@@ -165,6 +165,35 @@ detect_ssh_port() {
   echo "${p:-22}"
 }
  
+# Глобально велим apt ЖДАТЬ блокировку dpkg (до 5 мин), а не падать.
+# Действует и на наши apt-команды, и на сторонние установщики (netbird и т.п.).
+ensure_apt_lock_timeout() {
+  mkdir -p /etc/apt/apt.conf.d
+  echo 'DPkg::Lock::Timeout "300";' > /etc/apt/apt.conf.d/99-setup-lock-timeout
+}
+ 
+# Ждём, пока фоновые apt/unattended-upgrades отпустят блокировку.
+wait_for_apt() {
+  local waited=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+        || fuser /var/lib/dpkg/lock          >/dev/null 2>&1 \
+        || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1 \
+        || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    if [ "$waited" -eq 0 ]; then
+      log "Жду освобождения apt/dpkg (идёт фоновое обновление unattended-upgrades)..."
+    fi
+    sleep 5
+    waited=$((waited + 5))
+    if [ "$waited" -ge 300 ]; then
+      warn "Блокировка держится более 5 минут. При желании можно остановить автообновление:"
+      warn "  systemctl stop unattended-upgrades   — и повторить пункт."
+      return 0
+    fi
+  done
+  if [ "$waited" -gt 0 ]; then log "Блокировка освобождена."; fi
+  return 0
+}
+ 
 # ============================ БЛОКИ ============================
  
 # ----- 1) SSH-харденинг: порт + пользователь + sudo + ключи + запрет root -----
@@ -340,38 +369,18 @@ block_kernel() {
  
 # ----- 4) BBR -----
 block_bbr() {
-  modprobe tcp_bbr 2>/dev/null || true
-  local avail
-  avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
-  if [ -z "$avail" ]; then
-    err "Не удалось прочитать список доступных алгоритмов congestion control."
-    return 1
-  fi
-  log "Доступные алгоритмы: ${avail}"
- 
-  local algos a def="cubic"
-  read -r -a algos <<< "$avail"
-  for a in "${algos[@]}"; do
-    if [ "$a" = "bbr" ]; then def="bbr"; fi
-  done
- 
-  local cc qd
-  choose_from_list cc "Выберите congestion control:" "$def" "${algos[@]}"
-  if [ "$cc" = "bbr" ]; then qd="fq"; else qd="fq_codel"; fi
-  ask qd "qdisc (планировщик очереди)" "$qd"
- 
+  log "Включаю BBR + fq (без вопросов)."
   cat > /etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=${qd}
-net.ipv4.tcp_congestion_control=${cc}
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 EOF
   sysctl --system >/dev/null
   local now
   now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  if [ "$now" = "$cc" ]; then
-    log "Активно: congestion control=${now}, qdisc=${qd}."
-    if [ "$cc" = "bbr" ]; then log "На ядре XanMod алгоритм 'bbr' — это уже BBRv3."; fi
+  if [ "$now" = "bbr" ]; then
+    log "BBR активен (qdisc=fq). На ядре XanMod это BBRv3."
   else
-    warn "Сейчас: ${now:-неизвестно} (хотели ${cc}). Если выбран bbr — убедитесь, что загружено ядро XanMod (uname -r)."
+    warn "Сейчас: ${now:-неизвестно} (ожидался bbr). Нужна перезагрузка на ядре XanMod — проверьте uname -r."
   fi
 }
  
@@ -379,6 +388,7 @@ EOF
 block_netbird() {
   local key
   log "Устанавливаю netbird."
+  wait_for_apt
   curl -fsSL https://pkgs.netbird.io/install.sh | sh
   echo "setup-key вводится здесь и в файле не хранится."
   ask key "netbird setup-key (Enter — подключить позже)" ""
@@ -393,6 +403,7 @@ block_netbird() {
 # ----- 6) remnanode -----
 block_remnanode() {
   log "Запускаю установщик remnanode (интерактивный — следуйте подсказкам)."
+  wait_for_apt
   bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
  
   mkdir -p /var/log/remnanode
@@ -489,6 +500,7 @@ menu() {
  
 main() {
   require_root
+  ensure_apt_lock_timeout
   menu
 }
  
