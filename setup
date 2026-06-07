@@ -39,7 +39,7 @@ ask_required() {
   local __var="$1" __prompt="$2" __ans=""
   while [ -z "$__ans" ]; do
     read -rp "${__prompt}: " __ans
-    [ -z "$__ans" ] && warn "Значение не может быть пустым."
+    if [ -z "$__ans" ]; then warn "Значение не может быть пустым."; fi
   done
   printf -v "$__var" '%s' "$__ans"
 }
@@ -91,6 +91,31 @@ valid_pubkey() {
   [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-[a-z0-9-]+@openssh\.com)[[:space:]]+ ]]
 }
  
+# choose_from_list VAR "Заголовок" "значение_по_умолчанию_или_пусто" пункт1 пункт2 ...
+# Печатает нумерованное меню, помечает рекомендуемый пункт, читает выбор.
+choose_from_list() {
+  local __var="$1" __title="$2" __def="$3"; shift 3
+  local __items=("$@") __i __sel __defidx=""
+  echo "$__title"
+  for __i in "${!__items[@]}"; do
+    if [ -n "$__def" ] && [ "${__items[$__i]}" = "$__def" ]; then
+      printf "  %d) %s   ← рекомендуется\n" "$((__i + 1))" "${__items[$__i]}"
+      __defidx="$((__i + 1))"
+    else
+      printf "  %d) %s\n" "$((__i + 1))" "${__items[$__i]}"
+    fi
+  done
+  local __prompt="Номер"
+  if [ -n "$__defidx" ]; then __prompt="Номер [${__defidx}]"; fi
+  while true; do
+    read -rp "${__prompt}: " __sel
+    if [ -z "$__sel" ] && [ -n "$__defidx" ]; then __sel="$__defidx"; fi
+    if is_uint "$__sel" && [ "$__sel" -ge 1 ] && [ "$__sel" -le "${#__items[@]}" ]; then break; fi
+    warn "Введите число от 1 до ${#__items[@]}."
+  done
+  printf -v "$__var" '%s' "${__items[$((__sel - 1))]}"
+}
+ 
 # ----------------------------- ОБЩИЕ ХЕЛПЕРЫ -----------------------------
 ssh_service() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then echo ssh
@@ -131,11 +156,11 @@ apply_sshd() {
 # Определяем активный порт SSH из эффективного конфига
 detect_ssh_port() {
   local p
-  p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
   if [ -z "$p" ]; then
     p="$(grep -rhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
           /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
-          | awk '{print $2; exit}')"
+          | awk '{print $2; exit}' || true)"
   fi
   echo "${p:-22}"
 }
@@ -253,44 +278,100 @@ EOF
  
 # ----- 3) Ядро XanMod (точка перезагрузки) -----
 block_kernel() {
-  log "Устанавливаю ядро XanMod."
+  log "Подключаю репозиторий XanMod."
   apt-get update -y
-  apt-get install -y wget gnupg lsb-release gawk
+  apt-get install -y wget gnupg lsb-release gawk ca-certificates
   mkdir -p /etc/apt/keyrings
   wget -qO - https://dl.xanmod.org/archive.key \
     | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
   echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $(lsb_release -sc) main" \
     > /etc/apt/sources.list.d/xanmod-release.list
-  apt-get update -y
+  if ! apt-get update -y; then
+    warn "apt update завершился с ошибкой — возможно, репозиторий XanMod не отвечает для вашего релиза."
+  fi
  
-  local level pkg
-  level="$(wget -qO - https://dl.xanmod.org/check_x86-64_psabi.sh | awk -f -)"
-  log "Поддержка CPU: ${level}"
-  if   echo "$level" | grep -q 'x86-64-v4'; then pkg=linux-xanmod-x64v4
-  elif echo "$level" | grep -q 'x86-64-v3'; then pkg=linux-xanmod-x64v3
-  elif echo "$level" | grep -q 'x86-64-v2'; then pkg=linux-xanmod-x64v2
-  else                                           pkg=linux-xanmod-x64v1; fi
-  log "Ставлю пакет: ${pkg}"
-  apt-get install -y "$pkg"
+  # psABI-уровень CPU — только как подсказка (НЕ слепо собираем имя пакета)
+  local level reclevel
+  level="$(wget -qO - https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null | awk -f - 2>/dev/null || true)"
+  reclevel="$(printf '%s' "${level:-}" | grep -oE 'x86-64-v[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true)"
+  if [ -z "$reclevel" ]; then reclevel=3; fi
+  log "CPU поддерживает: ${level:-неизвестно} (psABI-уровень v${reclevel})"
+ 
+  # реально доступные мета-пакеты ядра из репозитория
+  local pkgs
+  mapfile -t pkgs < <(apt-cache pkgnames linux-xanmod 2>/dev/null \
+      | grep -E '^linux-xanmod(-(lts|edge|rt))?-x64v[0-9]+$' \
+      | sort -V -u)
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    err "В репозитории не найдено ни одного пакета linux-xanmod-x64vN."
+    err "Проверьте /etc/apt/sources.list.d/xanmod-release.list и вывод 'apt update'."
+    return 1
+  fi
+ 
+  # рекомендуемый: обычная ветка, наибольший vN, не превышающий уровень CPU
+  local rec="" p plevel
+  for p in "${pkgs[@]}"; do
+    case "$p" in
+      linux-xanmod-x64v*)
+        plevel="${p##*x64v}"
+        if [ "$plevel" -le "$reclevel" ]; then
+          if [ -z "$rec" ] || [ "$plevel" -gt "${rec##*x64v}" ]; then rec="$p"; fi
+        fi
+        ;;
+    esac
+  done
+ 
   echo
-  warn "Ядро установлено. ВЫПОЛНИТЕ:  sudo reboot"
-  warn "После загрузки проверьте: uname -r — и вернитесь в меню (пункт 4 — BBR)."
+  echo "Подсказка: обычная ветка v2/v3 подходит почти всем; lts — стабильная,"
+  echo "edge — самая новая, rt — реального времени. vN выше уровня CPU не загрузится."
+  local choice
+  choose_from_list choice "Доступные ядра XanMod — выберите вариант:" "$rec" "${pkgs[@]}"
+  log "Выбрано: ${choice}"
+ 
+  if apt-get install -y "$choice"; then
+    echo
+    warn "Ядро установлено. ВЫПОЛНИТЕ:  sudo reboot"
+    warn "После загрузки проверьте: uname -r — и вернитесь в меню (пункт 4 — BBR)."
+  else
+    err "Не удалось установить пакет ${choice}. Ядро НЕ установлено."
+    return 1
+  fi
 }
  
 # ----- 4) BBR -----
 block_bbr() {
-  log "Включаю BBR."
+  modprobe tcp_bbr 2>/dev/null || true
+  local avail
+  avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
+  if [ -z "$avail" ]; then
+    err "Не удалось прочитать список доступных алгоритмов congestion control."
+    return 1
+  fi
+  log "Доступные алгоритмы: ${avail}"
+ 
+  local algos a def="cubic"
+  read -r -a algos <<< "$avail"
+  for a in "${algos[@]}"; do
+    if [ "$a" = "bbr" ]; then def="bbr"; fi
+  done
+ 
+  local cc qd
+  choose_from_list cc "Выберите congestion control:" "$def" "${algos[@]}"
+  if [ "$cc" = "bbr" ]; then qd="fq"; else qd="fq_codel"; fi
+  ask qd "qdisc (планировщик очереди)" "$qd"
+ 
   cat > /etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=${qd}
+net.ipv4.tcp_congestion_control=${cc}
 EOF
   sysctl --system >/dev/null
-  local cc
-  cc="$(sysctl -n net.ipv4.tcp_congestion_control)"
-  if [ "$cc" = "bbr" ]; then
-    log "BBR активен."
+  local now
+  now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  if [ "$now" = "$cc" ]; then
+    log "Активно: congestion control=${now}, qdisc=${qd}."
+    if [ "$cc" = "bbr" ]; then log "На ядре XanMod алгоритм 'bbr' — это уже BBRv3."; fi
   else
-    warn "Сейчас: ${cc} (ожидался bbr). Нужна перезагрузка на ядре XanMod — проверьте uname -r."
+    warn "Сейчас: ${now:-неизвестно} (хотели ${cc}). Если выбран bbr — убедитесь, что загружено ядро XanMod (uname -r)."
   fi
 }
  
@@ -339,13 +420,15 @@ block_remnanode() {
 # Каждый блок запускается в подоболочке с `set -e`: ошибка останавливает
 # только текущий блок, меню продолжает работать.
 run_block() {
-  local name="$1" fn="$2"
+  local name="$1" fn="$2" rc=0
   echo
   log "▶ ${name}"
-  if ( set -eo pipefail; "$fn" ); then
+  ( set -eo pipefail; "$fn" )
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     log "✔ ${name} — готово."
   else
-    err "✘ ${name} — прервано (см. вывод выше)."
+    err "✘ ${name} — прервано (код ${rc}, см. вывод выше)."
   fi
 }
  
