@@ -305,10 +305,15 @@ block_ssh() {
   # порт
   log "Ставлю SSH-порт ${port}."
   set_sshd_option Port "$port"
+  if ! command -v ufw >/dev/null 2>&1; then
+    log "ufw не установлен — ставлю."
+    wait_for_apt
+    apt-get install -y ufw || warn "Не удалось установить ufw."
+  fi
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${port}/tcp" || warn "Не удалось добавить правило ufw."
+    ufw allow "${port}/tcp" || warn "Не удалось добавить правило ufw (${port}/tcp)."
   else
-    warn "ufw не установлен — откройте порт ${port}/tcp вручную."
+    warn "ufw недоступен — откройте порт ${port}/tcp вручную."
   fi
  
   # пользователь + sudo
