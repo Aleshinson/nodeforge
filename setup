@@ -15,9 +15,27 @@ NGINX_TARGET="${NGINX_TARGET:-1.30.1}"
 # Путь к самому скрипту (для самообновления).
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
  
-log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
-err()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; }
+# ----------------------------- ЦВЕТА И ВЫВОД -----------------------------
+# Цвета автоматически отключаются, если вывод не в терминал или задан NO_COLOR.
+setup_colors() {
+  if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    BOLD="" DIM="" RST="" RED="" GRN="" YLW="" BLU="" MAG="" CYN="" GRY="" WHT=""
+    return
+  fi
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
+  RED=$'\033[38;5;203m'; GRN=$'\033[38;5;78m';  YLW=$'\033[38;5;221m'
+  BLU=$'\033[38;5;75m';  MAG=$'\033[38;5;176m'; CYN=$'\033[38;5;81m'
+  GRY=$'\033[38;5;245m'; WHT=$'\033[38;5;231m'
+}
+setup_colors
+ 
+log()  { printf '%s%s•%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
+info() { printf '%s%si%s %s\n'  "$BOLD" "$BLU" "$RST" "$*"; }
+ok()   { printf '%s%s✓%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
+warn() { printf '%s%s▲%s %s\n'  "$BOLD" "$YLW" "$RST" "$*" >&2; }
+err()  { printf '%s%s✗%s %s\n'  "$BOLD" "$RED" "$RST" "$*" >&2; }
+step() { printf '%s%s▶ %s%s\n'  "$BOLD" "$CYN" "$*" "$RST"; }
+hr()   { printf '%s──────────────────────────────────────────────────────────────%s\n' "$GRY" "$RST"; }
  
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -722,7 +740,47 @@ block_nginx_upgrade() {
   log "Готово. Контейнер remnawave-nginx на образе: ${now:-неизвестно}"
 }
  
-# ----- 11) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
+# ----- 11) Перезапуск контейнеров (стек ноды или все на хосте) -----
+block_restart() {
+  local mode ids
+  echo
+  log "Текущие контейнеры:"
+  if ! docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null; then
+    err "docker недоступен."
+    return 1
+  fi
+  echo
+ 
+  choose_from_list mode "Что перезапустить?" "Стек ноды: restart" \
+    "Стек ноды: restart" \
+    "Стек ноды: пересоздать (down + up -d)" \
+    "Все контейнеры на хосте"
+ 
+  case "$mode" in
+    "Стек ноды: restart")
+      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
+      log "docker compose restart (в /opt/remnanode)..."
+      ( cd /opt/remnanode && docker compose restart )
+      ;;
+    "Стек ноды: пересоздать (down + up -d)")
+      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
+      log "docker compose down && up -d (в /opt/remnanode)..."
+      ( cd /opt/remnanode && docker compose down && docker compose up -d )
+      ;;
+    "Все контейнеры на хосте")
+      ids="$(docker ps -q 2>/dev/null || true)"
+      if [ -z "$ids" ]; then warn "Запущенных контейнеров нет."; return 0; fi
+      log "Перезапускаю все контейнеры на хосте..."
+      # shellcheck disable=SC2086
+      docker restart $ids >/dev/null
+      ;;
+  esac
+ 
+  log "Готово. Состояние:"
+  docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+}
+ 
+# ----- 12) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
 block_diag() {
   local tmp
   log "Скачиваю и запускаю диагностику ноды (Case211/node-diagnostic)."
@@ -738,30 +796,30 @@ block_diag() {
   rm -f "$tmp"
 }
  
-# ----- 12) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
+# ----- 13) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
 print_checks_menu() {
-  cat <<'EOF'
+  cat <<EOF
  
-══════════════════════════════════════════════════════════════
-                   Проверки и бенчмарки
-══════════════════════════════════════════════════════════════
- Блокировки / регион:
-   1) IP.Check.Place           — блокировки IP зарубежными сервисами
-   2) IP Region (ipregion.xyz) — какой регион видят сайты по IP
-   3) IP Region (vernette)     — то же, исходный скрипт с GitHub
-   4) CensorCheck (DPI)        — блокировки по DPI (для РФ-серверов)
-   5) Instagram audio          — блокировка аудио в Instagram
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+                   ${BOLD}${WHT}Проверки и бенчмарки${RST}
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+ ${BOLD}${MAG}Блокировки / регион${RST}${GRY}:${RST}
+   ${BOLD}${CYN} 1)${RST} IP.Check.Place           ${GRY}— блокировки IP зарубежными сервисами${RST}
+   ${BOLD}${CYN} 2)${RST} IP Region (ipregion.xyz) ${GRY}— какой регион видят сайты по IP${RST}
+   ${BOLD}${CYN} 3)${RST} IP Region (vernette)     ${GRY}— то же, исходный скрипт с GitHub${RST}
+   ${BOLD}${CYN} 4)${RST} CensorCheck (DPI)        ${GRY}— блокировки по DPI (для РФ-серверов)${RST}
+   ${BOLD}${CYN} 5)${RST} Instagram audio          ${GRY}— блокировка аудио в Instagram${RST}
  
- Бенчмарки / скорость:
-   6) bench.sh                 — параметры + скорость (зарубежные)
-   7) speed.tlab.pw            — скорость (зарубежные, альт.)
-   8) bench.gig.ovh            — параметры + скорость (РФ-провайдеры)
-   9) bench.tlab.pw            — то же (РФ, альт.)
-  10) YABS                     — диск + сеть (iperf3) + GeekBench
-  11) sysbench CPU             — оценка выделенного CPU
-   0) Назад
-──────────────────────────────────────────────────────────────
- Несколько номеров через пробел можно, напр.:  1 4
+ ${BOLD}${MAG}Бенчмарки / скорость${RST}${GRY}:${RST}
+   ${BOLD}${CYN} 6)${RST} bench.sh                 ${GRY}— параметры + скорость (зарубежные)${RST}
+   ${BOLD}${CYN} 7)${RST} speed.tlab.pw            ${GRY}— скорость (зарубежные, альт.)${RST}
+   ${BOLD}${CYN} 8)${RST} bench.gig.ovh            ${GRY}— параметры + скорость (РФ-провайдеры)${RST}
+   ${BOLD}${CYN} 9)${RST} bench.tlab.pw            ${GRY}— то же (РФ, альт.)${RST}
+   ${BOLD}${CYN}10)${RST} YABS                     ${GRY}— диск + сеть (iperf3) + GeekBench${RST}
+   ${BOLD}${CYN}11)${RST} sysbench CPU             ${GRY}— оценка выделенного CPU${RST}
+   ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
+${GRY}──────────────────────────────────────────────────────────────${RST}
+ ${DIM}Несколько номеров через пробел можно, напр.:  1 4${RST}
 EOF
 }
  
@@ -773,17 +831,17 @@ submenu_checks() {
     [ -z "$choice" ] && continue
     for c in $choice; do
       case "$c" in
-        1)  echo; log "▶ IP.Check.Place";            bash <(curl -Ls IP.Check.Place) -l en || true ;;
-        2)  echo; log "▶ IP Region (ipregion.xyz)";  bash <(wget -qO- https://ipregion.xyz) || true ;;
-        3)  echo; log "▶ IP Region (vernette)";       bash <(wget -qO- https://github.com/vernette/ipregion/raw/master/ipregion.sh) || true ;;
-        4)  echo; log "▶ CensorCheck (DPI)";          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        5)  echo; log "▶ Instagram audio";            bash <(curl -L -s https://bench.openode.xyz/checker_inst.sh) || true ;;
-        6)  echo; log "▶ bench.sh";                   wget -qO- bench.sh | bash || true ;;
-        7)  echo; log "▶ speed.tlab.pw";              wget -qO- speed.tlab.pw | bash || true ;;
-        8)  echo; log "▶ bench.gig.ovh";              wget -qO- bench.gig.ovh | bash || true ;;
-        9)  echo; log "▶ bench.tlab.pw";              wget -qO- bench.tlab.pw | bash || true ;;
-        10) echo; log "▶ YABS";                       curl -sL yabs.sh | bash -s -- -4 || true ;;
-        11) echo; log "▶ sysbench CPU"
+        1)  echo; step "IP.Check.Place";            bash <(curl -Ls IP.Check.Place) -l en || true ;;
+        2)  echo; step "IP Region (ipregion.xyz)";  bash <(wget -qO- https://ipregion.xyz) || true ;;
+        3)  echo; step "IP Region (vernette)";       bash <(wget -qO- https://github.com/vernette/ipregion/raw/master/ipregion.sh) || true ;;
+        4)  echo; step "CensorCheck (DPI)";          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
+        5)  echo; step "Instagram audio";            bash <(curl -L -s https://bench.openode.xyz/checker_inst.sh) || true ;;
+        6)  echo; step "bench.sh";                   wget -qO- bench.sh | bash || true ;;
+        7)  echo; step "speed.tlab.pw";              wget -qO- speed.tlab.pw | bash || true ;;
+        8)  echo; step "bench.gig.ovh";              wget -qO- bench.gig.ovh | bash || true ;;
+        9)  echo; step "bench.tlab.pw";              wget -qO- bench.tlab.pw | bash || true ;;
+        10) echo; step "YABS";                       curl -sL yabs.sh | bash -s -- -4 || true ;;
+        11) echo; step "sysbench CPU"
             if ! command -v sysbench >/dev/null 2>&1; then
               log "sysbench не найден — устанавливаю."
               wait_for_apt
@@ -806,7 +864,7 @@ submenu_checks() {
 # мог заменить весь процесс на свежую версию.
 self_update() {
   echo
-  log "▶ Обновление скрипта"
+  step "Обновление скрипта"
   log "Источник: ${UPDATE_URL}"
  
   local dest="$SELF" tmp
@@ -832,7 +890,7 @@ self_update() {
   cat "$tmp" > "$dest"
   rm -f "$tmp"
   chmod +x "$dest" 2>/dev/null || true
-  log "✔ Скрипт обновлён: ${dest}"
+  ok "Скрипт обновлён: ${dest}"
   log "Перезапускаю обновлённую версию..."
   exec bash "$dest"
 }
@@ -842,51 +900,67 @@ self_update() {
 run_block() {
   local name="$1" fn="$2" rc=0
   echo
-  log "▶ ${name}"
+  step "$name"
   ( set -eo pipefail; "$fn" )
   rc=$?
   if [ "$rc" -eq 0 ]; then
-    log "✔ ${name} — готово."
+    ok "${name} — готово."
   else
-    err "✘ ${name} — прервано (код ${rc}, см. вывод выше)."
+    err "${name} — прервано (код ${rc}, см. вывод выше)."
   fi
+}
+ 
+banner() {
+  echo
+  printf '%s%s' "$BOLD" "$CYN"
+  cat <<'ART'
+              _      __
+ _ _  ___  __| |___ / _|___ _ _ __ _ ___
+| ' \/ _ \/ _` / -_)  _/ _ \ '_/ _` / -_)
+|_||_\___/\__,_\___|_| \___/_| \__, \___|
+                               |___/
+ART
+  printf '%s' "$RST"
+  printf '   %sharden · configure · remnawave node%s\n' "$GRY" "$RST"
+  hr
 }
  
 print_menu() {
   cat <<EOF
  
-══════════════════════════════════════════════════════════════
-                     Настройка сервера
-══════════════════════════════════════════════════════════════
- ДО перезагрузки (совместимы в одном проходе):
-   1) SSH-харденинг  — порт + пользователь + sudo + ключи + запрет root
-   2) fail2ban       — защита от брутфорса (берёт текущий порт SSH)
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+                     ${BOLD}${WHT}Настройка сервера${RST}
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+ ${BOLD}${MAG}ДО перезагрузки${RST} ${GRY}(совместимы в одном проходе):${RST}
+   ${BOLD}${CYN} 1)${RST} SSH-харденинг  ${GRY}— порт + пользователь + sudo + ключи + запрет root${RST}
+   ${BOLD}${CYN} 2)${RST} fail2ban       ${GRY}— защита от брутфорса (берёт текущий порт SSH)${RST}
  
- Ядро (точка перезагрузки):
-   3) Ядро XanMod    — после установки нужен reboot
+ ${BOLD}${MAG}Ядро${RST} ${GRY}(точка перезагрузки):${RST}
+   ${BOLD}${CYN} 3)${RST} Ядро XanMod    ${GRY}— после установки нужен reboot${RST}
  
- ПОСЛЕ перезагрузки:
-   4) BBR            — ускорение TCP
-   5) netbird        — mesh VPN
-   6) remnanode      — нода (интерактивный установщик)
+ ${BOLD}${MAG}ПОСЛЕ перезагрузки${RST}${GRY}:${RST}
+   ${BOLD}${CYN} 4)${RST} BBR            ${GRY}— ускорение TCP${RST}
+   ${BOLD}${CYN} 5)${RST} netbird        ${GRY}— mesh VPN${RST}
+   ${BOLD}${CYN} 6)${RST} remnanode      ${GRY}— нода (интерактивный установщик)${RST}
  
- После ноды (доп. настройка remnanode):
-   7) RU-блокировка  — RU geoip/geosite + bind-mount + авто-обновление (cron)
-   8) Логи ноды      — logrotate + zstd
-   9) XHTTP          — location в nginx
-  10) nginx 1.28 → ${NGINX_TARGET}  — проверит версию и спросит
+ ${BOLD}${MAG}После ноды${RST} ${GRY}(управление remnanode):${RST}
+   ${BOLD}${CYN} 7)${RST} RU-блокировка  ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
+   ${BOLD}${CYN} 8)${RST} Логи ноды      ${GRY}— logrotate + zstd${RST}
+   ${BOLD}${CYN} 9)${RST} XHTTP          ${GRY}— location в nginx${RST}
+   ${BOLD}${CYN}10)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
+   ${BOLD}${CYN}11)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
- Диагностика / сервис:
-  11) Диагностика ноды (внешний скрипт node-diagnostic)
-  12) Проверки и бенчмарки (IP/регион/DPI/скорость/CPU…)
-  13) Обновить скрипт  (свежая версия с GitHub + перезапуск)
+ ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
+   ${BOLD}${CYN}12)${RST} Диагностика ноды  ${GRY}(node-diagnostic)${RST}
+   ${BOLD}${CYN}13)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
+   ${BOLD}${CYN}14)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
  
- Группы:
-  14) Всё ДО ядра      (= 1 + 2)
-  15) Всё ПОСЛЕ ребута (= 4 + 5 + 6)
-   0) Выход
-──────────────────────────────────────────────────────────────
- Можно ввести несколько номеров через пробел, напр.:  1 2
+ ${BOLD}${MAG}Группы${RST}${GRY}:${RST}
+   ${BOLD}${CYN}15)${RST} Всё ДО ядра      ${GRY}(= 1 + 2)${RST}
+   ${BOLD}${CYN}16)${RST} Всё ПОСЛЕ ребута ${GRY}(= 4 + 5 + 6)${RST}
+   ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
+${GRY}──────────────────────────────────────────────────────────────${RST}
+ ${DIM}Можно ввести несколько номеров через пробел, напр.:  1 2${RST}
 EOF
 }
  
@@ -908,12 +982,13 @@ menu() {
         8) run_block "Логи ноды" block_logs ;;
         9) run_block "XHTTP" block_xhttp ;;
         10) run_block "nginx upgrade" block_nginx_upgrade ;;
-        11) run_block "Диагностика ноды" block_diag ;;
-        12) submenu_checks ;;
-        13) self_update ;;
-        14) run_block "SSH-харденинг" block_ssh
+        11) run_block "Перезапуск контейнеров" block_restart ;;
+        12) run_block "Диагностика ноды" block_diag ;;
+        13) submenu_checks ;;
+        14) self_update ;;
+        15) run_block "SSH-харденинг" block_ssh
             run_block "fail2ban" block_fail2ban ;;
-        15) run_block "BBR" block_bbr
+        16) run_block "BBR" block_bbr
             run_block "netbird" block_netbird
             run_block "remnanode" block_remnanode ;;
         0) log "Выход."; exit 0 ;;
@@ -926,6 +1001,7 @@ menu() {
 }
  
 main() {
+  banner
   require_root
   ensure_apt_lock_timeout
   menu
@@ -935,3 +1011,4 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
+ 
