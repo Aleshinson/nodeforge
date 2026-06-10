@@ -838,7 +838,7 @@ block_beszel_agent() {
  
 # ----- 13) Beszel: обновить (агент и/или хаб) -----
 block_beszel_update() {
-  local found=0 bin
+  local found=0 bin c dir img
   bin="$(find_beszel_bin beszel-agent || true)"
   if [ -n "$bin" ]; then
     found=1
@@ -855,11 +855,23 @@ block_beszel_update() {
     systemctl restart beszel-hub 2>/dev/null || true
     ok "Хаб Beszel обновлён."
   fi
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^beszel(-agent)?$'; then
-    found=1
-    warn "Найдены Docker-контейнеры Beszel — для них обновление в папке с compose:"
-    warn "  docker compose pull && docker compose up -d"
-  fi
+  # Docker-установка (хаб beszel и/или агент beszel-agent): обновляем через compose.
+  for c in beszel beszel-agent; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
+      found=1
+      dir="$(docker inspect "$c" -f '{{ index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+      img="$(docker inspect "$c" -f '{{.Config.Image}}' 2>/dev/null || true)"
+      if [ -n "$dir" ] && [ -d "$dir" ]; then
+        log "Docker ${c}: обновляю через compose в ${dir}."
+        ( cd "$dir" && docker compose pull && docker compose up -d ) || warn "Не удалось обновить ${c} (compose в ${dir})."
+        ok "Docker ${c} обновлён."
+      else
+        log "Docker ${c}: тяну образ ${img:-henrygd/${c}:latest}."
+        docker pull "${img:-henrygd/${c}:latest}" || warn "docker pull не удался для ${c}."
+        warn "Контейнер ${c} запущен не через compose — пересоздай его вручную для применения образа."
+      fi
+    fi
+  done
   if [ "$found" -eq 0 ]; then
     warn "Beszel (агент/хаб) на этом сервере не найден."
     warn "Сначала подключи агент (пункт «Beszel: подключить агент»)."
