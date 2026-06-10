@@ -785,7 +785,88 @@ block_restart() {
   docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
 }
  
-# ----- 12) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
+# Поиск бинаря Beszel (агент или хаб) по PATH и штатным путям install-скрипта.
+find_beszel_bin() {
+  local n="$1" p
+  p="$(command -v "$n" 2>/dev/null || true)"
+  if [ -n "$p" ]; then echo "$p"; return 0; fi
+  for p in "/opt/${n}/${n}" "/usr/local/sbin/${n}" "/usr/local/bin/${n}"; do
+    if [ -x "$p" ]; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+ 
+# ----- 12) Beszel: подключить агент к хабу -----
+block_beszel_agent() {
+  local key port token url tmp
+  info "Beszel — мониторинг. Нужен публичный ключ из хаба:"
+  info "в веб-интерфейсе хаба нажми Add System и скопируй Public Key."
+  echo
+  ask_required key "Публичный ключ Beszel (Public Key из хаба)"
+  ask port  "Порт агента" "45876"
+  warn "Для NAT-сервера (агент сам идёт к хабу по WebSocket) укажи Token и URL хаба."
+  warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
+  ask token "Token (Enter — пропустить)" ""
+  ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
+ 
+  tmp=/tmp/install-agent.sh
+  log "Скачиваю install-agent.sh."
+  if ! curl -sL https://get.beszel.dev -o "$tmp"; then
+    err "Не удалось скачать install-agent.sh."
+    return 1
+  fi
+  chmod +x "$tmp"
+ 
+  set -- -k "$key" -p "$port"
+  if [ -n "$token" ]; then set -- "$@" -t "$token"; fi
+  if [ -n "$url" ];   then set -- "$@" -url "$url"; fi
+ 
+  log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."
+  "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
+ 
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp" || warn "Не удалось добавить правило ufw (${port}/tcp)."
+  fi
+ 
+  echo
+  if systemctl is-active --quiet beszel-agent 2>/dev/null; then
+    ok "beszel-agent запущен. Проверь, что в хабе нода стала зелёной."
+  else
+    warn "Агент не активен — проверь: systemctl status beszel-agent"
+  fi
+}
+ 
+# ----- 13) Beszel: обновить (агент и/или хаб) -----
+block_beszel_update() {
+  local found=0 bin
+  bin="$(find_beszel_bin beszel-agent || true)"
+  if [ -n "$bin" ]; then
+    found=1
+    log "Агент: ${bin} update"
+    "$bin" update || warn "Обновление агента вернуло ошибку."
+    systemctl restart beszel-agent 2>/dev/null || true
+    ok "Агент Beszel обновлён."
+  fi
+  bin="$(find_beszel_bin beszel || true)"
+  if [ -n "$bin" ]; then
+    found=1
+    log "Хаб: ${bin} update"
+    "$bin" update || warn "Обновление хаба вернуло ошибку."
+    systemctl restart beszel-hub 2>/dev/null || true
+    ok "Хаб Beszel обновлён."
+  fi
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^beszel(-agent)?$'; then
+    found=1
+    warn "Найдены Docker-контейнеры Beszel — для них обновление в папке с compose:"
+    warn "  docker compose pull && docker compose up -d"
+  fi
+  if [ "$found" -eq 0 ]; then
+    warn "Beszel (агент/хаб) на этом сервере не найден."
+    warn "Сначала подключи агент (пункт «Beszel: подключить агент»)."
+  fi
+}
+ 
+# ----- 14) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
 block_diag() {
   local tmp
   log "Скачиваю и запускаю диагностику ноды (Case211/node-diagnostic)."
@@ -801,7 +882,7 @@ block_diag() {
   rm -f "$tmp"
 }
  
-# ----- 13) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
+# ----- 15) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
 print_checks_menu() {
   cat <<EOF
  
@@ -955,14 +1036,18 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN}10)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}11)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
+ ${BOLD}${MAG}Мониторинг (Beszel)${RST}${GRY}:${RST}
+   ${BOLD}${CYN}12)${RST} Подключить агент к хабу  ${GRY}— установка beszel-agent${RST}
+   ${BOLD}${CYN}13)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
+ 
  ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
-   ${BOLD}${CYN}12)${RST} Диагностика ноды  ${GRY}(node-diagnostic)${RST}
-   ${BOLD}${CYN}13)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
-   ${BOLD}${CYN}14)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
+   ${BOLD}${CYN}14)${RST} Диагностика ноды  ${GRY}(node-diagnostic)${RST}
+   ${BOLD}${CYN}15)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
+   ${BOLD}${CYN}16)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
  
  ${BOLD}${MAG}Группы${RST}${GRY}:${RST}
-   ${BOLD}${CYN}15)${RST} Всё ДО ядра      ${GRY}(= 1 + 2)${RST}
-   ${BOLD}${CYN}16)${RST} Всё ПОСЛЕ ребута ${GRY}(= 4 + 5 + 6)${RST}
+   ${BOLD}${CYN}17)${RST} Всё ДО ядра      ${GRY}(= 1 + 2)${RST}
+   ${BOLD}${CYN}18)${RST} Всё ПОСЛЕ ребута ${GRY}(= 4 + 5 + 6)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
  ${DIM}Можно ввести несколько номеров через пробел, напр.:  1 2${RST}
@@ -988,12 +1073,14 @@ menu() {
         9) run_block "XHTTP" block_xhttp ;;
         10) run_block "nginx upgrade" block_nginx_upgrade ;;
         11) run_block "Перезапуск контейнеров" block_restart ;;
-        12) run_block "Диагностика ноды" block_diag ;;
-        13) submenu_checks ;;
-        14) self_update ;;
-        15) run_block "SSH-харденинг" block_ssh
+        12) run_block "Beszel: агент" block_beszel_agent ;;
+        13) run_block "Beszel: обновление" block_beszel_update ;;
+        14) run_block "Диагностика ноды" block_diag ;;
+        15) submenu_checks ;;
+        16) self_update ;;
+        17) run_block "SSH-харденинг" block_ssh
             run_block "fail2ban" block_fail2ban ;;
-        16) run_block "BBR" block_bbr
+        18) run_block "BBR" block_bbr
             run_block "netbird" block_netbird
             run_block "remnanode" block_remnanode ;;
         0) log "Выход."; exit 0 ;;
@@ -1016,4 +1103,3 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
- 
