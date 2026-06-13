@@ -1048,7 +1048,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN}12)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
  
  ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
-   ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— node-diagnostic + node-accelerator (read-only)${RST}
+   ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: node-diagnostic / node-accelerator${RST}
    ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
    ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
  
