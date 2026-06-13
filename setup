@@ -12,6 +12,8 @@ set -o pipefail
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/Aleshinson/nodeforge/main/setup}"
 # Целевая версия nginx для апгрейда (1.30.1 закрывает CVE из 1.28; 1.30.2 — ещё свежее).
 NGINX_TARGET="${NGINX_TARGET:-1.30.1}"
+# Ветка/тег репозитория node-accelerator (для прода можно зафиксировать тег: NA_REF=v2.1).
+NA_REF="${NA_REF:-main}"
 # Путь к самому скрипту (для самообновления).
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
  
@@ -379,6 +381,14 @@ EOF
  
 # ----- 3) Ядро XanMod (точка перезагрузки) -----
 block_kernel() {
+  # Guard: если XanMod уже стоит (в т.ч. через node-accelerator/optimize) — не дублируем.
+  if uname -r | grep -qi xanmod || dpkg -l 2>/dev/null | grep -qE '^ii[[:space:]]+linux-xanmod'; then
+    warn "XanMod уже установлен (текущее ядро: $(uname -r))."
+    if ! confirm "Переустановить базовый XanMod всё равно?"; then
+      log "Пропускаю — XanMod уже на месте (ставился отдельно или через optimize)."
+      return 0
+    fi
+  fi
   log "Подключаю репозиторий XanMod."
   apt-get update -y
   apt-get install -y wget gnupg lsb-release gawk ca-certificates
@@ -441,6 +451,12 @@ block_kernel() {
  
 # ----- 4) BBR -----
 block_bbr() {
+  local cur
+  cur="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  if [ "$cur" = "bbr" ]; then
+    log "BBR уже включён (qdisc fq + bbr) — пропускаю, дублировать не нужно."
+    return 0
+  fi
   log "Включаю BBR + fq (без вопросов)."
   cat > /etc/sysctl.d/99-bbr.conf <<EOF
 net.core.default_qdisc=fq
@@ -456,7 +472,28 @@ EOF
   fi
 }
  
-# ----- 5) netbird -----
+# ----- 5) node-accelerator: optimize (XanMod BBRv3 + sysctl + RPS/RFS + swap) -----
+# Заменяет пункты 3 (XanMod) и 4 (BBR): делает их и сверх того (RPS/RFS, swap, conntrack).
+block_optimize() {
+  local tmp
+  info "node-accelerator: оптимизация — XanMod BBRv3 + sysctl + RPS/RFS/XPS + swap + лимиты."
+  warn "Это замена пунктам 3 (XanMod) и 4 (BBR) — отдельно их запускать не нужно."
+  warn "После установки XanMod потребуется reboot."
+  echo
+  tmp="$(mktemp)"
+  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
+    err "Не удалось скачать node-accelerator (install.sh)."
+    rm -f "$tmp"
+    return 1
+  fi
+  NA_REF="$NA_REF" bash "$tmp" optimize || warn "optimize завершился с ненулевым кодом — см. вывод выше."
+  rm -f "$tmp"
+  echo
+  warn "Если установился XanMod — выполни reboot, затем проверь: uname -r (должно содержать xanmod)."
+  warn "Откатить тюнинг при необходимости: bash <(curl -fsSL .../node-accelerator/${NA_REF}/install.sh) rollback optimize"
+}
+ 
+# ----- 6) netbird -----
 block_netbird() {
   local key
   log "Устанавливаю netbird."
@@ -894,6 +931,22 @@ block_diag() {
   rm -f "$tmp"
 }
  
+# ----- node-accelerator: diagnose (ядро/sysctl/conntrack/NIC/firewall/порты, read-only) -----
+block_na_diagnose() {
+  local tmp
+  info "node-accelerator: диагностика — ядро/BBR/sysctl/conntrack/NIC/RPS/firewall/порты. Только чтение."
+  echo
+  tmp="$(mktemp)"
+  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
+    err "Не удалось скачать node-accelerator (install.sh)."
+    rm -f "$tmp"
+    return 1
+  fi
+  # read-only; ненулевой код = найдены замечания, это нормально
+  NA_REF="$NA_REF" bash "$tmp" diagnose || true
+  rm -f "$tmp"
+}
+ 
 # ----- 15) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
 print_checks_menu() {
   cat <<EOF
@@ -1033,36 +1086,38 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 1)${RST} SSH-харденинг  ${GRY}— порт + пользователь + sudo + ключи + запрет root${RST}
    ${BOLD}${CYN} 2)${RST} fail2ban       ${GRY}— защита от брутфорса (берёт текущий порт SSH)${RST}
  
- ${BOLD}${MAG}Ядро${RST} ${GRY}(точка перезагрузки):${RST}
-   ${BOLD}${CYN} 3)${RST} Ядро XanMod    ${GRY}— после установки нужен reboot${RST}
+ ${BOLD}${MAG}Ядро / тюнинг${RST} ${GRY}(точка перезагрузки):${RST}
+   ${BOLD}${CYN} 3)${RST} Ядро XanMod    ${GRY}— базовый (или п.5); пропустит, если уже стоит${RST}
+   ${BOLD}${CYN} 4)${RST} BBR            ${GRY}— базовый (входит в п.5); пропустит, если включён${RST}
+   ${BOLD}${GRN} 5)${RST} ${WHT}optimize${RST} ${GRN}★${RST} ${GRY}— node-accelerator: XanMod BBRv3 + тюнинг + swap${RST}
  
  ${BOLD}${MAG}ПОСЛЕ перезагрузки${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 4)${RST} BBR            ${GRY}— ускорение TCP${RST}
-   ${BOLD}${CYN} 5)${RST} netbird        ${GRY}— mesh VPN${RST}
-   ${BOLD}${CYN} 6)${RST} remnanode      ${GRY}— нода (интерактивный установщик)${RST}
+   ${BOLD}${CYN} 6)${RST} netbird        ${GRY}— mesh VPN${RST}
+   ${BOLD}${CYN} 7)${RST} remnanode      ${GRY}— нода (интерактивный установщик)${RST}
  
  ${BOLD}${MAG}После ноды${RST} ${GRY}(управление remnanode):${RST}
-   ${BOLD}${CYN} 7)${RST} RU-блокировка  ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
-   ${BOLD}${CYN} 8)${RST} Логи ноды      ${GRY}— logrotate + zstd${RST}
-   ${BOLD}${CYN} 9)${RST} XHTTP          ${GRY}— location в nginx${RST}
-   ${BOLD}${CYN}10)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
-   ${BOLD}${CYN}11)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
+   ${BOLD}${CYN} 8)${RST} RU-блокировка  ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
+   ${BOLD}${CYN} 9)${RST} Логи ноды      ${GRY}— logrotate + zstd${RST}
+   ${BOLD}${CYN}10)${RST} XHTTP          ${GRY}— location в nginx${RST}
+   ${BOLD}${CYN}11)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
+   ${BOLD}${CYN}12)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
  ${BOLD}${MAG}Мониторинг (Beszel)${RST}${GRY}:${RST}
-   ${BOLD}${CYN}12)${RST} Подключить агент к хабу  ${GRY}— установка beszel-agent${RST}
-   ${BOLD}${CYN}13)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
+   ${BOLD}${CYN}13)${RST} Подключить агент к хабу  ${GRY}— установка beszel-agent${RST}
+   ${BOLD}${CYN}14)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
  
  ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
-   ${BOLD}${CYN}14)${RST} Диагностика ноды  ${GRY}(node-diagnostic)${RST}
-   ${BOLD}${CYN}15)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
-   ${BOLD}${CYN}16)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
+   ${BOLD}${CYN}15)${RST} Диагностика ноды  ${GRY}(node-diagnostic)${RST}
+   ${BOLD}${CYN}16)${RST} diagnose  ${GRY}— node-accelerator: ядро/сеть/firewall (read-only)${RST}
+   ${BOLD}${CYN}17)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
+   ${BOLD}${CYN}18)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
  
  ${BOLD}${MAG}Группы${RST}${GRY}:${RST}
-   ${BOLD}${CYN}17)${RST} Всё ДО ядра      ${GRY}(= 1 + 2)${RST}
-   ${BOLD}${CYN}18)${RST} Всё ПОСЛЕ ребута ${GRY}(= 4 + 5 + 6)${RST}
+   ${BOLD}${CYN}19)${RST} Всё ДО ядра      ${GRY}(= 1 + 2)${RST}
+   ${BOLD}${CYN}20)${RST} Всё ПОСЛЕ ребута ${GRY}(= 6 + 7)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Можно ввести несколько номеров через пробел, напр.:  1 2${RST}
+ ${DIM}Совет: на чистом сервере — 1 → 5 → reboot → 6 7 → 8–12.  Несколько номеров через пробел.${RST}
 EOF
 }
  
@@ -1078,22 +1133,23 @@ menu() {
         2) run_block "fail2ban" block_fail2ban ;;
         3) run_block "Ядро XanMod" block_kernel ;;
         4) run_block "BBR" block_bbr ;;
-        5) run_block "netbird" block_netbird ;;
-        6) run_block "remnanode" block_remnanode ;;
-        7) run_block "RU-блокировка" block_rublock ;;
-        8) run_block "Логи ноды" block_logs ;;
-        9) run_block "XHTTP" block_xhttp ;;
-        10) run_block "nginx upgrade" block_nginx_upgrade ;;
-        11) run_block "Перезапуск контейнеров" block_restart ;;
-        12) run_block "Beszel: агент" block_beszel_agent ;;
-        13) run_block "Beszel: обновление" block_beszel_update ;;
-        14) run_block "Диагностика ноды" block_diag ;;
-        15) submenu_checks ;;
-        16) self_update ;;
-        17) run_block "SSH-харденинг" block_ssh
+        5) run_block "Оптимизация (node-accelerator)" block_optimize ;;
+        6) run_block "netbird" block_netbird ;;
+        7) run_block "remnanode" block_remnanode ;;
+        8) run_block "RU-блокировка" block_rublock ;;
+        9) run_block "Логи ноды" block_logs ;;
+        10) run_block "XHTTP" block_xhttp ;;
+        11) run_block "nginx upgrade" block_nginx_upgrade ;;
+        12) run_block "Перезапуск контейнеров" block_restart ;;
+        13) run_block "Beszel: агент" block_beszel_agent ;;
+        14) run_block "Beszel: обновление" block_beszel_update ;;
+        15) run_block "Диагностика ноды" block_diag ;;
+        16) run_block "Диагностика (node-accelerator)" block_na_diagnose ;;
+        17) submenu_checks ;;
+        18) self_update ;;
+        19) run_block "SSH-харденинг" block_ssh
             run_block "fail2ban" block_fail2ban ;;
-        18) run_block "BBR" block_bbr
-            run_block "netbird" block_netbird
+        20) run_block "netbird" block_netbird
             run_block "remnanode" block_remnanode ;;
         0) log "Выход."; exit 0 ;;
         *) warn "Неизвестный пункт: ${c}" ;;
