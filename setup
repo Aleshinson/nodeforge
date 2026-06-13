@@ -860,7 +860,41 @@ block_na_diagnose() {
   rm -f "$tmp"
 }
  
-# ----- 15) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
+# ----- 13) Подменю «Диагностика»: выбор, что запускать -----
+print_diag_menu() {
+  cat <<EOF
+ 
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+                        ${BOLD}${WHT}Диагностика${RST}
+${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
+   ${BOLD}${CYN} 1)${RST} node-diagnostic    ${GRY}— проверка ноды, может предложить фиксы${RST}
+   ${BOLD}${CYN} 2)${RST} node-accelerator   ${GRY}— ядро/sysctl/сеть/firewall, только чтение${RST}
+   ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
+${GRY}──────────────────────────────────────────────────────────────${RST}
+ ${DIM}Можно оба сразу:  1 2${RST}
+EOF
+}
+ 
+submenu_diag() {
+  local choice c
+  while true; do
+    print_diag_menu
+    read -rp "Выбор: " choice
+    [ -z "$choice" ] && continue
+    for c in $choice; do
+      case "$c" in
+        1) run_block "Диагностика ноды (node-diagnostic)" block_diag ;;
+        2) run_block "Диагностика (node-accelerator)" block_na_diagnose ;;
+        0) return 0 ;;
+        *) warn "Неизвестный пункт: ${c}" ;;
+      esac
+    done
+    echo
+    read -rp "Нажмите Enter для возврата в меню диагностики..." _
+  done
+}
+ 
+# ----- 14) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
 print_checks_menu() {
   cat <<EOF
  
@@ -1049,8 +1083,7 @@ menu() {
         10) run_block "Перезапуск контейнеров" block_restart ;;
         11) run_block "Beszel: агент" block_beszel_agent ;;
         12) run_block "Beszel: обновление" block_beszel_update ;;
-        13) run_block "Диагностика ноды (node-diagnostic)" block_diag
-            run_block "Диагностика (node-accelerator)" block_na_diagnose ;;
+        13) submenu_diag ;;
         14) submenu_checks ;;
         15) self_update ;;
         16) run_block "SSH-харденинг" block_ssh
