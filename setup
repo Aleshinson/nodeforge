@@ -1,1117 +1,126 @@
 #!/usr/bin/env bash
+# ============================================================================
+#  nodeforge — netbird (умное подключение) + единое обновление списков
+# ----------------------------------------------------------------------------
+#  ЧТО ВНУТРИ:
+#   • block_netbird      — ЗАМЕНА старой функции: если netbird уже стоит, не
+#                          переустанавливает, а корректно подключает по setup-key
+#                          (с переподключением, если уже в сети).
+#   • block_update_lists — НОВЫЙ пункт: обновляет ВСЕ списки сетей разом, чинит
+#                          пропавшие cron-задания, показывает расписание автообновления.
 #
-# setup.sh — интерактивная настройка/харденинг сервера (меню по блокам).
-#
-# Группировка пунктов — по совместимости в одном проходе:
-#
-# Запуск:  sudo ./setup.sh   (можно вводить несколько номеров: напр. 1 2)
-#
-set -o pipefail
- 
-# Откуда брать свежую версию (raw-ссылка на GitHub). Можно переопределить через env.
-UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/Aleshinson/nodeforge/main/setup}"
-# Целевая версия nginx для апгрейда (1.30.1 закрывает CVE из 1.28; 1.30.2 — ещё свежее).
-NGINX_TARGET="${NGINX_TARGET:-1.30.1}"
-# Ветка/тег репозитория node-accelerator (для прода можно зафиксировать тег: NA_REF=v2.1).
-NA_REF="${NA_REF:-main}"
-# Путь к самому скрипту (для самообновления).
-SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
- 
-# ----------------------------- ЦВЕТА И ВЫВОД -----------------------------
-# Цвета автоматически отключаются, если вывод не в терминал или задан NO_COLOR.
-setup_colors() {
-  if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
-    BOLD="" DIM="" RST="" RED="" GRN="" YLW="" BLU="" MAG="" CYN="" GRY="" WHT=""
-    return
-  fi
-  BOLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
-  RED=$'\033[38;5;203m'; GRN=$'\033[38;5;78m';  YLW=$'\033[38;5;221m'
-  BLU=$'\033[38;5;75m';  MAG=$'\033[38;5;176m'; CYN=$'\033[38;5;81m'
-  GRY=$'\033[38;5;245m'; WHT=$'\033[38;5;231m'
-}
-setup_colors
- 
-log()  { printf '%s%s•%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
-info() { printf '%s%si%s %s\n'  "$BOLD" "$BLU" "$RST" "$*"; }
-ok()   { printf '%s%s✓%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
-warn() { printf '%s%s▲%s %s\n'  "$BOLD" "$YLW" "$RST" "$*" >&2; }
-err()  { printf '%s%s✗%s %s\n'  "$BOLD" "$RED" "$RST" "$*" >&2; }
-step() { printf '%s%s▶ %s%s\n'  "$BOLD" "$CYN" "$*" "$RST"; }
-hr()   { printf '%s──────────────────────────────────────────────────────────────%s\n' "$GRY" "$RST"; }
- 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "Запустите через sudo или от root."
-    exit 1
-  fi
-}
- 
-# ----------------------------- ВВОД И ВАЛИДАЦИЯ -----------------------------
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
- 
-# ask VAR "Текст" "значение_по_умолчанию"
-ask() {
-  local __var="$1" __prompt="$2" __def="${3:-}" __ans
-  if [ -n "$__def" ]; then
-    read -rp "${__prompt} [${__def}]: " __ans
-    __ans="${__ans:-$__def}"
-  else
-    read -rp "${__prompt}: " __ans
-  fi
-  printf -v "$__var" '%s' "$__ans"
-}
- 
-# ask_required VAR "Текст" — не пускает дальше при пустом вводе
-ask_required() {
-  local __var="$1" __prompt="$2" __ans=""
-  while [ -z "$__ans" ]; do
-    read -rp "${__prompt}: " __ans
-    if [ -z "$__ans" ]; then warn "Значение не может быть пустым."; fi
-  done
-  printf -v "$__var" '%s' "$__ans"
-}
- 
-# ask_port VAR — обязательный ввод порта (1-65535), без значения по умолчанию
-ask_port() {
-  local __var="$1" __ans
-  while true; do
-    read -rp "SSH-порт (1-65535): " __ans
-    if is_uint "$__ans" && [ "$__ans" -ge 1 ] && [ "$__ans" -le 65535 ]; then break; fi
-    warn "Введите число от 1 до 65535."
-  done
-  printf -v "$__var" '%s' "$__ans"
-}
- 
-# ask_username VAR
-ask_username() {
-  local __var="$1" __ans
-  while true; do
-    read -rp "Имя нового пользователя: " __ans
-    if [[ "$__ans" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then break; fi
-    warn "Некорректное имя (строчные буквы/цифры/_/- , начинается с буквы или _)."
-  done
-  printf -v "$__var" '%s' "$__ans"
-}
- 
-# ask_password VAR — скрытый ввод, дважды, с проверкой совпадения
-ask_password() {
-  local __var="$1" __p1 __p2
-  while true; do
-    read -rsp "Пароль для пользователя (ввод скрыт): " __p1; echo
-    if [ -z "$__p1" ]; then warn "Пароль не может быть пустым."; continue; fi
-    read -rsp "Повторите пароль: " __p2; echo
-    if [ "$__p1" != "$__p2" ]; then warn "Пароли не совпадают, попробуйте снова."; continue; fi
-    break
-  done
-  printf -v "$__var" '%s' "$__p1"
-}
- 
-# confirm "Вопрос" -> 0, если да
-confirm() {
-  local __ans
-  read -rp "$1 [y/N]: " __ans
-  [[ "$__ans" =~ ^[YyДд] ]]
-}
- 
-# valid_pubkey "строка" -> 0, если похоже на публичный SSH-ключ
-valid_pubkey() {
-  [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-[a-z0-9-]+@openssh\.com)[[:space:]]+ ]]
-}
- 
-# choose_from_list VAR "Заголовок" "значение_по_умолчанию_или_пусто" пункт1 пункт2 ...
-# Печатает нумерованное меню, помечает рекомендуемый пункт, читает выбор.
-choose_from_list() {
-  local __var="$1" __title="$2" __def="$3"; shift 3
-  local __items=("$@") __i __sel __defidx=""
-  echo "$__title"
-  for __i in "${!__items[@]}"; do
-    if [ -n "$__def" ] && [ "${__items[$__i]}" = "$__def" ]; then
-      printf "  %d) %s   ← рекомендуется\n" "$((__i + 1))" "${__items[$__i]}"
-      __defidx="$((__i + 1))"
-    else
-      printf "  %d) %s\n" "$((__i + 1))" "${__items[$__i]}"
-    fi
-  done
-  local __prompt="Номер"
-  if [ -n "$__defidx" ]; then __prompt="Номер [${__defidx}]"; fi
-  while true; do
-    read -rp "${__prompt}: " __sel
-    if [ -z "$__sel" ] && [ -n "$__defidx" ]; then __sel="$__defidx"; fi
-    if is_uint "$__sel" && [ "$__sel" -ge 1 ] && [ "$__sel" -le "${#__items[@]}" ]; then break; fi
-    warn "Введите число от 1 до ${#__items[@]}."
-  done
-  printf -v "$__var" '%s' "${__items[$((__sel - 1))]}"
-}
- 
-# ----------------------------- ОБЩИЕ ХЕЛПЕРЫ -----------------------------
-ssh_service() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then echo ssh
-  elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then echo sshd
-  else echo ssh; fi
-}
- 
-# set_sshd_option Key Value — задаёт/раскомментирует директиву в sshd_config
-set_sshd_option() {
-  local key="$1" val="$2" file="/etc/ssh/sshd_config"
-  if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" "$file"; then
-    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}\b.*|${key} ${val}|I" "$file"
-  else
-    printf '%s %s\n' "$key" "$val" >> "$file"
-  fi
-}
- 
-# Нейтрализуем конфликтующие настройки в /etc/ssh/sshd_config.d/*.conf
-disable_conflicting_dropins() {
-  shopt -s nullglob
-  local f
-  for f in /etc/ssh/sshd_config.d/*.conf; do
-    sed -i -E 's@^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)([[:space:]].*)$@# disabled by setup: &@I' "$f"
-  done
-  shopt -u nullglob
-}
- 
-apply_sshd() {
-  if sshd -t; then
-    systemctl restart "$(ssh_service)"
-    log "SSH перезапущен."
-  else
-    err "sshd -t нашёл ошибку — SSH НЕ перезапущен. Проверьте /etc/ssh/sshd_config."
-    return 1
-  fi
-}
- 
-# Определяем активный порт SSH из эффективного конфига
-detect_ssh_port() {
-  local p
-  p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
-  if [ -z "$p" ]; then
-    p="$(grep -rhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
-          /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
-          | awk '{print $2; exit}' || true)"
-  fi
-  echo "${p:-22}"
-}
- 
-# Глобально велим apt ЖДАТЬ блокировку dpkg (до 5 мин), а не падать.
-# Действует и на наши apt-команды, и на сторонние установщики (netbird и т.п.).
-ensure_apt_lock_timeout() {
-  mkdir -p /etc/apt/apt.conf.d
-  echo 'DPkg::Lock::Timeout "300";' > /etc/apt/apt.conf.d/99-setup-lock-timeout
-}
- 
-# Ждём, пока фоновые apt/unattended-upgrades отпустят блокировку.
-wait_for_apt() {
-  local waited=0
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-        || fuser /var/lib/dpkg/lock          >/dev/null 2>&1 \
-        || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1 \
-        || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
-    if [ "$waited" -eq 0 ]; then
-      log "Жду освобождения apt/dpkg (идёт фоновое обновление unattended-upgrades)..."
-    fi
-    sleep 5
-    waited=$((waited + 5))
-    if [ "$waited" -ge 300 ]; then
-      warn "Блокировка держится более 5 минут. При желании можно остановить автообновление:"
-      warn "  systemctl stop unattended-upgrades   — и повторить пункт."
-      return 0
-    fi
-  done
-  if [ "$waited" -gt 0 ]; then log "Блокировка освобождена."; fi
-  return 0
-}
- 
-# Проверяем, что нода remnanode запущена и есть её docker-compose.
-require_node() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-    err "Контейнер remnanode не запущен. Сначала подними ноду (пункт 6)."
-    return 1
-  fi
-  if [ ! -f /opt/remnanode/docker-compose.yml ]; then
-    err "/opt/remnanode/docker-compose.yml не найден."
-    return 1
-  fi
-  return 0
-}
- 
-# compose_add_volume "host:container" — добавляет том именно в сервис remnanode
-# (и убирает этот же том из других сервисов, если он туда попал ошибочно). С бэкапом.
-compose_add_volume() {
-  local mapping="$1" f=/opt/remnanode/docker-compose.yml tmp rc=0
-  if [ ! -f "$f" ]; then warn "${f} не найден."; return 1; fi
-  cp -a "$f" "${f}.bak"
-  tmp="$(mktemp)"
-  # 1) убрать строки с этим mapping где угодно (в т.ч. ошибочно в nginx)
-  grep -vF "$mapping" "${f}.bak" > "$tmp" || true
-  # 2) вставить в volumes сервиса remnanode
-  awk -v mapping="$mapping" '
-    {
-      if (innode && ($0 ~ /^[^[:space:]]/ || ($0 ~ /^  [^[:space:]]/ && $0 !~ /^  remnanode:/))) innode=0
-      print $0
-      if ($0 ~ /^  remnanode:[[:space:]]*$/) innode=1
-      else if (innode && !done && $0 ~ /^    volumes:[[:space:]]*$/) { print "      - \"" mapping "\""; done=1 }
-    }
-    END { if (!done) exit 3 }
-  ' "$tmp" > "$f" || rc=$?
-  rm -f "$tmp"
-  if [ "$rc" -ne 0 ]; then
-    cp -a "${f}.bak" "$f"
-    warn "Не нашёл секцию volumes у сервиса remnanode — добавь вручную: - \"${mapping}\""
-    return 1
-  fi
-  log "Том прописан у remnanode: ${mapping} (бэкап: ${f}.bak)"
-  return 0
-}
- 
-# ============================ БЛОКИ ============================
- 
-# ----- 1) SSH-харденинг: порт + пользователь + sudo + ключи + запрет root -----
-block_ssh() {
-  local port user pass keyinput pubkey
-  ask_port port
-  ask_username user
-  ask_password pass
- 
-  echo
-  echo "Публичный SSH-ключ (содержимое id_rsa.pub):"
-  echo "  • вставьте строку ключа, ИЛИ"
-  echo "  • укажите путь к .pub файлу, ИЛИ"
-  echo "  • нажмите Enter — тогда парольный вход НЕ отключается."
-  read -rp "Ключ/путь: " keyinput
-  pubkey=""
-  if [ -n "$keyinput" ]; then
-    if [ -f "$keyinput" ]; then pubkey="$(cat "$keyinput")"; else pubkey="$keyinput"; fi
-    if ! valid_pubkey "$pubkey"; then
-      warn "Это не похоже на публичный SSH-ключ (ожидается ssh-ed25519 / ssh-rsa / ...)."
-      if confirm "Всё равно использовать это значение?"; then :; else
-        pubkey=""; warn "Ключ отброшен — парольный вход останется включённым."
-      fi
-    fi
-  fi
- 
-  # --- сводка перед применением (пароль НЕ печатается) ---
-  echo
-  echo "Будет применено:"
-  echo "  • SSH-порт:          ${port}"
-  echo "  • Пользователь:      ${user}  (sudo NOPASSWD)"
-  echo "  • Вход root по SSH:  запрещён"
-  if [ -n "$pubkey" ]; then
-    echo "  • SSH-ключ:          установлен"
-    echo "  • Парольный вход:    будет ОТКЛЮЧЁН"
-  else
-    echo "  • SSH-ключ:          не задан"
-    echo "  • Парольный вход:    останется включённым"
-  fi
-  confirm "Продолжить?" || { warn "Отменено."; return 1; }
- 
-  # порт
-  log "Ставлю SSH-порт ${port}."
-  set_sshd_option Port "$port"
-  if ! command -v ufw >/dev/null 2>&1; then
-    log "ufw не установлен — ставлю."
-    wait_for_apt
-    apt-get install -y ufw || warn "Не удалось установить ufw."
-  fi
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${port}/tcp" || warn "Не удалось добавить правило ufw (${port}/tcp)."
-  else
-    warn "ufw недоступен — откройте порт ${port}/tcp вручную."
-  fi
- 
-  # пользователь + sudo
-  log "Создаю/настраиваю пользователя ${user}."
-  apt-get update -y
-  apt-get install -y sudo
-  id "$user" >/dev/null 2>&1 || adduser --disabled-password --gecos "" "$user"
-  echo "${user}:${pass}" | chpasswd
-  usermod -aG sudo "$user"
-  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user" > "/etc/sudoers.d/90-${user}"
-  chmod 440 "/etc/sudoers.d/90-${user}"
-  visudo -cf "/etc/sudoers.d/90-${user}" >/dev/null
- 
-  # запрет root
-  set_sshd_option PermitRootLogin no
- 
-  # ключи
-  set_sshd_option PubkeyAuthentication yes
-  if [ -n "$pubkey" ]; then
-    install -d -m 700 -o "$user" -g "$user" "/home/${user}/.ssh"
-    printf '%s\n' "$pubkey" > "/home/${user}/.ssh/authorized_keys"
-    chmod 600 "/home/${user}/.ssh/authorized_keys"
-    chown "${user}:${user}" "/home/${user}/.ssh/authorized_keys"
-    set_sshd_option PasswordAuthentication no
-    log "Ключ установлен, парольный вход будет отключён."
-  else
-    warn "Ключ не задан — парольный вход оставлен включённым."
-  fi
- 
-  disable_conflicting_dropins
-  apply_sshd
-  echo
-  warn "В НОВОМ окне проверьте вход (НЕ закрывая текущую сессию!):"
-  warn "    ssh -p ${port} ${user}@<IP_СЕРВЕРА>"
-}
- 
-# ----- 2) node-accelerator: optimize (XanMod BBRv3 + sysctl + RPS/RFS + swap) -----
-# Единственный владелец ядра и тюнинга (раньше это были отдельные XanMod/BBR — удалены как дубли).
-block_optimize() {
-  local tmp
-  info "node-accelerator: оптимизация — XanMod BBRv3 + sysctl + RPS/RFS/XPS + swap + лимиты."
-  warn "Делает ядро XanMod (BBRv3) и весь сетевой тюнинг за один проход."
-  warn "После установки XanMod потребуется reboot."
-  echo
-  tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator (install.sh)."
-    rm -f "$tmp"
-    return 1
-  fi
-  NA_REF="$NA_REF" bash "$tmp" optimize || warn "optimize завершился с ненулевым кодом — см. вывод выше."
-  rm -f "$tmp"
-  echo
-  warn "Если установился XanMod — выполни reboot, затем проверь: uname -r (должно содержать xanmod)."
-  warn "Откатить тюнинг при необходимости: bash <(curl -fsSL .../node-accelerator/${NA_REF}/install.sh) rollback optimize"
-}
- 
-# ----- 3) node-accelerator: protect (nftables na_filter + CrowdSec) -----
-# Единственный владелец фаервола/анти-брутфорса (раньше это был fail2ban — удалён как дубль).
-block_protect() {
-  local tmp ssh_port node_port tcp_ports udp_ports whitelist
-  info "node-accelerator: защита — nftables (таблица na_filter) + CrowdSec, anti-scan/flood, бан брутфорса SSH."
-  warn "Запускай ПОСЛЕ поднятия ноды — нужны её порты."
-  warn "Есть таймер безопасности: если после применения SSH отвалится и ты не переподключишься"
-  warn "за 5 минут — правила откатятся сами. Запереть себя насмерть это не даст."
-  echo
-  ssh_port="$(detect_ssh_port 2>/dev/null || echo 22)"
-  log "SSH-порт определён: ${ssh_port}"
-  ask node_port "Порт ноды (NODE_PORT)" "2222"
-  ask tcp_ports "Сервисные TCP-порты (через запятую)" "443"
-  ask udp_ports "Сервисные UDP-порты (через запятую)" "443"
-  warn "ВАЖНО: впиши свой постоянный IP (домашний/VPN/панель), чтобы лимиты тебя не банили."
-  ask whitelist "WHITELIST (IP/CIDR через запятую; можно пусто)" ""
-  echo
-  tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator (install.sh)."
-    rm -f "$tmp"
-    return 1
-  fi
-  SSH_PORT="$ssh_port" TCP_PORTS="$tcp_ports" UDP_PORTS="$udp_ports" NODE_PORT="$node_port" \
-    WHITELIST="$whitelist" SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
-    bash "$tmp" protect || warn "protect завершился с ненулевым кодом — см. вывод выше."
-  rm -f "$tmp"
-  echo
-  ok "Готово. ПЕРЕПОДКЛЮЧИСЬ по SSH в течение 5 минут — это подтвердит, что доступ жив."
-  warn "Статус: na-fw-status  |  топ источников: na-fw-top-talkers"
-  warn "Откат: bash <(curl -fsSL .../node-accelerator/${NA_REF}/install.sh) rollback protect"
-}
- 
-# ----- 6) netbird -----
+#  КАК ВСТАВИТЬ:
+#   1) В своём `setup` УДАЛИ старую функцию block_netbird и вставь новую отсюда.
+#   2) block_update_lists добавь рядом с остальными функциями.
+#   3) В print_menu (раздел «Диагностика / сервис») добавь строку:
+#        echo -e "   ${BOLD}${GRN} u)${RST} Обновить все списки сетей  ${GRY}— геолисты/блоклисты/госсети + проверка автообновления${RST}"
+#   4) В menu() в "case" добавь:
+#        u|U) run_block "Обновить списки сетей" block_update_lists ;;
+#      (ветка для netbird у тебя уже есть — пункт 4 / группа 17.)
+# ============================================================================
+
+
+# ----- netbird: установка ТОЛЬКО если не стоит, иначе сразу подключение -----
 block_netbird() {
   local key
-  log "Устанавливаю netbird."
-  wait_for_apt
-  curl -fsSL https://pkgs.netbird.io/install.sh | sh
+
+  if command -v netbird >/dev/null 2>&1; then
+    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1)). Установку пропускаю."
+  else
+    log "netbird не найден — устанавливаю."
+    wait_for_apt
+    if ! curl -fsSL https://pkgs.netbird.io/install.sh | sh; then
+      err "Установка netbird не удалась."
+      return 1
+    fi
+    hash -r 2>/dev/null || true   # обновить кэш путей, чтобы команда netbird нашлась сразу
+  fi
+
+  if ! command -v netbird >/dev/null 2>&1; then
+    err "Команда netbird всё ещё недоступна — проверь установку вручную."
+    return 1
+  fi
+
+  # Уже подключён? Покажем и спросим про переподключение.
+  if netbird status 2>/dev/null | grep -qiE 'Management:[[:space:]]*Connected|Connected to'; then
+    info "netbird сейчас ПОДКЛЮЧЁН:"
+    netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|Signal|FQDN' | sed 's/^/   /' || true
+    if ! confirm "Переподключить с новым setup-key?"; then
+      ok "Оставляю текущее подключение без изменений."
+      return 0
+    fi
+  fi
+
   echo "setup-key вводится здесь и в файле не хранится."
   ask key "netbird setup-key (Enter — подключить позже)" ""
-  if [ -n "$key" ]; then
-    netbird up --setup-key "$key"
-    log "netbird подключён."
+  if [ -z "$key" ]; then
+    warn "Ключ не задан. Позже подключишь командой: netbird up --setup-key <KEY>"
+    return 0
+  fi
+
+  # Если уже в сети — корректно выходим перед повторным up (иначе netbird ругается).
+  if netbird status 2>/dev/null | grep -qiE 'Management:[[:space:]]*Connected|Connected to'; then
+    log "Отключаюсь перед переподключением (netbird down)."
+    netbird down >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  if netbird up --setup-key "$key"; then
+    ok "netbird подключён."
+    netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|FQDN' | sed 's/^/   /' || true
   else
-    warn "Позже подключите: netbird up --setup-key <KEY>"
-  fi
-}
- 
-# ----- 6) remnanode -----
-block_remnanode() {
-  log "Запускаю установщик remnanode (интерактивный — следуйте подсказкам)."
-  wait_for_apt
-  bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
- 
-  mkdir -p /var/log/remnanode
-  if [ ! -f /opt/remnanode/docker-compose.yml ]; then
-    warn "/opt/remnanode/docker-compose.yml не найден — пропускаю правку volumes."
-    return
-  fi
-  compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  if confirm "Перезапустить remnanode (docker compose down && up -d)?"; then
-    ( cd /opt/remnanode && docker compose down && docker compose up -d )
-  fi
-}
- 
-# ----- 7) RU-блокировка (RU geoip/geosite + bind-mount + cron) -----
-block_rublock() {
-  require_node || return 1
- 
-  log "Готовлю папку ассетов и копирую штатные geoip/geosite из контейнера."
-  mkdir -p /opt/remnanode/xray-assets
-  docker cp remnanode:/usr/local/share/xray/. /opt/remnanode/xray-assets/
- 
-  log "Скачиваю RU-списки (runetfreedom)."
-  wget -qO /opt/remnanode/xray-assets/geosite-ru.dat \
-    https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
-  wget -qO /opt/remnanode/xray-assets/geoip-ru.dat \
-    https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
-  if [ "$(stat -c%s /opt/remnanode/xray-assets/geosite-ru.dat 2>/dev/null || echo 0)" -lt 1000000 ] \
-     || [ "$(stat -c%s /opt/remnanode/xray-assets/geoip-ru.dat 2>/dev/null || echo 0)" -lt 1000000 ]; then
-    err "RU-списки скачались подозрительно маленькими — прерываю."
+    err "netbird up не удался. Проверь setup-key и статус: netbird status"
     return 1
   fi
-  chmod 644 /opt/remnanode/xray-assets/*.dat
- 
-  log "Прописываю bind-mount ассетов в docker-compose."
-  compose_add_volume "/opt/remnanode/xray-assets:/usr/local/share/xray"
- 
-  log "Пересоздаю контейнер."
-  ( cd /opt/remnanode && docker compose up -d )
-  sleep 3
-  local cnt
-  cnt="$(docker exec remnanode sh -c 'ls /usr/local/share/xray/*.dat 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  log "В контейнере .dat-файлов: ${cnt} (ожидаем 4)."
-  if [ "${cnt:-0}" -lt 4 ]; then
-    warn "Похоже, bind-mount не применился — проверь отступы в docker-compose.yml."
+}
+
+
+# ----- Единое обновление ВСЕХ списков сетей + самолечение автообновления -----
+block_update_lists() {
+  local did=0
+  echo
+  step "Обновление всех списков сетей"
+
+  # 1) RU geoip/geosite для Xray (если настроена RU-блокировка)
+  if [ -x /opt/remnanode/update-geo.sh ]; then
+    log "RU geoip/geosite (Xray)…"
+    if /opt/remnanode/update-geo.sh; then ok "RU-списки обновлены."; else warn "RU-списки: ошибка (см. вывод)."; fi
+    did=1
   fi
- 
-  log "Ставлю авто-обновление списков (cron, воскресенье 04:00)."
-  cat > /opt/remnanode/update-geo.sh <<'EOS'
-#!/bin/bash
-set -e
-ASSETS=/opt/remnanode/xray-assets
-TMP=$(mktemp -d)
-wget -q -O "$TMP/geosite-ru.dat" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
-wget -q -O "$TMP/geoip-ru.dat"   https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
-[ "$(stat -c%s "$TMP/geosite-ru.dat")" -gt 1000000 ] || { echo "geosite-ru.dat suspiciously small"; exit 1; }
-[ "$(stat -c%s "$TMP/geoip-ru.dat")"   -gt 1000000 ] || { echo "geoip-ru.dat suspiciously small"; exit 1; }
-mv "$TMP/geosite-ru.dat" "$ASSETS/geosite-ru.dat"
-mv "$TMP/geoip-ru.dat"   "$ASSETS/geoip-ru.dat"
-chmod 644 "$ASSETS"/*.dat
-rmdir "$TMP"
-docker restart remnanode >/dev/null
-echo "geo update done: $(date)"
-EOS
-  chmod +x /opt/remnanode/update-geo.sh
-  if crontab -l 2>/dev/null | grep -qF '/opt/remnanode/update-geo.sh'; then
-    log "Cron уже настроен."
-  else
+
+  # 2) Блоклисты node-accelerator (Spamhaus DROP + FireHOL L1 [+ Tor])
+  if [ -x /usr/local/sbin/na-blocklist-update ]; then
+    log "Блоклисты node-accelerator (Spamhaus/FireHOL)…"
+    if /usr/local/sbin/na-blocklist-update >/dev/null 2>&1; then ok "Блоклисты обновлены."; else warn "Блоклисты: ошибка."; fi
+    did=1
+  fi
+
+  # 3) РФ-госсети (если включён блок госсетей)
+  if [ -x /usr/local/sbin/nodeforge-govblock-update ]; then
+    log "РФ-госсети…"
+    if /usr/local/sbin/nodeforge-govblock-update; then ok "Госсети обновлены."; else warn "Госсети: ошибка."; fi
+    did=1
+  fi
+
+  [ "$did" -eq 0 ] && warn "Обновляемых списков не найдено (ничего списочного пока не настроено)."
+
+  # --- самолечение cron: если скрипт есть, а задание пропало — вернуть ---
+  if [ -x /opt/remnanode/update-geo.sh ] && ! { crontab -l 2>/dev/null | grep -qF 'update-geo.sh'; }; then
     ( crontab -l 2>/dev/null || true; echo '0 4 * * 0 /opt/remnanode/update-geo.sh >> /var/log/geo-update.log 2>&1' ) | crontab -
-    log "Cron добавлен."
+    log "Восстановил cron для RU-geo (Вс 04:00)."
   fi
- 
+  if [ -x /usr/local/sbin/nodeforge-govblock-update ] && ! { crontab -l 2>/dev/null | grep -qF 'nodeforge-govblock-update'; }; then
+    ( crontab -l 2>/dev/null || true; echo '17 5 * * * /usr/local/sbin/nodeforge-govblock-update >> /var/log/nodeforge-govblock.log 2>&1' ) | crontab -
+    log "Восстановил cron для РФ-госсетей (ежедневно 05:17)."
+  fi
+
+  # --- показать, что всё обновляется само ---
   echo
-  warn "ОСТАЛОСЬ СДЕЛАТЬ В ПАНЕЛИ Remnawave (один раз на все ноды):"
-  warn "Xray Config → заменить блоки outbounds и routing на это и сохранить:"
-  cat <<'EOJSON'
- 
-"outbounds": [
-  { "tag": "DIRECT",  "protocol": "freedom" },
-  { "tag": "BLOCK",   "protocol": "blackhole" },
-  { "tag": "TORRENT", "protocol": "blackhole" }
-],
-"routing": {
-  "domainStrategy": "IPIfNonMatch",
-  "rules": [
-    { "type": "field", "protocol": ["bittorrent"], "outboundTag": "TORRENT" },
-    { "type": "field",
-      "domain": [
-        "ext:geosite-ru.dat:category-ru",
-        "ext:geosite-ru.dat:ru-available-only-inside",
-        "ext:geosite-ru.dat:category-ads-all"
-      ],
-      "outboundTag": "BLOCK" },
-    { "type": "field",
-      "ip": [ "geoip:private", "ext:geoip-ru.dat:ru" ],
-      "outboundTag": "BLOCK" }
-  ]
-}
-EOJSON
-}
- 
-# ----- 8) Логи ноды (logrotate + zstd) -----
-block_logs() {
-  require_node || return 1
- 
-  log "Гарантирую папку логов и том логов в compose."
-  mkdir -p /var/log/remnanode
-  compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  ( cd /opt/remnanode && docker compose up -d )
- 
-  log "Ставлю logrotate + zstd."
-  wait_for_apt
-  apt-get install -y logrotate zstd
- 
-  log "Пишу /etc/logrotate.d/remnanode."
-  cat > /etc/logrotate.d/remnanode <<'EOC'
-/var/log/remnanode/*.log {
-    daily
-    rotate 9999
-    compress
-    compresscmd /usr/bin/zstd
-    compressoptions "-19 --quiet --rm"
-    compressext .zst
-    uncompresscmd /usr/bin/unzstd
-    missingok
-    notifempty
-    copytruncate
-    dateext
-    dateformat -%Y-%m-%d
-}
-EOC
-  if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
-    log "Конфиг logrotate корректен."
-  else
-    warn "logrotate -d сообщил о проблеме — проверь /etc/logrotate.d/remnanode."
-  fi
- 
+  info "Автообновление (работает само, по расписанию):"
+  echo "   ${GRY}— cron-задания:${RST}"
+  crontab -l 2>/dev/null | grep -E 'update-geo|govblock' | sed 's/^/      /' || echo "      (нет)"
+  echo "   ${GRY}— systemd-таймеры node-accelerator (блоклисты/fleet):${RST}"
+  systemctl list-timers --all 2>/dev/null | grep -E 'na-blocklist|na-fleet' | sed 's/^/      /' || echo "      (нет)"
   echo
-  warn "ОСТАЛОСЬ В ПАНЕЛИ Remnawave: в Config Profile ноды добавь блок log с путями"
-  warn "  /var/log/remnanode/access.log  и  /var/log/remnanode/error.log"
-  warn "иначе логи не появятся. Потом проверь:"
-  warn "  docker exec remnanode ls -la /var/log/remnanode/"
+  ok "Готово."
 }
- 
-# ----- 9) XHTTP (location в nginx ноды) -----
-block_xhttp() {
-  local f=/opt/remnanode/nginx.conf path block ngx tmp existed=0 rc=0
-  ask path "XHTTP-путь (без слешей)" "xhttppath"
- 
-  # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
-  # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
-  block=$(cat <<EOB
- 
-    location /${path}/ {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:/dev/shm/xrxh.socket;
-        }
-EOB
-)
- 
-  if [ ! -f "$f" ]; then
-    warn "${f} не найден. Вставь этот блок в server { } нужного nginx.conf вручную:"
-    printf '%s\n' "$block"
-    return 1
-  fi
- 
-  if grep -qF "location /${path}/" "$f"; then existed=1; fi
-  cp -a "$f" "${f}.bak"
-  tmp="$(mktemp)"
- 
-  # 1) удалить существующий блок location /path/ { ... } (в т.ч. с кривыми отступами)
-  awk -v path="$path" '
-    function cnt(s, ch,   n,i){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==ch) n++; return n }
-    {
-      if (skip==0 && index($0,"location /" path "/")>0 && index($0,"{")>0) { skip=1; depth=cnt($0,"{")-cnt($0,"}"); if(depth<=0) skip=0; next }
-      if (skip==1) { depth += cnt($0,"{")-cnt($0,"}"); if(depth<=0) skip=0; next }
-      print
-    }' "${f}.bak" > "$tmp"
- 
-  # 2) вставить свежий блок в первый server { } (перед его закрывающей скобкой)
-  awk -v ins="$block" '
-    function cnt(s, ch,   n,i){ n=0; for(i=1;i<=length(s);i++) if(substr(s,i,1)==ch) n++; return n }
-    { buf[NR]=$0 }
-    END {
-      start=0
-      for (i=1;i<=NR;i++) if (buf[i] ~ /server[[:space:]]*\{/) { start=i; break }
-      end=0
-      if (start>0){ d=0; for (i=start;i<=NR;i++){ d += cnt(buf[i],"{")-cnt(buf[i],"}"); if (d<=0){ end=i; break } } }
-      for (i=1;i<=NR;i++){ if (end>0 && i==end) print ins; print buf[i] }
-      if (end==0) exit 3
-    }' "$tmp" > "$f" || rc=$?
-  rm -f "$tmp"
- 
-  if [ "$rc" -ne 0 ]; then
-    err "Не нашёл server-блок в ${f} — откатываю. Вставь блок вручную:"
-    cp -a "${f}.bak" "$f"
-    printf '%s\n' "$block"
-    return 1
-  fi
-  if [ "$existed" -eq 1 ]; then
-    log "Пересобрал location /${path}/ с правильными отступами (бэкап: ${f}.bak)."
-  else
-    log "Вставил location /${path}/ (бэкап: ${f}.bak)."
-  fi
- 
-  # ищем nginx-контейнер (приоритет — remnawave-nginx)
-  ngx="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'remnawave.*nginx|nginx.*remnawave' | head -n1 || true)"
-  if [ -z "$ngx" ]; then
-    ngx="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i nginx | head -n1 || true)"
-  fi
-  if [ -z "$ngx" ]; then
-    warn "Не нашёл nginx-контейнер. Проверь конфиг и перезапусти nginx вручную."
-    return 1
-  fi
- 
-  log "Проверяю конфиг в контейнере ${ngx}."
-  if docker exec "$ngx" nginx -t; then
-    docker restart "$ngx" >/dev/null
-    docker restart remnanode >/dev/null
-    log "nginx (${ngx}) и remnanode перезапущены."
-  else
-    err "nginx -t не прошёл — откатываю ${f}."
-    if [ -f "${f}.bak" ]; then cp -a "${f}.bak" "$f"; fi
-    return 1
-  fi
-}
- 
-# ----- 10) nginx 1.28 -> NGINX_TARGET (с проверкой версии и вопросом) -----
-block_nginx_upgrade() {
-  local f=/opt/remnanode/docker-compose.yml cur target rc=0
-  if [ ! -f "$f" ]; then err "${f} не найден."; return 1; fi
- 
-  cur="$(grep -oE 'image:[[:space:]]*nginx:[0-9.]+' "$f" | grep -oE '[0-9.]+$' | head -n1 || true)"
-  if [ -z "$cur" ]; then
-    warn "В ${f} не нашёл строку 'image: nginx:<версия>' — проверь образ вручную."
-    return 1
-  fi
-  log "Текущая версия nginx в compose: ${cur}"
-  case "$cur" in
-    1.28*) : ;;
-    *) log "Версия не 1.28 (сейчас ${cur}) — менять не нужно."; return 0 ;;
-  esac
- 
-  warn "В nginx 1.28 найдены уязвимости (CVE). Рекомендуется обновить."
-  ask target "Целевая версия nginx" "$NGINX_TARGET"
-  if ! confirm "Поменять nginx ${cur} → ${target} и пересоздать контейнер?"; then
-    warn "Отменено — образ не тронут."
-    return 0
-  fi
- 
-  cp -a "$f" "${f}.bak"
-  sed -i -E "s#nginx:${cur//./\\.}#nginx:${target}#g" "$f"
-  log "Образ в compose обновлён на nginx:${target} (бэкап: ${f}.bak). Тяну и пересоздаю."
-  ( cd /opt/remnanode && docker compose pull && docker compose up -d ) || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    err "pull/up не удался (возможно, нет такого тега). Откатываю compose."
-    cp -a "${f}.bak" "$f"
-    ( cd /opt/remnanode && docker compose up -d ) || true
-    return 1
-  fi
-  sleep 2
-  local now
-  now="$(docker inspect -f '{{.Config.Image}}' remnawave-nginx 2>/dev/null || true)"
-  log "Готово. Контейнер remnawave-nginx на образе: ${now:-неизвестно}"
-}
- 
-# ----- 11) Перезапуск контейнеров (стек ноды или все на хосте) -----
-block_restart() {
-  local mode ids
-  echo
-  log "Текущие контейнеры:"
-  if ! docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null; then
-    err "docker недоступен."
-    return 1
-  fi
-  echo
- 
-  choose_from_list mode "Что перезапустить?" "Стек ноды: restart" \
-    "Стек ноды: restart" \
-    "Стек ноды: пересоздать (down + up -d)" \
-    "Все контейнеры на хосте"
- 
-  case "$mode" in
-    "Стек ноды: restart")
-      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
-      log "docker compose restart (в /opt/remnanode)..."
-      ( cd /opt/remnanode && docker compose restart )
-      ;;
-    "Стек ноды: пересоздать (down + up -d)")
-      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
-      log "docker compose down && up -d (в /opt/remnanode)..."
-      ( cd /opt/remnanode && docker compose down && docker compose up -d )
-      ;;
-    "Все контейнеры на хосте")
-      ids="$(docker ps -q 2>/dev/null || true)"
-      if [ -z "$ids" ]; then warn "Запущенных контейнеров нет."; return 0; fi
-      log "Перезапускаю все контейнеры на хосте..."
-      # shellcheck disable=SC2086
-      docker restart $ids >/dev/null
-      ;;
-  esac
- 
-  log "Готово. Состояние:"
-  docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
-}
- 
-# Поиск бинаря Beszel (агент или хаб) по PATH и штатным путям install-скрипта.
-find_beszel_bin() {
-  local n="$1" p
-  p="$(command -v "$n" 2>/dev/null || true)"
-  if [ -n "$p" ]; then echo "$p"; return 0; fi
-  for p in "/opt/${n}/${n}" "/usr/local/sbin/${n}" "/usr/local/bin/${n}"; do
-    if [ -x "$p" ]; then echo "$p"; return 0; fi
-  done
-  return 1
-}
- 
-# ----- 12) Beszel: подключить агент к хабу -----
-block_beszel_agent() {
-  local key port token url tmp
-  info "Beszel — мониторинг. Нужен публичный ключ из хаба:"
-  info "в веб-интерфейсе хаба нажми Add System и скопируй Public Key."
-  echo
-  ask_required key "Публичный ключ Beszel (Public Key из хаба)"
-  ask port  "Порт агента" "45876"
-  warn "Для NAT-сервера (агент сам идёт к хабу по WebSocket) укажи Token и URL хаба."
-  warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
-  ask token "Token (Enter — пропустить)" ""
-  ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
- 
-  tmp=/tmp/install-agent.sh
-  log "Скачиваю install-agent.sh."
-  if ! curl -sL https://get.beszel.dev -o "$tmp"; then
-    err "Не удалось скачать install-agent.sh."
-    return 1
-  fi
-  chmod +x "$tmp"
- 
-  set -- -k "$key" -p "$port"
-  if [ -n "$token" ]; then set -- "$@" -t "$token"; fi
-  if [ -n "$url" ];   then set -- "$@" -url "$url"; fi
- 
-  log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."
-  "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
- 
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${port}/tcp" || warn "Не удалось добавить правило ufw (${port}/tcp)."
-  fi
- 
-  echo
-  if systemctl is-active --quiet beszel-agent 2>/dev/null; then
-    ok "beszel-agent запущен. Проверь, что в хабе нода стала зелёной."
-  else
-    warn "Агент не активен — проверь: systemctl status beszel-agent"
-  fi
-}
- 
-# ----- 13) Beszel: обновить (агент и/или хаб) -----
-block_beszel_update() {
-  local found=0 bin c dir img
-  bin="$(find_beszel_bin beszel-agent || true)"
-  if [ -n "$bin" ]; then
-    found=1
-    log "Агент: ${bin} update"
-    "$bin" update || warn "Обновление агента вернуло ошибку."
-    systemctl restart beszel-agent 2>/dev/null || true
-    ok "Агент Beszel обновлён."
-  fi
-  bin="$(find_beszel_bin beszel || true)"
-  if [ -n "$bin" ]; then
-    found=1
-    log "Хаб: ${bin} update"
-    "$bin" update || warn "Обновление хаба вернуло ошибку."
-    systemctl restart beszel-hub 2>/dev/null || true
-    ok "Хаб Beszel обновлён."
-  fi
-  # Docker-установка (хаб beszel и/или агент beszel-agent): обновляем через compose.
-  for c in beszel beszel-agent; do
-    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
-      found=1
-      dir="$(docker inspect "$c" -f '{{ index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
-      img="$(docker inspect "$c" -f '{{.Config.Image}}' 2>/dev/null || true)"
-      if [ -n "$dir" ] && [ -d "$dir" ]; then
-        log "Docker ${c}: обновляю через compose в ${dir}."
-        ( cd "$dir" && docker compose pull && docker compose up -d ) || warn "Не удалось обновить ${c} (compose в ${dir})."
-        ok "Docker ${c} обновлён."
-      else
-        log "Docker ${c}: тяну образ ${img:-henrygd/${c}:latest}."
-        docker pull "${img:-henrygd/${c}:latest}" || warn "docker pull не удался для ${c}."
-        warn "Контейнер ${c} запущен не через compose — пересоздай его вручную для применения образа."
-      fi
-    fi
-  done
-  if [ "$found" -eq 0 ]; then
-    warn "Beszel (агент/хаб) на этом сервере не найден."
-    warn "Сначала подключи агент (пункт «Beszel: подключить агент»)."
-  fi
-}
- 
-# ----- 14) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
-block_diag() {
-  local tmp
-  log "Скачиваю и запускаю диагностику ноды (Case211/node-diagnostic)."
-  log "Полный прогон ~5 мин; скрипт может предложить применить фиксы — отвечай сам."
-  tmp="$(mktemp)"
-  if ! curl -fsSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/node-diagnostic.sh -o "$tmp"; then
-    err "Не удалось скачать диагностику."
-    rm -f "$tmp"
-    return 1
-  fi
-  # сам диагностический скрипт может вернуть ненулевой код при найденных проблемах — это нормально
-  bash "$tmp" || true
-  rm -f "$tmp"
-}
- 
-# ----- node-accelerator: diagnose (ядро/sysctl/conntrack/NIC/firewall/порты, read-only) -----
-block_na_diagnose() {
-  local tmp
-  info "node-accelerator: диагностика — ядро/BBR/sysctl/conntrack/NIC/RPS/firewall/порты. Только чтение."
-  echo
-  tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator (install.sh)."
-    rm -f "$tmp"
-    return 1
-  fi
-  # read-only; ненулевой код = найдены замечания, это нормально
-  NA_REF="$NA_REF" bash "$tmp" diagnose || true
-  rm -f "$tmp"
-}
- 
-# ----- 13) Подменю «Диагностика»: выбор, что запускать -----
-print_diag_menu() {
-  cat <<EOF
- 
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
-                        ${BOLD}${WHT}Диагностика${RST}
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
-   ${BOLD}${CYN} 1)${RST} node-diagnostic    ${GRY}— проверка ноды, может предложить фиксы${RST}
-   ${BOLD}${CYN} 2)${RST} node-accelerator   ${GRY}— ядро/sysctl/сеть/firewall, только чтение${RST}
-   ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
-${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Можно оба сразу:  1 2${RST}
-EOF
-}
- 
-submenu_diag() {
-  local choice c
-  while true; do
-    print_diag_menu
-    read -rp "Выбор: " choice
-    [ -z "$choice" ] && continue
-    for c in $choice; do
-      case "$c" in
-        1) run_block "Диагностика ноды (node-diagnostic)" block_diag ;;
-        2) run_block "Диагностика (node-accelerator)" block_na_diagnose ;;
-        0) return 0 ;;
-        *) warn "Неизвестный пункт: ${c}" ;;
-      esac
-    done
-    echo
-    read -rp "Нажмите Enter для возврата в меню диагностики..." _
-  done
-}
- 
-# ----- 14) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
-print_checks_menu() {
-  cat <<EOF
- 
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
-                   ${BOLD}${WHT}Проверки и бенчмарки${RST}
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
- ${BOLD}${MAG}Блокировки / регион${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 1)${RST} IP.Check.Place           ${GRY}— блокировки IP зарубежными сервисами${RST}
-   ${BOLD}${CYN} 2)${RST} IP Region (ipregion.xyz) ${GRY}— какой регион видят сайты по IP${RST}
-   ${BOLD}${CYN} 3)${RST} IP Region (vernette)     ${GRY}— то же, исходный скрипт с GitHub${RST}
-   ${BOLD}${CYN} 4)${RST} CensorCheck (DPI)        ${GRY}— блокировки по DPI (для РФ-серверов)${RST}
-   ${BOLD}${CYN} 5)${RST} Instagram audio          ${GRY}— блокировка аудио в Instagram${RST}
- 
- ${BOLD}${MAG}Бенчмарки / скорость${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 6)${RST} bench.sh                 ${GRY}— параметры + скорость (зарубежные)${RST}
-   ${BOLD}${CYN} 7)${RST} speed.tlab.pw            ${GRY}— скорость (зарубежные, альт.)${RST}
-   ${BOLD}${CYN} 8)${RST} bench.gig.ovh            ${GRY}— параметры + скорость (РФ-провайдеры)${RST}
-   ${BOLD}${CYN} 9)${RST} bench.tlab.pw            ${GRY}— то же (РФ, альт.)${RST}
-   ${BOLD}${CYN}10)${RST} YABS                     ${GRY}— диск + сеть (iperf3) + GeekBench${RST}
-   ${BOLD}${CYN}11)${RST} sysbench CPU             ${GRY}— оценка выделенного CPU${RST}
-   ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
-${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Несколько номеров через пробел можно, напр.:  1 4${RST}
-EOF
-}
- 
-submenu_checks() {
-  local choice c
-  while true; do
-    print_checks_menu
-    read -rp "Выбор: " choice
-    [ -z "$choice" ] && continue
-    for c in $choice; do
-      case "$c" in
-        1)  echo; step "IP.Check.Place";            bash <(curl -Ls IP.Check.Place) -l en || true ;;
-        2)  echo; step "IP Region (ipregion.xyz)";  bash <(wget -qO- https://ipregion.xyz) || true ;;
-        3)  echo; step "IP Region (vernette)";       bash <(wget -qO- https://github.com/vernette/ipregion/raw/master/ipregion.sh) || true ;;
-        4)  echo; step "CensorCheck (DPI)";          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        5)  echo; step "Instagram audio";            bash <(curl -L -s https://bench.openode.xyz/checker_inst.sh) || true ;;
-        6)  echo; step "bench.sh";                   wget -qO- bench.sh | bash || true ;;
-        7)  echo; step "speed.tlab.pw";              wget -qO- speed.tlab.pw | bash || true ;;
-        8)  echo; step "bench.gig.ovh";              wget -qO- bench.gig.ovh | bash || true ;;
-        9)  echo; step "bench.tlab.pw";              wget -qO- bench.tlab.pw | bash || true ;;
-        10) echo; step "YABS";                       curl -sL yabs.sh | bash -s -- -4 || true ;;
-        11) echo; step "sysbench CPU"
-            if ! command -v sysbench >/dev/null 2>&1; then
-              log "sysbench не найден — устанавливаю."
-              wait_for_apt
-              if ! apt-get install -y sysbench; then warn "Не удалось поставить sysbench."; fi
-            fi
-            if command -v sysbench >/dev/null 2>&1; then
-              sysbench cpu run --threads=1 || true
-            fi ;;
-        0)  return 0 ;;
-        *)  warn "Неизвестный пункт: ${c}" ;;
-      esac
-    done
-    echo
-    read -rp "Нажмите Enter для возврата в меню проверок..." _
-  done
-}
- 
-# ============================ МЕНЮ ============================
-# self_update вызывается НАПРЯМУЮ из меню (не через run_block), чтобы exec
-# мог заменить весь процесс на свежую версию.
-self_update() {
-  echo
-  step "Обновление скрипта"
-  log "Источник: ${UPDATE_URL}"
- 
-  local dest="$SELF" tmp
-  case "$dest" in
-    /dev/fd/*|/proc/*|"") dest="$(pwd)/setup.sh" ;;   # запущено не из файла
-  esac
- 
-  tmp="$(mktemp)"
-  if ! curl -fsSL "$UPDATE_URL" -o "$tmp"; then
-    err "Не удалось скачать обновление с ${UPDATE_URL}."
-    rm -f "$tmp"; return 1
-  fi
-  if [ ! -s "$tmp" ] || ! head -n1 "$tmp" | grep -q '^#!'; then
-    err "Скачанный файл не похож на скрипт (пустой или без shebang) — обновление отменено."
-    rm -f "$tmp"; return 1
-  fi
-  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
-    rm -f "$tmp"
-    log "У тебя уже последняя версия (${dest})."
-    return 0
-  fi
- 
-  cat "$tmp" > "$dest"
-  rm -f "$tmp"
-  chmod +x "$dest" 2>/dev/null || true
-  ok "Скрипт обновлён: ${dest}"
-  log "Перезапускаю обновлённую версию..."
-  exec bash "$dest"
-}
- 
-# Каждый блок запускается в подоболочке с `set -e`: ошибка останавливает
-# только текущий блок, меню продолжает работать.
-run_block() {
-  local name="$1" fn="$2" rc=0
-  echo
-  step "$name"
-  ( set -eo pipefail; "$fn" )
-  rc=$?
-  if [ "$rc" -eq 0 ]; then
-    ok "${name} — готово."
-  else
-    err "${name} — прервано (код ${rc}, см. вывод выше)."
-  fi
-}
- 
-banner() {
-  echo
-  printf '%s%s' "$BOLD" "$CYN"
-  cat <<'ART'
-              _      __
- _ _  ___  __| |___ / _|___ _ _ __ _ ___
-| ' \/ _ \/ _` / -_)  _/ _ \ '_/ _` / -_)
-|_||_\___/\__,_\___|_| \___/_| \__, \___|
-                               |___/
-ART
-  printf '%s' "$RST"
-  printf '   %sharden · configure · remnawave node%s\n' "$GRY" "$RST"
-  hr
-}
- 
-print_menu() {
-  cat <<EOF
- 
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
-                     ${BOLD}${WHT}Настройка сервера${RST}
-${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
- ${BOLD}${MAG}Базовые шаги${RST} ${GRY}(каждый можно запустить отдельно):${RST}
-   ${BOLD}${CYN} 1)${RST} SSH-харденинг   ${GRY}— порт + пользователь + sudo + ключи + запрет root${RST}
-   ${BOLD}${GRN} 2)${RST} ${WHT}optimize${RST} ${GRN}★${RST}      ${GRY}— node-accelerator: ядро XanMod BBRv3 + тюнинг + swap${RST}
-   ${BOLD}${GRN} 3)${RST} ${WHT}protect${RST}         ${GRY}— node-accelerator: nftables + CrowdSec (фаервол)${RST}
-   ${BOLD}${CYN} 4)${RST} netbird         ${GRY}— mesh VPN${RST}
-   ${BOLD}${CYN} 5)${RST} remnanode       ${GRY}— нода (интерактивный установщик)${RST}
- 
- ${BOLD}${MAG}Настройка ноды${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 6)${RST} RU-блокировка   ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
-   ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
-   ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
-   ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
-   ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
- 
- ${BOLD}${MAG}Мониторинг (Beszel)${RST}${GRY}:${RST}
-   ${BOLD}${CYN}11)${RST} Подключить агент к хабу  ${GRY}— установка beszel-agent${RST}
-   ${BOLD}${CYN}12)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
- 
- ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
-   ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: node-diagnostic / node-accelerator${RST}
-   ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
-   ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
- 
- ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
-   ${BOLD}${YLW}16)${RST} ① До ребута       ${GRY}(1 + 2)  → потом reboot${RST}
-   ${BOLD}${YLW}17)${RST} ② Поднять ноду    ${GRY}(4 + 5)${RST}
-   ${BOLD}${YLW}18)${RST} ③ Настроить ноду  ${GRY}(6 + 7 + 8)${RST}
-   ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
-   ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
-${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → 13.  Можно несколько номеров через пробел.${RST}
-EOF
-}
- 
-menu() {
-  local choice c
-  while true; do
-    print_menu
-    read -rp "Выбор: " choice
-    [ -z "$choice" ] && continue
-    for c in $choice; do
-      case "$c" in
-        1) run_block "SSH-харденинг" block_ssh ;;
-        2) run_block "Оптимизация (node-accelerator)" block_optimize ;;
-        3) run_block "Защита (node-accelerator)" block_protect ;;
-        4) run_block "netbird" block_netbird ;;
-        5) run_block "remnanode" block_remnanode ;;
-        6) run_block "RU-блокировка" block_rublock ;;
-        7) run_block "Логи ноды" block_logs ;;
-        8) run_block "XHTTP" block_xhttp ;;
-        9) run_block "nginx upgrade" block_nginx_upgrade ;;
-        10) run_block "Перезапуск контейнеров" block_restart ;;
-        11) run_block "Beszel: агент" block_beszel_agent ;;
-        12) run_block "Beszel: обновление" block_beszel_update ;;
-        13) submenu_diag ;;
-        14) submenu_checks ;;
-        15) self_update ;;
-        16) run_block "SSH-харденинг" block_ssh
-            run_block "Оптимизация (node-accelerator)" block_optimize ;;
-        17) run_block "netbird" block_netbird
-            run_block "remnanode" block_remnanode ;;
-        18) run_block "RU-блокировка" block_rublock
-            run_block "Логи ноды" block_logs
-            run_block "XHTTP" block_xhttp ;;
-        19) run_block "Защита (node-accelerator)" block_protect
-            run_block "Beszel: агент" block_beszel_agent ;;
-        0) log "Выход."; exit 0 ;;
-        *) warn "Неизвестный пункт: ${c}" ;;
-      esac
-    done
-    echo
-    read -rp "Нажмите Enter для возврата в меню..." _
-  done
-}
- 
-main() {
-  banner
-  require_root
-  ensure_apt_lock_timeout
-  menu
-}
- 
-# Запуск только при прямом вызове (позволяет тестировать через source).
-if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  main "$@"
-fi
