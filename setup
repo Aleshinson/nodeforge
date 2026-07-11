@@ -748,8 +748,10 @@ EOB
  
 # ----- 10) nginx 1.28 -> NGINX_TARGET (с проверкой версии и вопросом) -----
 block_nginx_upgrade() {
-  local f=/opt/remnanode/docker-compose.yml cur target rc=0
-  if [ ! -f "$f" ]; then err "${f} не найден."; return 1; fi
+  local f cur target rc=0
+  require_node || return 1
+  f="${NODE_DIR}/docker-compose.yml"
+  info "Стек ноды найден: ${f}"
  
   cur="$(grep -oE 'image:[[:space:]]*nginx:[0-9.]+' "$f" | grep -oE '[0-9.]+$' | head -n1 || true)"
   if [ -z "$cur" ]; then
@@ -772,11 +774,11 @@ block_nginx_upgrade() {
   cp -a "$f" "${f}.bak"
   sed -i -E "s#nginx:${cur//./\\.}#nginx:${target}#g" "$f"
   log "Образ в compose обновлён на nginx:${target} (бэкап: ${f}.bak). Тяну и пересоздаю."
-  ( cd /opt/remnanode && docker compose pull && docker compose up -d ) || rc=$?
+  ( cd "$NODE_DIR" && docker compose pull && docker compose up -d ) || rc=$?
   if [ "$rc" -ne 0 ]; then
     err "pull/up не удался (возможно, нет такого тега). Откатываю compose."
     cp -a "${f}.bak" "$f"
-    ( cd /opt/remnanode && docker compose up -d ) || true
+    ( cd "$NODE_DIR" && docker compose up -d ) || true
     return 1
   fi
   sleep 2
@@ -1698,4 +1700,5 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
+
 
