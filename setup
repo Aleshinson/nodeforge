@@ -627,7 +627,7 @@ block_logs() {
   log "Пишу /etc/logrotate.d/remnanode."
 
   cat >/etc/logrotate.d/remnanode <<'EOF'
-/var/log/remnanode/*.log {
+  /var/log/remnanode/*.log {
     daily
     rotate 9999
     compress
@@ -640,8 +640,8 @@ block_logs() {
     copytruncate
     dateext
     dateformat -%Y-%m-%d
-}
-EOF
+  }
+  EOF
 
   if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
     log "Конфиг logrotate корректен."
