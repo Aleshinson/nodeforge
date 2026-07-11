@@ -223,19 +223,16 @@ wait_for_apt() {
  
 # Проверяем, что нода remnanode запущена и есть её docker-compose.
 require_node() {
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+  if [ -f /opt/remnanode/docker-compose.yml ]; then
     NODE_DIR="/opt/remnanode"
     NODE_CONTAINER="remnanode"
-  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnawave$'; then
+    NODE_SERVICE="remnanode"
+  elif [ -f /opt/remnawave/docker-compose.yml ]; then
     NODE_DIR="/opt/remnawave"
     NODE_CONTAINER="remnawave"
+    NODE_SERVICE="remnawave"
   else
-    err "Контейнер remnanode/remnawave не запущен."
-    return 1
-  fi
-
-  if [ ! -f "${NODE_DIR}/docker-compose.yml" ]; then
-    err "${NODE_DIR}/docker-compose.yml не найден."
+    err "Не найден docker-compose.yml ни в /opt/remnanode, ни в /opt/remnawave."
     return 1
   fi
 
@@ -246,30 +243,61 @@ require_node() {
 # (и убирает этот же том из других сервисов, если он туда попал ошибочно). С бэкапом.
 compose_add_volume() {
   require_node || return 1
-  local mapping="$1" f="${NODE_DIR}/docker-compose.yml" tmp rc=0
-  if [ ! -f "$f" ]; then warn "${f} не найден."; return 1; fi
-  cp -a "$f" "${f}.bak"
+
+  local mapping="$1"
+  local f="${NODE_DIR}/docker-compose.yml"
+  local tmp
+  local rc=0
+
   tmp="$(mktemp)"
-  # 1) убрать строки с этим mapping где угодно (в т.ч. ошибочно в nginx)
-  grep -vF "$mapping" "${f}.bak" > "$tmp" || true
-  # 2) вставить в volumes сервиса remnanode
-  awk -v mapping="$mapping" '
-    {
-      if (innode && ($0 ~ /^[^[:space:]]/ || ($0 ~ /^  [^[:space:]]/ && $0 !~ /^  remnanode:/))) innode=0
-      print $0
-      if ($0 ~ /^  remnanode:[[:space:]]*$/) innode=1
-      else if (innode && !done && $0 ~ /^    volumes:[[:space:]]*$/) { print "      - \"" mapping "\""; done=1 }
+
+  awk -v map="$mapping" -v service="$NODE_SERVICE" '
+    BEGIN{
+      in_service=0
+      in_vol=0
+      has=0
+      inserted=0
     }
-    END { if (!done) exit 3 }
-  ' "$tmp" > "$f" || rc=$?
-  rm -f "$tmp"
-  if [ "$rc" -ne 0 ]; then
-    cp -a "${f}.bak" "$f"
-    warn "Не нашёл секцию volumes у сервиса remnanode — добавь вручную: - \"${mapping}\""
-    return 1
+
+    $0 ~ ("^  " service ":[[:space:]]*$") {
+      in_service=1
+    }
+
+    in_service && /^[^ ]/ {
+      if (!inserted && !has) print "      - " map
+      in_service=0
+      in_vol=0
+      inserted=1
+    }
+
+    in_service && /^    volumes:[[:space:]]*$/ {
+      in_vol=1
+    }
+
+    in_service && in_vol && $0=="      - " map {
+      has=1
+    }
+
+    in_service && in_vol && /^    [^ ]/ && !/^    volumes:/ {
+      if (!has) print "      - " map
+      inserted=1
+      in_vol=0
+    }
+
+    { print }
+
+    END{
+      if (in_service && in_vol && !has)
+        print "      - " map
+    }
+  ' "$f" >"$tmp" || rc=$?
+
+  if [ $rc -ne 0 ]; then
+    rm -f "$tmp"
+    return $rc
   fi
-  log "Том прописан у remnanode: ${mapping} (бэкап: ${f}.bak)"
-  return 0
+
+  mv "$tmp" "$f"
 }
  
 # ============================ БЛОКИ ============================
@@ -584,15 +612,21 @@ block_logs() {
 
   log "Гарантирую папку логов и том логов в compose."
   mkdir -p /var/log/remnanode
+
   compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  ( cd "$NODE_DIR" && docker compose up -d )
+
+  (
+    cd "$NODE_DIR"
+    docker compose up -d
+  )
 
   log "Ставлю logrotate + zstd."
   wait_for_apt
   apt-get install -y logrotate zstd
 
   log "Пишу /etc/logrotate.d/remnanode."
-  cat > /etc/logrotate.d/remnanode <<'EOC'
+
+  cat >/etc/logrotate.d/remnanode <<'EOF'
 /var/log/remnanode/*.log {
     daily
     rotate 9999
@@ -607,18 +641,21 @@ block_logs() {
     dateext
     dateformat -%Y-%m-%d
 }
-EOC
+EOF
 
   if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
     log "Конфиг logrotate корректен."
   else
-    warn "logrotate -d сообщил о проблеме — проверь /etc/logrotate.d/remnanode."
+    warn "logrotate сообщил о проблеме — проверь конфиг."
   fi
 
   echo
-  warn "ОСТАЛОСЬ В ПАНЕЛИ Remnawave: в Config Profile ноды добавь блок log с путями"
-  warn "  /var/log/remnanode/access.log  и  /var/log/remnanode/error.log"
-  warn "иначе логи не появятся. Потом проверь:"
+  warn "ОСТАЛОСЬ В ПАНЕЛИ:"
+  warn "Добавь пути:"
+  warn "  /var/log/remnanode/access.log"
+  warn "  /var/log/remnanode/error.log"
+  warn ""
+  warn "Проверить можно так:"
   warn "  docker exec ${NODE_CONTAINER} ls -la /var/log/remnanode/"
 }
 EOC
