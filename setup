@@ -245,7 +245,8 @@ require_node() {
 # compose_add_volume "host:container" — добавляет том именно в сервис remnanode
 # (и убирает этот же том из других сервисов, если он туда попал ошибочно). С бэкапом.
 compose_add_volume() {
-  local mapping="$1" f=/opt/remnanode/docker-compose.yml tmp rc=0
+  require_node || return 1
+  local mapping="$1" f="${NODE_DIR}/docker-compose.yml" tmp rc=0
   if [ ! -f "$f" ]; then warn "${f} не найден."; return 1; fi
   cp -a "$f" "${f}.bak"
   tmp="$(mktemp)"
@@ -580,16 +581,16 @@ EOJSON
 # ----- 8) Логи ноды (logrotate + zstd) -----
 block_logs() {
   require_node || return 1
- 
+
   log "Гарантирую папку логов и том логов в compose."
   mkdir -p /var/log/remnanode
   compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  ( cd /opt/remnanode && docker compose up -d )
- 
+  ( cd "$NODE_DIR" && docker compose up -d )
+
   log "Ставлю logrotate + zstd."
   wait_for_apt
   apt-get install -y logrotate zstd
- 
+
   log "Пишу /etc/logrotate.d/remnanode."
   cat > /etc/logrotate.d/remnanode <<'EOC'
 /var/log/remnanode/*.log {
@@ -605,6 +606,20 @@ block_logs() {
     copytruncate
     dateext
     dateformat -%Y-%m-%d
+}
+EOC
+
+  if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
+    log "Конфиг logrotate корректен."
+  else
+    warn "logrotate -d сообщил о проблеме — проверь /etc/logrotate.d/remnanode."
+  fi
+
+  echo
+  warn "ОСТАЛОСЬ В ПАНЕЛИ Remnawave: в Config Profile ноды добавь блок log с путями"
+  warn "  /var/log/remnanode/access.log  и  /var/log/remnanode/error.log"
+  warn "иначе логи не появятся. Потом проверь:"
+  warn "  docker exec ${NODE_CONTAINER} ls -la /var/log/remnanode/"
 }
 EOC
   if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
