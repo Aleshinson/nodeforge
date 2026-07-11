@@ -658,19 +658,6 @@ block_logs() {
   warn "Проверить можно так:"
   warn "  docker exec ${NODE_CONTAINER} ls -la /var/log/remnanode/"
 }
-EOC
-  if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
-    log "Конфиг logrotate корректен."
-  else
-    warn "logrotate -d сообщил о проблеме — проверь /etc/logrotate.d/remnanode."
-  fi
- 
-  echo
-  warn "ОСТАЛОСЬ В ПАНЕЛИ Remnawave: в Config Profile ноды добавь блок log с путями"
-  warn "  /var/log/remnanode/access.log  и  /var/log/remnanode/error.log"
-  warn "иначе логи не появятся. Потом проверь:"
-  warn "  docker exec remnanode ls -la /var/log/remnanode/"
-}
  
 # ----- 9) XHTTP (location в nginx ноды) -----
 block_xhttp() {
