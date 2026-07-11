@@ -795,7 +795,7 @@ block_restart() {
     return 1
   fi
   echo
- 
+
   choose_from_list mode "Что перезапустить?" "Стек ноды: restart" \
     "Стек ноды: restart" \
     "Стек ноды: пересоздать (down + up -d)" \
@@ -803,14 +803,16 @@ block_restart() {
  
   case "$mode" in
     "Стек ноды: restart")
-      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
-      log "docker compose restart (в /opt/remnanode)..."
-      ( cd /opt/remnanode && docker compose restart )
+      require_node || return 1
+      info "Стек ноды найден: ${NODE_DIR}/docker-compose.yml"
+      log "docker compose restart (в ${NODE_DIR})..."
+      ( cd "$NODE_DIR" && docker compose restart )
       ;;
     "Стек ноды: пересоздать (down + up -d)")
-      if [ ! -f /opt/remnanode/docker-compose.yml ]; then err "/opt/remnanode/docker-compose.yml не найден."; return 1; fi
-      log "docker compose down && up -d (в /opt/remnanode)..."
-      ( cd /opt/remnanode && docker compose down && docker compose up -d )
+      require_node || return 1
+      info "Стек ноды найден: ${NODE_DIR}/docker-compose.yml"
+      log "docker compose down && up -d (в ${NODE_DIR})..."
+      ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
       ;;
     "Все контейнеры на хосте")
       ids="$(docker ps -q 2>/dev/null || true)"
@@ -1696,3 +1698,4 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
+
