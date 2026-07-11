@@ -641,7 +641,7 @@ block_logs() {
     dateext
     dateformat -%Y-%m-%d
   }
-  EOF
+EOF
 
   if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
     log "Конфиг logrotate корректен."
@@ -983,27 +983,40 @@ submenu_diag() {
   done
 }
  
-# ----- 14) Подменю «Проверки и бенчмарки» (внешние скрипты) -----
+# Зависимости для внешних проверок. Устанавливаем только отсутствующие пакеты.
+ensure_check_dependencies() {
+  local packages=(ca-certificates curl wget iperf3 sysbench jq bc) missing=() pkg
+  for pkg in "${packages[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || missing+=("$pkg")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
+  fi
+  log "Ставлю зависимости для проверок: ${missing[*]}"
+  wait_for_apt
+  apt-get update -y
+  apt-get install -y "${missing[@]}"
+}
+
+# ----- 14) Подменю «Проверки VPS» (внешние скрипты) -----
 print_checks_menu() {
   cat <<EOF
  
 ${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
-                   ${BOLD}${WHT}Проверки и бенчмарки${RST}
+                         ${BOLD}${WHT}Проверки VPS${RST}
 ${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
  ${BOLD}${MAG}Блокировки / регион${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 1)${RST} IP.Check.Place           ${GRY}— блокировки IP зарубежными сервисами${RST}
-   ${BOLD}${CYN} 2)${RST} IP Region (ipregion.xyz) ${GRY}— какой регион видят сайты по IP${RST}
-   ${BOLD}${CYN} 3)${RST} IP Region (vernette)     ${GRY}— то же, исходный скрипт с GitHub${RST}
-   ${BOLD}${CYN} 4)${RST} CensorCheck (DPI)        ${GRY}— блокировки по DPI (для РФ-серверов)${RST}
-   ${BOLD}${CYN} 5)${RST} Instagram audio          ${GRY}— блокировка аудио в Instagram${RST}
+   ${BOLD}${CYN} 1)${RST} IP region                ${GRY}— какой регион видят сайты по IP${RST}
+   ${BOLD}${CYN} 2)${RST} CensorCheck geoblock     ${GRY}— проверка геоблокировок${RST}
+   ${BOLD}${CYN} 3)${RST} CensorCheck DPI          ${GRY}— проверка для серверов РФ${RST}
+   ${BOLD}${CYN} 4)${RST} IP.Check.Place           ${GRY}— блокировки IP зарубежными сервисами${RST}
+   ${BOLD}${CYN} 5)${RST} IPQuality                ${GRY}— качество и репутация IP${RST}
  
  ${BOLD}${MAG}Бенчмарки / скорость${RST}${GRY}:${RST}
-   ${BOLD}${CYN} 6)${RST} bench.sh                 ${GRY}— параметры + скорость (зарубежные)${RST}
-   ${BOLD}${CYN} 7)${RST} speed.tlab.pw            ${GRY}— скорость (зарубежные, альт.)${RST}
-   ${BOLD}${CYN} 8)${RST} bench.gig.ovh            ${GRY}— параметры + скорость (РФ-провайдеры)${RST}
-   ${BOLD}${CYN} 9)${RST} bench.tlab.pw            ${GRY}— то же (РФ, альт.)${RST}
-   ${BOLD}${CYN}10)${RST} YABS                     ${GRY}— диск + сеть (iperf3) + GeekBench${RST}
-   ${BOLD}${CYN}11)${RST} sysbench CPU             ${GRY}— оценка выделенного CPU${RST}
+   ${BOLD}${CYN} 6)${RST} Russian iPerf3           ${GRY}— скорость до российских серверов${RST}
+   ${BOLD}${CYN} 7)${RST} YABS                     ${GRY}— диск + сеть (iperf3) + GeekBench${RST}
+   ${BOLD}${CYN} 8)${RST} bench.sh                 ${GRY}— параметры + зарубежная скорость${RST}
+   ${BOLD}${CYN} 9)${RST} sysbench CPU             ${GRY}— оценка выделенного CPU${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
  ${DIM}Несколько номеров через пробел можно, напр.:  1 4${RST}
@@ -1012,31 +1025,25 @@ EOF
  
 submenu_checks() {
   local choice c
+  ensure_check_dependencies || {
+    err "Не удалось установить зависимости для проверок."
+    return 1
+  }
   while true; do
     print_checks_menu
     read -rp "Выбор: " choice
     [ -z "$choice" ] && continue
     for c in $choice; do
       case "$c" in
-        1)  echo; step "IP.Check.Place";            bash <(curl -Ls IP.Check.Place) -l en || true ;;
-        2)  echo; step "IP Region (ipregion.xyz)";  bash <(wget -qO- https://ipregion.xyz) || true ;;
-        3)  echo; step "IP Region (vernette)";       bash <(wget -qO- https://github.com/vernette/ipregion/raw/master/ipregion.sh) || true ;;
-        4)  echo; step "CensorCheck (DPI)";          bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        5)  echo; step "Instagram audio";            bash <(curl -L -s https://bench.openode.xyz/checker_inst.sh) || true ;;
-        6)  echo; step "bench.sh";                   wget -qO- bench.sh | bash || true ;;
-        7)  echo; step "speed.tlab.pw";              wget -qO- speed.tlab.pw | bash || true ;;
-        8)  echo; step "bench.gig.ovh";              wget -qO- bench.gig.ovh | bash || true ;;
-        9)  echo; step "bench.tlab.pw";              wget -qO- bench.tlab.pw | bash || true ;;
-        10) echo; step "YABS";                       curl -sL yabs.sh | bash -s -- -4 || true ;;
-        11) echo; step "sysbench CPU"
-            if ! command -v sysbench >/dev/null 2>&1; then
-              log "sysbench не найден — устанавливаю."
-              wait_for_apt
-              if ! apt-get install -y sysbench; then warn "Не удалось поставить sysbench."; fi
-            fi
-            if command -v sysbench >/dev/null 2>&1; then
-              sysbench cpu run --threads=1 || true
-            fi ;;
+        1) echo; step "IP region";          bash <(wget -qO- https://ipregion.vrnt.xyz) || true ;;
+        2) echo; step "CensorCheck geoblock"; bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true ;;
+        3) echo; step "CensorCheck DPI";    bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
+        4) echo; step "IP.Check.Place";     bash <(curl -Ls IP.Check.Place) -l en || true ;;
+        5) echo; step "IPQuality";          bash <(curl -Ls https://Check.Place) -EI || true ;;
+        6) echo; step "Russian iPerf3";     bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true ;;
+        7) echo; step "YABS";               curl -sL yabs.sh | bash -s -- -4 || true ;;
+        8) echo; step "bench.sh";           wget -qO- bench.sh | bash || true ;;
+        9) echo; step "sysbench CPU";       sysbench cpu run --threads=1 || true ;;
         0)  return 0 ;;
         *)  warn "Неизвестный пункт: ${c}" ;;
       esac
