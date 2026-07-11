@@ -223,14 +223,22 @@ wait_for_apt() {
  
 # Проверяем, что нода remnanode запущена и есть её docker-compose.
 require_node() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-    err "Контейнер remnanode не запущен. Сначала подними ноду (пункт 6)."
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
+    NODE_DIR="/opt/remnanode"
+    NODE_CONTAINER="remnanode"
+  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^remnawave$'; then
+    NODE_DIR="/opt/remnawave"
+    NODE_CONTAINER="remnawave"
+  else
+    err "Контейнер remnanode/remnawave не запущен."
     return 1
   fi
-  if [ ! -f /opt/remnanode/docker-compose.yml ]; then
-    err "/opt/remnanode/docker-compose.yml не найден."
+
+  if [ ! -f "${NODE_DIR}/docker-compose.yml" ]; then
+    err "${NODE_DIR}/docker-compose.yml не найден."
     return 1
   fi
+
   return 0
 }
  
