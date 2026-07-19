@@ -173,6 +173,203 @@ disable_conflicting_dropins() {
 apply_sshd() {
   if sshd -t; then
     systemctl restart "$(ssh_service)"
+    log "SSH перезапущен."#!/usr/bin/env bash
+#
+# setup.sh — интерактивная настройка/харденинг сервера (меню по блокам).
+#
+# Группировка пунктов — по совместимости в одном проходе:
+#
+# Запуск:  sudo ./setup.sh   (можно вводить несколько номеров: напр. 1 2)
+#
+set -o pipefail
+ 
+# Откуда брать свежую версию (raw-ссылка на GitHub). Можно переопределить через env.
+UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/Aleshinson/nodeforge/main/setup}"
+# Целевая версия nginx для апгрейда (1.30.1 закрывает CVE из 1.28; 1.30.2 — ещё свежее).
+NGINX_TARGET="${NGINX_TARGET:-1.30.1}"
+# Ветка/тег репозитория node-accelerator (для прода можно зафиксировать тег: NA_REF=v2.1).
+NA_REF="${NA_REF:-main}"
+# Путь к самому скрипту (для самообновления).
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+ 
+# ----------------------------- ЦВЕТА И ВЫВОД -----------------------------
+# Цвета автоматически отключаются, если вывод не в терминал или задан NO_COLOR.
+setup_colors() {
+  if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    BOLD="" DIM="" RST="" RED="" GRN="" YLW="" BLU="" MAG="" CYN="" GRY="" WHT=""
+    return
+  fi
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
+  RED=$'\033[38;5;203m'; GRN=$'\033[38;5;78m';  YLW=$'\033[38;5;221m'
+  BLU=$'\033[38;5;75m';  MAG=$'\033[38;5;176m'; CYN=$'\033[38;5;81m'
+  GRY=$'\033[38;5;245m'; WHT=$'\033[38;5;231m'
+}
+setup_colors
+ 
+log()  { printf '%s%s•%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
+info() { printf '%s%si%s %s\n'  "$BOLD" "$BLU" "$RST" "$*"; }
+ok()   { printf '%s%s✓%s %s\n'  "$BOLD" "$GRN" "$RST" "$*"; }
+warn() { printf '%s%s▲%s %s\n'  "$BOLD" "$YLW" "$RST" "$*" >&2; }
+err()  { printf '%s%s✗%s %s\n'  "$BOLD" "$RED" "$RST" "$*" >&2; }
+step() { printf '%s%s▶ %s%s\n'  "$BOLD" "$CYN" "$*" "$RST"; }
+hr()   { printf '%s──────────────────────────────────────────────────────────────%s\n' "$GRY" "$RST"; }
+ 
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "Запустите через sudo или от root."
+    exit 1
+  fi
+}
+ 
+# ----------------------------- ВВОД И ВАЛИДАЦИЯ -----------------------------
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+ 
+# ask VAR "Текст" "значение_по_умолчанию"
+ask() {
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans
+  if [ -n "$__def" ]; then
+    read -rp "${__prompt} [${__def}]: " __ans
+    __ans="${__ans:-$__def}"
+  else
+    read -rp "${__prompt}: " __ans
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+ 
+# ask_required VAR "Текст" — не пускает дальше при пустом вводе
+ask_required() {
+  local __var="$1" __prompt="$2" __ans=""
+  while [ -z "$__ans" ]; do
+    read -rp "${__prompt}: " __ans
+    if [ -z "$__ans" ]; then warn "Значение не может быть пустым."; fi
+  done
+  printf -v "$__var" '%s' "$__ans"
+}
+ 
+# ask_port VAR — обязательный ввод порта (1-65535), без значения по умолчанию
+ask_port() {
+  local __var="$1" __ans
+  while true; do
+    read -rp "SSH-порт (1-65535): " __ans
+    if is_uint "$__ans" && [ "$__ans" -ge 1 ] && [ "$__ans" -le 65535 ]; then break; fi
+    warn "Введите число от 1 до 65535."
+  done
+  printf -v "$__var" '%s' "$__ans"
+}
+ 
+# ask_username VAR
+ask_username() {
+  local __var="$1" __ans
+  while true; do
+    read -rp "Имя нового пользователя: " __ans
+    if [[ "$__ans" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then break; fi
+    warn "Некорректное имя (строчные буквы/цифры/_/- , начинается с буквы или _)."
+  done
+  printf -v "$__var" '%s' "$__ans"
+}
+ 
+# Минимальная длина пароля пользователя (можно переопределить через env).
+PASS_MIN_LEN="${PASS_MIN_LEN:-10}"
+
+# is_weak_password "пароль" -> 0, если пароль слабый (короче лимита или из блоклиста).
+# У создаваемого пользователя NOPASSWD-sudo, поэтому слабый пароль недопустим.
+is_weak_password() {
+  local p="$1" lc
+  if [ "${#p}" -lt "$PASS_MIN_LEN" ]; then return 0; fi
+  lc="${p,,}"
+  case "$lc" in
+    password*|passw0rd*|qwerty*|qwerty123*|123456*|12345678*|123456789*|1234567890*|\
+    111111*|000000*|admin*|admin123*|root*|toor*|letmein*|welcome*|iloveyou*|\
+    changeme*|secret*|superman*|monkey*|dragon*|master*|abc123*|football*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# ask_password VAR — скрытый ввод, дважды, с проверкой длины/блоклиста и совпадения
+ask_password() {
+  local __var="$1" __p1 __p2
+  while true; do
+    read -rsp "Пароль для пользователя (ввод скрыт, минимум ${PASS_MIN_LEN} символов): " __p1; echo
+    if [ -z "$__p1" ]; then warn "Пароль не может быть пустым."; continue; fi
+    if is_weak_password "$__p1"; then
+      warn "Слабый пароль (короче ${PASS_MIN_LEN} символов или из списка типовых). У пользователя будет NOPASSWD-sudo — задайте стойкий пароль."
+      continue
+    fi
+    read -rsp "Повторите пароль: " __p2; echo
+    if [ "$__p1" != "$__p2" ]; then warn "Пароли не совпадают, попробуйте снова."; continue; fi
+    break
+  done
+  printf -v "$__var" '%s' "$__p1"
+}
+ 
+# confirm "Вопрос" -> 0, если да
+confirm() {
+  local __ans
+  read -rp "$1 [y/N]: " __ans
+  [[ "$__ans" =~ ^[YyДд] ]]
+}
+ 
+# valid_pubkey "строка" -> 0, если похоже на публичный SSH-ключ
+valid_pubkey() {
+  [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-[a-z0-9-]+@openssh\.com)[[:space:]]+ ]]
+}
+ 
+# choose_from_list VAR "Заголовок" "значение_по_умолчанию_или_пусто" пункт1 пункт2 ...
+# Печатает нумерованное меню, помечает рекомендуемый пункт, читает выбор.
+choose_from_list() {
+  local __var="$1" __title="$2" __def="$3"; shift 3
+  local __items=("$@") __i __sel __defidx=""
+  echo "$__title"
+  for __i in "${!__items[@]}"; do
+    if [ -n "$__def" ] && [ "${__items[$__i]}" = "$__def" ]; then
+      printf "  %d) %s   ← рекомендуется\n" "$((__i + 1))" "${__items[$__i]}"
+      __defidx="$((__i + 1))"
+    else
+      printf "  %d) %s\n" "$((__i + 1))" "${__items[$__i]}"
+    fi
+  done
+  local __prompt="Номер"
+  if [ -n "$__defidx" ]; then __prompt="Номер [${__defidx}]"; fi
+  while true; do
+    read -rp "${__prompt}: " __sel
+    if [ -z "$__sel" ] && [ -n "$__defidx" ]; then __sel="$__defidx"; fi
+    if is_uint "$__sel" && [ "$__sel" -ge 1 ] && [ "$__sel" -le "${#__items[@]}" ]; then break; fi
+    warn "Введите число от 1 до ${#__items[@]}."
+  done
+  printf -v "$__var" '%s' "${__items[$((__sel - 1))]}"
+}
+ 
+# ----------------------------- ОБЩИЕ ХЕЛПЕРЫ -----------------------------
+ssh_service() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then echo ssh
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then echo sshd
+  else echo ssh; fi
+}
+ 
+# set_sshd_option Key Value — задаёт/раскомментирует директиву в sshd_config
+set_sshd_option() {
+  local key="$1" val="$2" file="/etc/ssh/sshd_config"
+  if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}\b.*|${key} ${val}|I" "$file"
+  else
+    printf '%s %s\n' "$key" "$val" >> "$file"
+  fi
+}
+ 
+# Нейтрализуем конфликтующие настройки в /etc/ssh/sshd_config.d/*.conf
+disable_conflicting_dropins() {
+  shopt -s nullglob
+  local f
+  for f in /etc/ssh/sshd_config.d/*.conf; do
+    sed -i -E 's@^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)([[:space:]].*)$@# disabled by setup: &@I' "$f"
+  done
+  shopt -u nullglob
+}
+ 
+apply_sshd() {
+  if sshd -t; then
+    systemctl restart "$(ssh_service)"
     log "SSH перезапущен."
   else
     err "sshd -t нашёл ошибку — SSH НЕ перезапущен. Проверьте /etc/ssh/sshd_config."
@@ -338,6 +535,8 @@ block_ssh() {
   else
     echo "  • SSH-ключ:          не задан"
     echo "  • Парольный вход:    останется включённым"
+    warn "БЕЗ КЛЮЧА: парольный вход по SSH остаётся ВКЛ, а у ${user} — беспарольный sudo (NOPASSWD)."
+    warn "Слабый пароль = прямой путь к root. Настоятельно рекомендую задать SSH-ключ."
   fi
   confirm "Продолжить?" || { warn "Отменено."; return 1; }
  
@@ -438,12 +637,59 @@ block_protect() {
   apply_firewall
 }
  
+# ----- netbird: обновление демона до последней версии -----
+# netbird ставится из apt-репозитория (его добавляет официальный install.sh),
+# поэтому штатное обновление — через apt. Если репозитория нет (ставили иначе) —
+# предлагаем переустановку официальным установщиком (подтянет последнюю версию).
+netbird_update() {
+  command -v netbird >/dev/null 2>&1 || { err "netbird не установлен. Сначала установи его (пункт «netbird»)."; return 1; }
+
+  local before after
+  before="$(netbird version 2>/dev/null | head -1 || true)"
+  info "Текущая версия netbird: ${before:-неизвестна}"
+
+  if grep -rqi 'pkgs\.netbird\.io' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    log "Обновляю netbird через apt."
+    wait_for_apt
+    apt-get update -y
+    apt-get install -y --only-upgrade netbird || { err "apt не смог обновить netbird."; return 1; }
+  else
+    warn "apt-репозиторий netbird не найден (демон ставили не через install.sh)."
+    confirm "Переустановить официальным установщиком (подтянет последнюю версию)?" || { warn "Отменено."; return 1; }
+    wait_for_apt
+    if ! curl -fsSL https://pkgs.netbird.io/install.sh | sh; then
+      err "Переустановка netbird не удалась."
+      return 1
+    fi
+    hash -r 2>/dev/null || true
+  fi
+
+  # Применяем новый бинарь: перезапуск службы. Туннель на пару секунд рвётся и
+  # переподключается сам по сохранённой конфигурации — setup-key не нужен.
+  if systemctl list-unit-files 2>/dev/null | grep -q '^netbird\.service'; then
+    log "Перезапускаю службу netbird."
+    systemctl restart netbird 2>/dev/null || warn "Не удалось перезапустить — сделай вручную: systemctl restart netbird"
+    sleep 1
+  fi
+
+  after="$(netbird version 2>/dev/null | head -1 || true)"
+  if [ -n "$after" ] && [ "$before" = "$after" ]; then
+    ok "netbird уже актуален (${after}). Изменений нет."
+  else
+    ok "netbird обновлён: ${before:-?} → ${after:-?}"
+  fi
+  netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|Signal|FQDN' | sed 's/^/   /' || true
+}
+
 # ----- 6) netbird -----
 block_netbird() {
   local key
 
   if command -v netbird >/dev/null 2>&1; then
-    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1)). Установку пропускаю."
+    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1))."
+    if confirm "Обновить netbird до последней версии?"; then
+      netbird_update || warn "Обновление netbird завершилось с ошибкой — см. вывод выше."
+    fi
   else
     log "netbird не найден — устанавливаю."
     wait_for_apt
@@ -496,7 +742,7 @@ block_netbird() {
 block_remnanode() {
   log "Запускаю установщик remnanode (интерактивный — следуйте подсказкам)."
   wait_for_apt
-  bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+  bash <(curl -fLs https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
 
   # Установщик ноды делает `ufw --force enable` (открыты только 22+443) — это ВТОРОЙ
   # фаервол, который потом «съедает» твои порты. Гасим его и возвращаем единый na_filter.
@@ -662,7 +908,11 @@ EOF
 # ----- 9) XHTTP (location в nginx ноды) -----
 block_xhttp() {
   local f=/opt/remnanode/nginx.conf path block ngx tmp existed=0 rc=0
-  ask path "XHTTP-путь (без слешей)" "xhttppath"
+  while true; do
+    ask path "XHTTP-путь (без слешей)" "xhttppath"
+    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
+    warn "Путь может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
+  done
  
   # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
   # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
@@ -853,10 +1103,11 @@ block_beszel_agent() {
   ask token "Token (Enter — пропустить)" ""
   ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
  
-  tmp=/tmp/install-agent.sh
+  tmp="$(mktemp)"
   log "Скачиваю install-agent.sh."
-  if ! curl -sL https://get.beszel.dev -o "$tmp"; then
+  if ! curl -fsSL https://get.beszel.dev -o "$tmp"; then
     err "Не удалось скачать install-agent.sh."
+    rm -f "$tmp"
     return 1
   fi
   chmod +x "$tmp"
@@ -867,6 +1118,7 @@ block_beszel_agent() {
  
   log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."
   "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
+  rm -f "$tmp"
  
   # ЕДИНЫЙ ФАЕРВОЛ: не трогаем ufw — регистрируем порт и переприменяем na_filter.
   fw_add_port "$port" tcp
@@ -1042,10 +1294,10 @@ submenu_checks() {
         1) echo; step "IP region";          bash <(wget -qO- https://ipregion.vrnt.xyz) || true ;;
         2) echo; step "CensorCheck geoblock"; bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true ;;
         3) echo; step "CensorCheck DPI";    bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        4) echo; step "IP.Check.Place";     bash <(curl -Ls IP.Check.Place) -l en || true ;;
-        5) echo; step "IPQuality";          bash <(curl -Ls https://Check.Place) -EI || true ;;
+        4) echo; step "IP.Check.Place";     bash <(curl -fLs IP.Check.Place) -l en || true ;;
+        5) echo; step "IPQuality";          bash <(curl -fLs https://Check.Place) -EI || true ;;
         6) echo; step "Russian iPerf3";     bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true ;;
-        7) echo; step "YABS";               curl -sL yabs.sh | bash -s -- -4 || true ;;
+        7) echo; step "YABS";               curl -fsSL yabs.sh | bash -s -- -4 || true ;;
         8) echo; step "bench.sh";           wget -qO- bench.sh | bash || true ;;
         9) echo; step "sysbench CPU";       sysbench cpu run --threads=1 || true ;;
         0)  return 0 ;;
@@ -1065,7 +1317,9 @@ FW_ENV="/etc/nodeforge/firewall.env"
 
 # Создать реестр с дефолтами для ОТСУТСТВУЮЩИХ ключей (ничего не перетирает).
 fw_init() {
-  mkdir -p /etc/nodeforge; touch "$FW_ENV"; chmod 600 "$FW_ENV"
+  mkdir -p /etc/nodeforge
+  [ -f "$FW_ENV" ] || ( umask 077; : > "$FW_ENV" )
+  chmod 600 "$FW_ENV"
   local kv k v
   for kv in \
     "SSH_PORT=$(detect_ssh_port)" \
@@ -1312,8 +1566,12 @@ block_shaper() {
       ;;
     perip)
       info "perip — лимит на каждый клиентский IP по VPN-порту."
-      ask vpnport "VPN-порт (порт трафика клиентов)" "443"
-      vpnport="${vpnport%%,*}"
+      while true; do
+        ask vpnport "VPN-порт (порт трафика клиентов)" "443"
+        vpnport="${vpnport%%,*}"
+        if is_uint "$vpnport" && [ "$vpnport" -ge 1 ] && [ "$vpnport" -le 65535 ]; then break; fi
+        warn "Введите номер порта 1–65535."
+      done
       choose_from_list proto "Протокол VPN-порта:" "tcp" "tcp" "udp"
       ask perip "Лимит на ОДИН IP, Мбит/с (число)" "50"
       if ! is_uint "$perip"; then warn "Нужно число."; return 1; fi
@@ -1627,6 +1885,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
    ${BOLD}${GRN} b)${RST} Бэкап конфигов     ${GRY}— один архив со всеми настройками${RST}
    ${BOLD}${GRN} u)${RST} Обновить списки    ${GRY}— геолисты/блоклисты/госсети + автообновление${RST}
+   ${BOLD}${GRN} w)${RST} netbird: обновить  ${GRY}— apt-обновление демона до последней версии${RST}
    ${BOLD}${GRN} l)${RST} Fleet-sync         ${GRY}— ноды флота whitelist-ят друг друга${RST}
  
  ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
@@ -1670,6 +1929,7 @@ menu() {
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
+        w|W) run_block "netbird: обновление" netbird_update ;;
         l|L) run_block "Fleet-sync" block_fleet ;;
         16) run_block "SSH-харденинг" block_ssh
             run_block "Оптимизация (node-accelerator)" block_optimize ;;
