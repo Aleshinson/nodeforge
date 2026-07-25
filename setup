@@ -730,29 +730,12 @@ EOF
   warn "  docker exec ${NODE_CONTAINER} ls -la /var/log/remnanode/"
 }
  
-# ----- 9) XHTTP (location в nginx ноды) -----
-block_xhttp() {
-  local f=/opt/remnanode/nginx.conf path block ngx tmp existed=0 rc=0
-  while true; do
-    ask path "XHTTP-путь (без слешей)" "xhttppath"
-    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
-    warn "Путь может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
-  done
- 
-  # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
-  # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
-  block=$(cat <<EOB
- 
-    location /${path}/ {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:/dev/shm/xrxh.socket;
-        }
-EOB
-)
+# ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
+# Удаляет старый location /<path>/ и вставляет свежий блок в первый
+# server { } (валидация nginx -t + рестарт nginx/remnanode, откат при ошибке).
+nginx_upsert_location() {
+  local path="$1" block="$2"
+  local f=/opt/remnanode/nginx.conf ngx tmp existed=0 rc=0
  
   if [ ! -f "$f" ]; then
     warn "${f} не найден. Вставь этот блок в server { } нужного nginx.conf вручную:"
@@ -819,6 +802,58 @@ EOB
     if [ -f "${f}.bak" ]; then cp -a "${f}.bak" "$f"; fi
     return 1
   fi
+}
+ 
+# ----- 9a) XHTTP (location в nginx ноды) -----
+block_xhttp() {
+  local path block
+  while true; do
+    ask path "XHTTP-путь (без слешей)" "xhttppath"
+    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
+    warn "Путь может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
+  done
+ 
+  # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
+  # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
+  block=$(cat <<EOB
+ 
+    location /${path}/ {
+            client_max_body_size 0;
+            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            client_body_timeout 5m;
+            grpc_read_timeout 315;
+            grpc_send_timeout 5m;
+            grpc_pass unix:/dev/shm/xrxh.socket;
+        }
+EOB
+)
+  nginx_upsert_location "$path" "$block"
+}
+ 
+# ----- 9b) gRPC (location в nginx ноды) -----
+block_grpc() {
+  local path block
+  while true; do
+    ask path "gRPC serviceName (без слешей)" "grpc"
+    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
+    warn "serviceName может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
+  done
+ 
+  # Тот же паттерн, что XHTTP, но сокет gRPC-инбаунда + keepalive для длинных стримов.
+  block=$(cat <<EOB
+ 
+    location /${path}/ {
+            client_max_body_size 0;
+            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            grpc_socket_keepalive on;
+            client_body_timeout 5m;
+            grpc_read_timeout 315;
+            grpc_send_timeout 5m;
+            grpc_pass unix:/dev/shm/xrgrpc.socket;
+        }
+EOB
+)
+  nginx_upsert_location "$path" "$block"
 }
  
 # ----- 10) nginx 1.28 -> NGINX_TARGET (с проверкой версии и вопросом) -----
@@ -1690,6 +1725,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 6)${RST} RU-блокировка   ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
+   ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -1751,6 +1787,7 @@ menu() {
         f|F) run_block "Починить фаервол" apply_firewall ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
+        r|R) run_block "gRPC" block_grpc ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
@@ -1785,4 +1822,3 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
-
