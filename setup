@@ -7,6 +7,9 @@
 # Запуск:  sudo ./setup.sh   (можно вводить несколько номеров: напр. 1 2)
 #
 set -o pipefail
+# Все создаваемые этим root-скриптом файлы по умолчанию доступны только root.
+# Точечные chmod ниже открывают лишь то, что действительно должно читаться сервисами.
+umask 077
  
 # Откуда брать свежую версию (raw-ссылка на GitHub). Можно переопределить через env.
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/Aleshinson/nodeforge/main/setup}"
@@ -14,6 +17,12 @@ UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/Aleshinson/nodeforge
 NGINX_TARGET="${NGINX_TARGET:-1.30.1}"
 # Ветка/тег репозитория node-accelerator (для прода можно зафиксировать тег: NA_REF=v2.1).
 NA_REF="${NA_REF:-main}"
+# Политика запуска скачанного shell-кода — только pinned: код исполняется лишь
+# при совпадении с заранее доверенным SHA-256. TOFU/prompt-режима намеренно нет.
+# Пины — публичные данные, их безопасно хранить рядом с открытым скриптом или в
+# root-only файле:  /etc/nodeforge/remote-scripts.sha256  (LABEL SHA256).
+REMOTE_EXEC_POLICY="${REMOTE_EXEC_POLICY:-pinned}"
+REMOTE_PINS_FILE="${REMOTE_PINS_FILE:-/etc/nodeforge/remote-scripts.sha256}"
 # Путь к самому скрипту (для самообновления).
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
  
@@ -70,6 +79,17 @@ ask_required() {
   done
   printf -v "$__var" '%s' "$__ans"
 }
+
+# ask_secret VAR "Текст" — обязательный скрытый ввод; значение не попадает в history.
+ask_secret() {
+  local __var="$1" __prompt="$2" __ans=""
+  while [ -z "$__ans" ]; do
+    read -rsp "${__prompt}: " __ans
+    echo
+    if [ -z "$__ans" ]; then warn "Значение не может быть пустым."; fi
+  done
+  printf -v "$__var" '%s' "$__ans"
+}
  
 # ask_port VAR — обязательный ввод порта (1-65535), без значения по умолчанию
 ask_port() {
@@ -93,34 +113,12 @@ ask_username() {
   printf -v "$__var" '%s' "$__ans"
 }
  
-# Минимальная длина пароля пользователя (можно переопределить через env).
-PASS_MIN_LEN="${PASS_MIN_LEN:-10}"
-
-# is_weak_password "пароль" -> 0, если пароль слабый (короче лимита или из блоклиста).
-# У создаваемого пользователя NOPASSWD-sudo, поэтому слабый пароль недопустим.
-is_weak_password() {
-  local p="$1" lc
-  if [ "${#p}" -lt "$PASS_MIN_LEN" ]; then return 0; fi
-  lc="${p,,}"
-  case "$lc" in
-    password*|passw0rd*|qwerty*|qwerty123*|123456*|12345678*|123456789*|1234567890*|\
-    111111*|000000*|admin*|admin123*|root*|toor*|letmein*|welcome*|iloveyou*|\
-    changeme*|secret*|superman*|monkey*|dragon*|master*|abc123*|football*)
-      return 0 ;;
-  esac
-  return 1
-}
-
-# ask_password VAR — скрытый ввод, дважды, с проверкой длины/блоклиста и совпадения
+# ask_password VAR — скрытый ввод, дважды, с проверкой совпадения
 ask_password() {
   local __var="$1" __p1 __p2
   while true; do
-    read -rsp "Пароль для пользователя (ввод скрыт, минимум ${PASS_MIN_LEN} символов): " __p1; echo
+    read -rsp "Пароль для пользователя (ввод скрыт): " __p1; echo
     if [ -z "$__p1" ]; then warn "Пароль не может быть пустым."; continue; fi
-    if is_weak_password "$__p1"; then
-      warn "Слабый пароль (короче ${PASS_MIN_LEN} символов или из списка типовых). У пользователя будет NOPASSWD-sudo — задайте стойкий пароль."
-      continue
-    fi
     read -rsp "Повторите пароль: " __p2; echo
     if [ "$__p1" != "$__p2" ]; then warn "Пароли не совпадают, попробуйте снова."; continue; fi
     break
@@ -137,7 +135,7 @@ confirm() {
  
 # valid_pubkey "строка" -> 0, если похоже на публичный SSH-ключ
 valid_pubkey() {
-  [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-[a-z0-9-]+@openssh\.com)[[:space:]]+ ]]
+  [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-[a-z0-9-]+@openssh\.com)[[:space:]]+ ]]
 }
  
 # choose_from_list VAR "Заголовок" "значение_по_умолчанию_или_пусто" пункт1 пункт2 ...
@@ -242,7 +240,153 @@ wait_for_apt() {
   if [ "$waited" -gt 0 ]; then log "Блокировка освобождена."; fi
   return 0
 }
- 
+
+# ----------------------------- ВНЕШНИЙ КОД -----------------------------
+# Один защитный слой для любого shell-кода из сети. Публикация URL и SHA-256
+# безопасна: это не секреты. Секреты окружения в дочерний скрипт не наследуются.
+_remote_pin_for() {
+  local label="$1" explicit="${2:-}" env_name pin=""
+  if [ -n "$explicit" ]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+
+  env_name="REMOTE_SHA256_$(printf '%s' "$label" | tr '[:lower:].-' '[:upper:]__')"
+  if [[ "$env_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] && [ -n "${!env_name:-}" ]; then
+    printf '%s\n' "${!env_name}"
+    return 0
+  fi
+
+  if [ -f "$REMOTE_PINS_FILE" ]; then
+    if [ -L "$REMOTE_PINS_FILE" ] \
+       || [ "$(stat -c '%u' "$REMOTE_PINS_FILE" 2>/dev/null || echo -1)" != "0" ] \
+       || find "$REMOTE_PINS_FILE" -prune -perm /022 -print -quit 2>/dev/null | grep -q .; then
+      err "Файл пинов небезопасен (нужен обычный root-owned файл без group/other write): ${REMOTE_PINS_FILE}"
+      return 1
+    fi
+    pin="$(awk -v label="$label" '$1 == label { print $2; exit }' "$REMOTE_PINS_FILE")"
+  fi
+  printf '%s\n' "$pin"
+}
+
+# fetch_verified_script LABEL HTTPS_URL DEST [EXPLICIT_SHA256]
+fetch_verified_script() {
+  local label="$1" url="$2" dest="$3" explicit="${4:-}" expected actual size
+  case "$label" in
+    ''|*[!A-Za-z0-9._-]*) err "Некорректная метка внешнего скрипта: ${label}"; return 1 ;;
+  esac
+  case "$url" in
+    https://*) ;;
+    *) err "Внешний код разрешено загружать только по явному HTTPS: ${url}"; return 1 ;;
+  esac
+  if [ "$REMOTE_EXEC_POLICY" != "pinned" ]; then
+    err "Разрешена только REMOTE_EXEC_POLICY=pinned; небезопасные bypass-режимы удалены."
+    return 1
+  fi
+
+  : > "$dest" || return 1
+  chmod 600 "$dest"
+  if ! ( 
+      ulimit -f 8192
+      curl --disable --fail --show-error --silent --location \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 180 --max-filesize 8388608 --retry 3 \
+        --output "$dest" "$url"
+    ); then
+    err "Не удалось скачать ${label}: ${url}"
+    rm -f "$dest"
+    return 1
+  fi
+  if [ ! -s "$dest" ]; then
+    err "${label}: скачан пустой файл."
+    return 1
+  fi
+  size="$(wc -c < "$dest" | tr -d '[:space:]')"
+  if ! is_uint "$size" || [ "$size" -gt 8388608 ]; then
+    err "${label}: подозрительный размер (${size:-?} байт, максимум 8 MiB)."
+    return 1
+  fi
+  if LC_ALL=C head -c 512 "$dest" | grep -qiE '<!doctype[[:space:]]+html|<html'; then
+    err "${label}: вместо shell-скрипта получен HTML."
+    return 1
+  fi
+  if ! bash -n "$dest"; then
+    err "${label}: bash -n нашёл синтаксическую ошибку; запуск отменён."
+    return 1
+  fi
+
+  command -v sha256sum >/dev/null 2>&1 || { err "Нужен sha256sum (coreutils)."; return 1; }
+  actual="$(sha256sum "$dest" | awk '{print tolower($1)}')"
+  expected="$(_remote_pin_for "$label" "$explicit")" || return 1
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -n "$expected" ]; then
+    if ! [[ "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+      err "${label}: пин должен быть SHA-256 из 64 hex-символов."
+      return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+      err "${label}: SHA-256 НЕ совпал; код не запущен."
+      err "Ожидался: ${expected}"
+      err "Получен:   ${actual}"
+      return 1
+    fi
+    ok "${label}: SHA-256 проверен (${actual:0:12}…)."
+    return 0
+  fi
+
+  err "${label}: нет доверенного SHA-256; запуск запрещён политикой pinned."
+  warn "После проверки исходника добавь строку в ${REMOTE_PINS_FILE}:"
+  warn "  ${label} ${actual}"
+  return 1
+}
+
+# Выполнить проверенный root-скрипт с очищенным окружением: случайные GH/AWS/CI
+# токены и SSH_AUTH_SOCK из сессии ему не передаются.
+run_verified_script() {
+  local label="$1" url="$2" tmp rc=0; shift 2
+  tmp="$(mktemp)"
+  if ! fetch_verified_script "$label" "$url" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME=/root USER=root LOGNAME=root LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
+    NA_REF="${NA_REF:-}" bash "$tmp" "$@" || rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# Публичные тесты VPS не получают root и не видят home, каталоги проектов,
+# Docker и /etc/nodeforge. Без mount sandbox запуск запрещён: одного UID nobody мало.
+run_sandboxed_check() {
+  local label="$1" url="$2" tmp rc=0; shift 2
+  tmp="$(mktemp)"
+  if ! fetch_verified_script "$label" "$url" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
+      systemd-run --quiet --wait --pipe --collect \
+        -p DynamicUser=yes -p PrivateTmp=yes -p PrivateDevices=yes \
+        -p ProtectHome=yes -p ProtectSystem=strict -p NoNewPrivileges=yes \
+        -p ProtectProc=invisible -p ProtectKernelTunables=yes \
+        -p ProtectKernelModules=yes -p ProtectKernelLogs=yes \
+        -p RestrictSUIDSGID=yes -p LockPersonality=yes \
+        -p CapabilityBoundingSet= -p AmbientCapabilities= \
+        -p "InaccessiblePaths=-/opt -/srv -/etc/nodeforge -/var/lib/docker -/var/www -/mnt -/media -/data -/var/run/docker.sock -/run/docker.sock" \
+        /bin/bash -s -- "$@" < "$tmp" || rc=$?
+  else
+    err "Нет systemd-run: безопасная filesystem-изоляция публичной проверки невозможна."
+    rc=1
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
 # Проверяем, что нода remnanode запущена и есть её docker-compose.
 require_node() {
   if [ -f /opt/remnanode/docker-compose.yml ]; then
@@ -322,6 +466,112 @@ compose_add_volume() {
   mv "$tmp" "$f"
 }
  
+# compose_set_env "KEY" "VALUE" — ставит переменную в environment: сервиса ноды:
+# существующую заменяет (дубликаты схлопывает), отсутствующую дописывает. Форма
+# (список `- KEY=VALUE` или карта `KEY: "VALUE"`) и отступ берутся у соседних
+# строк; без блока environment: он создаётся в конце сервиса. Результат сначала
+# проходит `docker compose config`, и только потом ложится на место (с .bak).
+compose_set_env() {
+  require_node || return 1
+
+  local key="$1" value="$2"
+  local f="${NODE_DIR}/docker-compose.yml"
+  local tmp rc=0
+
+  case "$key" in
+    ''|*[!A-Za-z0-9_]*) err "Некорректное имя переменной: ${key}"; return 1 ;;
+  esac
+
+  tmp="$(mktemp)"
+
+  awk -v key="$key" -v value="$value" -v service="$NODE_SERVICE" '
+    function flush_hold() { printf "%s", hold; hold = "" }
+    function emit_item() {
+      if (form == "map") print item_indent key ": \"" value "\""
+      else               print item_indent "- " key "=" value
+      done = 1
+    }
+    # Конец блока environment: переменной в нём не было — дописать.
+    function close_env() {
+      if (in_env && !done) emit_item()
+      in_env = 0
+    }
+    # Конец сервиса: блока environment: не было — создать. Придержанные пустые
+    # строки/комментарии выходят после, чтобы блок не отрывался от сервиса.
+    function close_service() {
+      close_env()
+      if (in_service && !have_env) { print "    environment:"; emit_item() }
+      flush_hold()
+      in_service = 0
+    }
+
+    BEGIN { form = "list"; item_indent = "      " }
+
+    /^[^ ]/ { top = $0 }
+
+    top ~ /^services:/ && $0 ~ ("^  " service ":[[:space:]]*(#.*)?$") {
+      print
+      in_service = 1
+      seen = 1
+      have_env = 0
+      next
+    }
+
+    in_service && /^[[:space:]]*(#|$)/ { hold = hold $0 "\n"; next }
+
+    in_service && $0 !~ /^   / { close_service() }
+
+    in_service && /^    environment:/ {
+      if ($0 !~ /^    environment:[[:space:]]*(#.*)?$/) { bad = 1; exit 3 }
+      flush_hold()
+      print
+      in_env = 1
+      have_env = 1
+      next
+    }
+
+    in_env && /^    [^ ]/ { close_env() }
+
+    in_env {
+      flush_hold()
+      match($0, /^[[:space:]]*/)
+      item_indent = substr($0, 1, RLENGTH)
+      form = ($0 ~ /^[[:space:]]*-/) ? "list" : "map"
+      if ($0 ~ ("^[[:space:]]*-[[:space:]]*\"?" key "=") || $0 ~ ("^[[:space:]]*\"?" key "\"?[[:space:]]*:")) {
+        if (!done) emit_item()
+        next
+      }
+    }
+
+    in_service { flush_hold() }
+
+    { print }
+
+    END {
+      if (bad) exit 3
+      close_service()
+      if (!seen) exit 4
+    }
+  ' "$f" >"$tmp" || rc=$?
+
+  case "$rc" in
+    0) ;;
+    3) rm -f "$tmp"; err "В ${f} у сервиса ${NODE_SERVICE} блок environment: записан в одну строку — правь вручную."; return 1 ;;
+    4) rm -f "$tmp"; err "В ${f} не найден сервис '${NODE_SERVICE}:' под services:."; return 1 ;;
+    *) rm -f "$tmp"; err "Не удалось обработать ${f} (awk вернул ${rc})."; return "$rc" ;;
+  esac
+
+  if ! docker compose --project-directory "$NODE_DIR" -f "$tmp" config -q; then
+    rm -f "$tmp"
+    err "После правки compose не проходит 'docker compose config' — файл не тронут."
+    return 1
+  fi
+
+  cp -a "$f" "${f}.bak"
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+ 
 # ============================ БЛОКИ ============================
  
 # ----- 1) SSH-харденинг: порт + пользователь + sudo + ключи + запрет root -----
@@ -360,23 +610,24 @@ block_ssh() {
   else
     echo "  • SSH-ключ:          не задан"
     echo "  • Парольный вход:    останется включённым"
-    warn "БЕЗ КЛЮЧА: парольный вход по SSH остаётся ВКЛ, а у ${user} — беспарольный sudo (NOPASSWD)."
-    warn "Слабый пароль = прямой путь к root. Настоятельно рекомендую задать SSH-ключ."
   fi
   confirm "Продолжить?" || { warn "Отменено."; return 1; }
  
   # порт
   log "Ставлю SSH-порт ${port}."
   set_sshd_option Port "$port"
-  # ЕДИНЫЙ ФАЕРВОЛ: ufw НЕ трогаем. Пишем порт в реестр; если na_filter уже поднят —
-  # сразу переприменяем, иначе порт подхватит пункт 3 (protect).
+  # Пишем порт в реестр. UFW не отключаем, пока проверенный na_filter не готов.
   fw_set SSH_PORT "$port"
-  fw_neutralize_ufw
   if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
     apply_firewall
   else
-    warn "Фаервол ещё не поднят (na_filter нет). Новый порт ${port} сохранён в реестр и откроется в пункте 3 (protect)."
-    warn "Сейчас активного фаервола нет — для свежего сервера это нормально, доступ открыт."
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+      ufw allow "${port}/tcp"
+      warn "UFW оставлен активным; новый SSH-порт ${port}/tcp добавлен. Старый порт пока не удаляй."
+    else
+      warn "na_filter ещё не поднят. Порт ${port} сохранён и будет открыт пунктом protect."
+      warn "Активный фаервол не обнаружен — до protect хост может быть доступен шире ожидаемого."
+    fi
   fi
  
   # пользователь + sudo
@@ -416,22 +667,16 @@ block_ssh() {
 # ----- 2) node-accelerator: optimize (XanMod BBRv3 + sysctl + RPS/RFS + swap) -----
 # Единственный владелец ядра и тюнинга (раньше это были отдельные XanMod/BBR — удалены как дубли).
 block_optimize() {
-  local tmp
   info "node-accelerator: оптимизация — XanMod BBRv3 + sysctl + RPS/RFS/XPS + swap + лимиты."
   warn "Делает ядро XanMod (BBRv3) и весь сетевой тюнинг за один проход."
   warn "После установки XanMod потребуется reboot."
   echo
-  tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator (install.sh)."
-    rm -f "$tmp"
-    return 1
-  fi
-  NA_REF="$NA_REF" bash "$tmp" optimize || warn "optimize завершился с ненулевым кодом — см. вывод выше."
-  rm -f "$tmp"
+  run_verified_script "node-accelerator" \
+    "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" \
+    optimize || warn "optimize завершился с ненулевым кодом — см. вывод выше."
   echo
   warn "Если установился XanMod — выполни reboot, затем проверь: uname -r (должно содержать xanmod)."
-  warn "Откатить тюнинг при необходимости: bash <(curl -fsSL .../node-accelerator/${NA_REF}/install.sh) rollback optimize"
+  warn "Откат делай тем же проверенным пунктом/пином: install.sh rollback optimize."
 }
  
 # ----- 3) node-accelerator: protect (nftables na_filter + CrowdSec) -----
@@ -462,63 +707,16 @@ block_protect() {
   apply_firewall
 }
  
-# ----- netbird: обновление демона до последней версии -----
-# netbird ставится из apt-репозитория (его добавляет официальный install.sh),
-# поэтому штатное обновление — через apt. Если репозитория нет (ставили иначе) —
-# предлагаем переустановку официальным установщиком (подтянет последнюю версию).
-netbird_update() {
-  command -v netbird >/dev/null 2>&1 || { err "netbird не установлен. Сначала установи его (пункт «netbird»)."; return 1; }
-
-  local before after
-  before="$(netbird version 2>/dev/null | head -1 || true)"
-  info "Текущая версия netbird: ${before:-неизвестна}"
-
-  if grep -rqi 'pkgs\.netbird\.io' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-    log "Обновляю netbird через apt."
-    wait_for_apt
-    apt-get update -y
-    apt-get install -y --only-upgrade netbird || { err "apt не смог обновить netbird."; return 1; }
-  else
-    warn "apt-репозиторий netbird не найден (демон ставили не через install.sh)."
-    confirm "Переустановить официальным установщиком (подтянет последнюю версию)?" || { warn "Отменено."; return 1; }
-    wait_for_apt
-    if ! curl -fsSL https://pkgs.netbird.io/install.sh | sh; then
-      err "Переустановка netbird не удалась."
-      return 1
-    fi
-    hash -r 2>/dev/null || true
-  fi
-
-  # Применяем новый бинарь: перезапуск службы. Туннель на пару секунд рвётся и
-  # переподключается сам по сохранённой конфигурации — setup-key не нужен.
-  if systemctl list-unit-files 2>/dev/null | grep -q '^netbird\.service'; then
-    log "Перезапускаю службу netbird."
-    systemctl restart netbird 2>/dev/null || warn "Не удалось перезапустить — сделай вручную: systemctl restart netbird"
-    sleep 1
-  fi
-
-  after="$(netbird version 2>/dev/null | head -1 || true)"
-  if [ -n "$after" ] && [ "$before" = "$after" ]; then
-    ok "netbird уже актуален (${after}). Изменений нет."
-  else
-    ok "netbird обновлён: ${before:-?} → ${after:-?}"
-  fi
-  netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|Signal|FQDN' | sed 's/^/   /' || true
-}
-
 # ----- 6) netbird -----
 block_netbird() {
-  local key
+  local key keyfile rc=0
 
   if command -v netbird >/dev/null 2>&1; then
-    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1))."
-    if confirm "Обновить netbird до последней версии?"; then
-      netbird_update || warn "Обновление netbird завершилось с ошибкой — см. вывод выше."
-    fi
+    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1)). Установку пропускаю."
   else
     log "netbird не найден — устанавливаю."
     wait_for_apt
-    if ! curl -fsSL https://pkgs.netbird.io/install.sh | sh; then
+    if ! run_verified_script "netbird-install" "https://pkgs.netbird.io/install.sh"; then
       err "Установка netbird не удалась."
       return 1
     fi
@@ -541,7 +739,8 @@ block_netbird() {
   fi
 
   echo "setup-key вводится здесь и в файле не хранится."
-  ask key "netbird setup-key (Enter — подключить позже)" ""
+  echo "Нажми Enter, если хочешь подключить NetBird позже."
+  read -rsp "netbird setup-key: " key; echo
   if [ -z "$key" ]; then
     warn "Ключ не задан. Позже подключишь командой: netbird up --setup-key <KEY>"
     return 0
@@ -554,7 +753,25 @@ block_netbird() {
     sleep 1
   fi
 
-  if netbird up --setup-key "$key"; then
+  if ! netbird up --help 2>&1 | grep -q -- '--setup-key-file'; then
+    err "Эта версия NetBird не поддерживает --setup-key-file; обнови клиент. Передавать секрет через argv не буду."
+    unset key
+    return 1
+  fi
+  keyfile="$(mktemp)"
+  chmod 600 "$keyfile"
+  printf '%s\n' "$key" > "$keyfile"
+  unset key
+  trap 'rm -f "$keyfile"; exit 130' INT TERM
+  if netbird up --setup-key-file "$keyfile"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  rm -f "$keyfile"
+  trap - INT TERM
+
+  if [ "$rc" -eq 0 ]; then
     ok "netbird подключён."
     netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|FQDN' | sed 's/^/   /' || true
   else
@@ -567,16 +784,16 @@ block_netbird() {
 block_remnanode() {
   log "Запускаю установщик remnanode (интерактивный — следуйте подсказкам)."
   wait_for_apt
-  bash <(curl -fLs https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+  run_verified_script "remnanode-install" \
+    "https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh"
 
   # Установщик ноды делает `ufw --force enable` (открыты только 22+443) — это ВТОРОЙ
   # фаервол, который потом «съедает» твои порты. Гасим его и возвращаем единый na_filter.
-  fw_neutralize_ufw
   if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
     log "Возвращаю полный набор портов в единый фаервол (na_filter)."
     apply_firewall
   else
-    warn "ufw от установщика ноды выключен. Подними фаервол пунктом 3 (protect) — он откроет все порты разом."
+    warn "na_filter ещё не готов: UFW не отключаю. Сначала проверь SSH/порты, затем запусти protect."
   fi
  
   mkdir -p /var/log/remnanode
@@ -730,12 +947,25 @@ EOF
   warn "  docker exec ${NODE_CONTAINER} ls -la /var/log/remnanode/"
 }
  
-# ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
-# Удаляет старый location /<path>/ и вставляет свежий блок в первый
-# server { } (валидация nginx -t + рестарт nginx/remnanode, откат при ошибке).
-nginx_upsert_location() {
-  local path="$1" block="$2"
-  local f=/opt/remnanode/nginx.conf ngx tmp existed=0 rc=0
+# ----- 9) XHTTP (location в nginx ноды) -----
+block_xhttp() {
+  local f=/opt/remnanode/nginx.conf path block ngx tmp existed=0 rc=0
+  ask path "XHTTP-путь (без слешей)" "xhttppath"
+ 
+  # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
+  # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
+  block=$(cat <<EOB
+ 
+    location /${path}/ {
+            client_max_body_size 0;
+            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            client_body_timeout 5m;
+            grpc_read_timeout 315;
+            grpc_send_timeout 5m;
+            grpc_pass unix:/dev/shm/xrxh.socket;
+        }
+EOB
+)
  
   if [ ! -f "$f" ]; then
     warn "${f} не найден. Вставь этот блок в server { } нужного nginx.conf вручную:"
@@ -804,58 +1034,6 @@ nginx_upsert_location() {
   fi
 }
  
-# ----- 9a) XHTTP (location в nginx ноды) -----
-block_xhttp() {
-  local path block
-  while true; do
-    ask path "XHTTP-путь (без слешей)" "xhttppath"
-    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
-    warn "Путь может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
-  done
- 
-  # Свежий блок с правильными отступами (пустая строка + location на 4 пробелах,
-  # тело на 12, закрывающая скобка на 8 — как в рабочем конфиге).
-  block=$(cat <<EOB
- 
-    location /${path}/ {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:/dev/shm/xrxh.socket;
-        }
-EOB
-)
-  nginx_upsert_location "$path" "$block"
-}
- 
-# ----- 9b) gRPC (location в nginx ноды) -----
-block_grpc() {
-  local path block
-  while true; do
-    ask path "gRPC serviceName (без слешей)" "grpc"
-    if [[ "$path" =~ ^[A-Za-z0-9_-]+$ ]]; then break; fi
-    warn "serviceName может содержать только латиницу, цифры, дефис и подчёркивание (без слешей, пробелов и спецсимволов)."
-  done
- 
-  # Тот же паттерн, что XHTTP, но сокет gRPC-инбаунда + keepalive для длинных стримов.
-  block=$(cat <<EOB
- 
-    location /${path}/ {
-            client_max_body_size 0;
-            grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            grpc_socket_keepalive on;
-            client_body_timeout 5m;
-            grpc_read_timeout 315;
-            grpc_send_timeout 5m;
-            grpc_pass unix:/dev/shm/xrgrpc.socket;
-        }
-EOB
-)
-  nginx_upsert_location "$path" "$block"
-}
- 
 # ----- 10) nginx 1.28 -> NGINX_TARGET (с проверкой версии и вопросом) -----
 block_nginx_upgrade() {
   local f cur target rc=0
@@ -895,6 +1073,62 @@ block_nginx_upgrade() {
   local now
   now="$(docker inspect -f '{{.Config.Image}}' remnawave-nginx 2>/dev/null || true)"
   log "Готово. Контейнер remnawave-nginx на образе: ${now:-неизвестно}"
+}
+ 
+# ----- SNI-проверка mTLS (панель → нода), remnawave/node >= 3.4 -----
+# https://f.docs.rw/t/topic/639 — в 3.3.x нода обязательно сверяла SNI входящего
+# mTLS-соединения (и не подключалась к старым панелям); с 3.4.x проверка выключена
+# по умолчанию и включается переменной SNI_VERIFICATION в environment сервиса.
+node_env_value() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NODE_CONTAINER" 2>/dev/null \
+    | awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+block_sni_verification() {
+  local live want mode
+  require_node || return 1
+  info "Стек ноды найден: ${NODE_DIR}/docker-compose.yml"
+
+  live="$(node_env_value SNI_VERIFICATION)"
+  log "SNI_VERIFICATION в контейнере ${NODE_CONTAINER}: ${live:-не задана (по умолчанию false)}"
+  echo
+  info "Нужна нода remnawave/node >= 3.4: в 3.3.x проверка включена всегда, до 3.2.x переменная игнорируется."
+  info "Панель должна слать SNI, который нода ожидает. Если после включения нода в панели уйдёт"
+  info "в offline — запусти этот пункт ещё раз и выключи."
+  echo
+
+  choose_from_list mode "Что сделать?" "Включить (SNI_VERIFICATION=true)" \
+    "Включить (SNI_VERIFICATION=true)" \
+    "Выключить (SNI_VERIFICATION=false)"
+  case "$mode" in
+    Включить*) want=true ;;
+    *)         want=false ;;
+  esac
+
+  if [ "$live" = "$want" ]; then
+    log "В контейнере уже SNI_VERIFICATION=${want} — менять нечего."
+    return 0
+  fi
+  if ! confirm "Записать SNI_VERIFICATION=${want} в compose и пересоздать ${NODE_CONTAINER}?"; then
+    warn "Отменено — compose не тронут."
+    return 0
+  fi
+
+  compose_set_env SNI_VERIFICATION "$want" || return 1
+  log "compose обновлён (бэкап: ${NODE_DIR}/docker-compose.yml.bak). Пересоздаю контейнер."
+  if ! ( cd "$NODE_DIR" && docker compose up -d ); then
+    err "docker compose up -d не удался — см. вывод выше. Откат: cp ${NODE_DIR}/docker-compose.yml.bak ${NODE_DIR}/docker-compose.yml"
+    return 1
+  fi
+  sleep 2
+
+  live="$(node_env_value SNI_VERIFICATION)"
+  if [ "$live" != "$want" ]; then
+    err "В контейнере SNI_VERIFICATION=${live:-<пусто>}, ожидалось ${want}. Проверь compose вручную."
+    return 1
+  fi
+  ok "SNI_VERIFICATION=${want} применена в ${NODE_CONTAINER}."
+  warn "Проверь в панели, что нода online. Логи: docker logs --tail 50 ${NODE_CONTAINER}"
 }
  
 # ----- 11) Перезапуск контейнеров (стек ноды или все на хосте) -----
@@ -952,7 +1186,7 @@ find_beszel_bin() {
  
 # ----- 12) Beszel: подключить агент к хабу -----
 block_beszel_agent() {
-  local key port token url tmp
+  local key port token url tmp rc=0
   info "Beszel — мониторинг. Нужен публичный ключ из хаба:"
   info "в веб-интерфейсе хаба нажми Add System и скопируй Public Key."
   echo
@@ -960,25 +1194,48 @@ block_beszel_agent() {
   ask port  "Порт агента" "45876"
   warn "Для NAT-сервера (агент сам идёт к хабу по WebSocket) укажи Token и URL хаба."
   warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
-  ask token "Token (Enter — пропустить)" ""
+  read -rsp "Token (Enter — пропустить): " token; echo
   ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
+  if ! is_uint "$port" || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    err "Порт Beszel должен быть числом 1-65535."
+    unset token
+    return 1
+  fi
+  if [ -n "$url" ] \
+     && ! { [[ "$url" == https://* ]] && [[ ! "$url" =~ [[:space:]] ]]; } \
+     && ! [[ "$url" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?(/[^[:space:]]*)?$ ]]; then
+    err "URL хаба должен использовать HTTPS (HTTP разрешён только для точного localhost/loopback)."
+    unset token
+    return 1
+  fi
  
   tmp="$(mktemp)"
   log "Скачиваю install-agent.sh."
-  if ! curl -fsSL https://get.beszel.dev -o "$tmp"; then
+  if ! fetch_verified_script "beszel-install" "https://get.beszel.dev" "$tmp"; then
     err "Не удалось скачать install-agent.sh."
     rm -f "$tmp"
+    unset token
     return 1
   fi
-  chmod +x "$tmp"
- 
-  set -- -k "$key" -p "$port"
-  if [ -n "$token" ]; then set -- "$@" -t "$token"; fi
-  if [ -n "$url" ];   then set -- "$@" -url "$url"; fi
  
   log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."
-  "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
+  # TOKEN идёт по анонимному FD 3. Он не появляется ни в argv, ни в environment.
+  env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME=/root USER=root LOGNAME=root LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
+    bash -c '
+      key="$1"; port="$2"; url="$3"; script="$4"
+      IFS= read -r token <&3 || token=""
+      set -- -k "$key" -p "$port"
+      [ -n "$token" ] && set -- "$@" -t "$token"
+      [ -n "$url" ] && set -- "$@" -url "$url"
+      . "$script"
+    ' nodeforge-beszel "$key" "$port" "$url" "$tmp" 3<<<"$token" || rc=$?
+  unset token
   rm -f "$tmp"
+  if [ "$rc" -ne 0 ]; then
+    err "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
+    return "$rc"
+  fi
  
   # ЕДИНЫЙ ФАЕРВОЛ: не трогаем ufw — регистрируем порт и переприменяем na_filter.
   fw_add_port "$port" tcp
@@ -1035,34 +1292,21 @@ block_beszel_update() {
  
 # ----- 14) Диагностика ноды (внешний скрипт Case211/node-diagnostic) -----
 block_diag() {
-  local tmp
   log "Скачиваю и запускаю диагностику ноды (Case211/node-diagnostic)."
   log "Полный прогон ~5 мин; скрипт может предложить применить фиксы — отвечай сам."
-  tmp="$(mktemp)"
-  if ! curl -fsSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/node-diagnostic.sh -o "$tmp"; then
-    err "Не удалось скачать диагностику."
-    rm -f "$tmp"
-    return 1
-  fi
   # сам диагностический скрипт может вернуть ненулевой код при найденных проблемах — это нормально
-  bash "$tmp" || true
-  rm -f "$tmp"
+  run_verified_script "node-diagnostic" \
+    "https://raw.githubusercontent.com/Case211/node-diagnostic/main/node-diagnostic.sh" || true
 }
  
 # ----- node-accelerator: diagnose (ядро/sysctl/conntrack/NIC/firewall/порты, read-only) -----
 block_na_diagnose() {
-  local tmp
   info "node-accelerator: диагностика — ядро/BBR/sysctl/conntrack/NIC/RPS/firewall/порты. Только чтение."
   echo
-  tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator (install.sh)."
-    rm -f "$tmp"
-    return 1
-  fi
   # read-only; ненулевой код = найдены замечания, это нормально
-  NA_REF="$NA_REF" bash "$tmp" diagnose || true
-  rm -f "$tmp"
+  run_verified_script "node-accelerator" \
+    "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" \
+    diagnose || true
 }
  
 # ----- 13) Подменю «Диагностика»: выбор, что запускать -----
@@ -1151,14 +1395,14 @@ submenu_checks() {
     [ -z "$choice" ] && continue
     for c in $choice; do
       case "$c" in
-        1) echo; step "IP region";          bash <(wget -qO- https://ipregion.vrnt.xyz) || true ;;
-        2) echo; step "CensorCheck geoblock"; bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true ;;
-        3) echo; step "CensorCheck DPI";    bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        4) echo; step "IP.Check.Place";     bash <(curl -fLs IP.Check.Place) -l en || true ;;
-        5) echo; step "IPQuality";          bash <(curl -fLs https://Check.Place) -EI || true ;;
-        6) echo; step "Russian iPerf3";     bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true ;;
-        7) echo; step "YABS";               curl -fsSL yabs.sh | bash -s -- -4 || true ;;
-        8) echo; step "bench.sh";           wget -qO- bench.sh | bash || true ;;
+        1) echo; step "IP region";          run_sandboxed_check "ip-region" "https://ipregion.vrnt.xyz" || true ;;
+        2) echo; step "CensorCheck geoblock"; run_sandboxed_check "censorcheck" "https://github.com/vernette/censorcheck/raw/master/censorcheck.sh" --mode geoblock || true ;;
+        3) echo; step "CensorCheck DPI";    run_sandboxed_check "censorcheck" "https://github.com/vernette/censorcheck/raw/master/censorcheck.sh" --mode dpi || true ;;
+        4) echo; step "IP.Check.Place";     run_sandboxed_check "ip-check-place" "https://IP.Check.Place" -l en || true ;;
+        5) echo; step "IPQuality";          run_sandboxed_check "ip-quality" "https://Check.Place" -EI || true ;;
+        6) echo; step "Russian iPerf3";     run_sandboxed_check "russian-iperf3" "https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh" || true ;;
+        7) echo; step "YABS";               run_sandboxed_check "yabs" "https://yabs.sh" -4 || true ;;
+        8) echo; step "bench.sh";           run_sandboxed_check "bench-sh" "https://bench.sh" || true ;;
         9) echo; step "sysbench CPU";       sysbench cpu run --threads=1 || true ;;
         0)  return 0 ;;
         *)  warn "Неизвестный пункт: ${c}" ;;
@@ -1175,38 +1419,125 @@ submenu_checks() {
 
 FW_ENV="/etc/nodeforge/firewall.env"
 
-# Создать реестр с дефолтами для ОТСУТСТВУЮЩИХ ключей (ничего не перетирает).
+# Реестр — ДАННЫЕ, а не shell-файл: KEY:base64(value), формат base64-v1.
+# Поэтому URL/токен/ввод оператора никогда не исполняются через source/eval.
+_fw_allowed_key() {
+  case "$1" in
+    SSH_PORT|NODE_PORT|TCP_PORTS|UDP_PORTS|EXTRA_TCP|EXTRA_UDP|WHITELIST|\
+    ENABLE_BLOCKLISTS|BLOCK_TOR|REMNAWAVE_URL|REMNAWAVE_TOKEN) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_valid_port() { is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+_valid_port_list() {
+  local list="$1" p
+  [ -z "$list" ] && return 0
+  while IFS= read -r p; do
+    p="${p//[[:space:]]/}"
+    _valid_port "$p" || return 1
+  done < <(printf '%s' "$list" | tr ',' '\n')
+}
+
+_fw_value_valid() {
+  local k="$1" v="$2"
+  case "$k" in
+    SSH_PORT|NODE_PORT) _valid_port "$v" ;;
+    TCP_PORTS|UDP_PORTS|EXTRA_TCP|EXTRA_UDP) _valid_port_list "$v" ;;
+    ENABLE_BLOCKLISTS|BLOCK_TOR) [[ "$v" =~ ^[01]$ ]] ;;
+    WHITELIST) [[ "$v" =~ ^[0-9A-Fa-f:.,/[:space:]]*$ ]] ;;
+    REMNAWAVE_URL) [ -z "$v" ] || { [[ "$v" == https://* ]] && [[ ! "$v" =~ [[:space:]] ]]; } ;;
+    REMNAWAVE_TOKEN) [ "${#v}" -le 4096 ] && [[ "$v" != *$'\n'* ]] && [[ "$v" != *$'\r'* ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 fw_init() {
-  mkdir -p /etc/nodeforge
-  [ -f "$FW_ENV" ] || ( umask 077; : > "$FW_ENV" )
-  chmod 600 "$FW_ENV"
-  local kv k v
-  for kv in \
-    "SSH_PORT=$(detect_ssh_port)" \
-    "NODE_PORT=2222" \
-    "TCP_PORTS=443" \
-    "UDP_PORTS=443" \
-    "EXTRA_TCP=" \
-    "EXTRA_UDP=" \
-    "WHITELIST=" \
-    "ENABLE_BLOCKLISTS=1" \
-    "BLOCK_TOR=0"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    grep -qE "^${k}=" "$FW_ENV" || printf '%s="%s"\n' "$k" "$v" >> "$FW_ENV"
-  done
-}
-
-# Обновить ОДИН ключ, сохранив остальные.
-fw_set() {
-  fw_init; local k="$1" v="$2"
-  if grep -qE "^${k}=" "$FW_ENV"; then
-    sed -i -E "s|^${k}=.*|${k}=\"${v}\"|" "$FW_ENV"
-  else
-    printf '%s="%s"\n' "$k" "$v" >> "$FW_ENV"
+  install -d -m 700 /etc/nodeforge
+  [ -L "$FW_ENV" ] && { err "Отказываюсь использовать symlink: ${FW_ENV}"; return 1; }
+  if [ -f "$FW_ENV" ] && head -n1 "$FW_ENV" | grep -qF 'base64-v1'; then
+    chmod 600 "$FW_ENV"
+    return 0
   fi
+
+  local k raw v enc tmp old_had_data=0
+  local -A vals
+  vals[SSH_PORT]="$(detect_ssh_port)"
+  vals[NODE_PORT]="2222"
+  vals[TCP_PORTS]="443"
+  vals[UDP_PORTS]="443"
+  vals[EXTRA_TCP]=""
+  vals[EXTRA_UDP]=""
+  vals[WHITELIST]=""
+  vals[ENABLE_BLOCKLISTS]="1"
+  vals[BLOCK_TOR]="0"
+  vals[REMNAWAVE_URL]=""
+  vals[REMNAWAVE_TOKEN]=""
+
+  # Однократная безопасная миграция старого KEY="value": разбираем как текст,
+  # не source-им. Некорректные значения отбрасываются.
+  if [ -s "$FW_ENV" ]; then
+    old_had_data=1
+    while IFS= read -r raw; do
+      [[ "$raw" == *=* ]] || continue
+      k="${raw%%=*}"; v="${raw#*=}"
+      _fw_allowed_key "$k" || continue
+      if [ "${#v}" -ge 2 ] && [ "${v:0:1}" = '"' ] && [ "${v: -1}" = '"' ]; then
+        v="${v:1:${#v}-2}"
+      fi
+      if _fw_value_valid "$k" "$v"; then vals[$k]="$v"; fi
+    done < "$FW_ENV"
+    cp -a "$FW_ENV" "${FW_ENV}.legacy-$(date +%s)"
+  fi
+
+  tmp="$(mktemp "${FW_ENV}.tmp.XXXXXX")"
+  printf '# nodeforge firewall registry base64-v1\n' > "$tmp"
+  for k in SSH_PORT NODE_PORT TCP_PORTS UDP_PORTS EXTRA_TCP EXTRA_UDP WHITELIST \
+           ENABLE_BLOCKLISTS BLOCK_TOR REMNAWAVE_URL REMNAWAVE_TOKEN; do
+    enc="$(printf '%s' "${vals[$k]}" | base64 | tr -d '\r\n')"
+    printf '%s:%s\n' "$k" "$enc" >> "$tmp"
+  done
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$FW_ENV"
+  [ "$old_had_data" -eq 1 ] && warn "Старый firewall.env безопасно мигрирован; копия сохранена рядом как .legacy-*"
 }
 
-fw_load() { fw_init; . "$FW_ENV"; }
+# Обновить один разрешённый ключ атомарно.
+fw_set() {
+  local k="$1" v="$2" enc tmp
+  _fw_allowed_key "$k" || { err "Неизвестный ключ firewall.env: ${k}"; return 1; }
+  _fw_value_valid "$k" "$v" || { err "Некорректное значение ${k}."; return 1; }
+  fw_init || return 1
+  enc="$(printf '%s' "$v" | base64 | tr -d '\r\n')"
+  tmp="$(mktemp "${FW_ENV}.tmp.XXXXXX")"
+  awk -F: -v key="$k" -v entry="${k}:${enc}" '
+    $1 == key { print entry; found=1; next }
+    { print }
+    END { if (!found) print entry }
+  ' "$FW_ENV" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$FW_ENV"
+}
+
+fw_load() {
+  local k enc v
+  fw_init || return 1
+  SSH_PORT="$(detect_ssh_port)"; NODE_PORT="2222"
+  TCP_PORTS="443"; UDP_PORTS="443"; EXTRA_TCP=""; EXTRA_UDP=""
+  WHITELIST=""; ENABLE_BLOCKLISTS="1"; BLOCK_TOR="0"
+  REMNAWAVE_URL=""; REMNAWAVE_TOKEN=""
+  while IFS=: read -r k enc; do
+    [[ "$k" == \#* ]] && continue
+    _fw_allowed_key "$k" || { warn "Игнорирую неизвестный ключ firewall.env: ${k}"; continue; }
+    if ! v="$(printf '%s' "$enc" | base64 --decode 2>/dev/null)"; then
+      err "Повреждён base64 для ${k} в ${FW_ENV}."
+      return 1
+    fi
+    _fw_value_valid "$k" "$v" || { err "Некорректное значение ${k} в ${FW_ENV}."; return 1; }
+    printf -v "$k" '%s' "$v"
+  done < "$FW_ENV"
+}
 
 # Объединить два списка "a,b" + "c" → "a,b,c" (uniq, без пустых).
 _merge_ports() { { echo "$1"; echo "$2"; } | tr ',' '\n' | sed '/^[[:space:]]*$/d' | sort -un | paste -sd, ; }
@@ -1214,38 +1545,153 @@ _merge_ports() { { echo "$1"; echo "$2"; } | tr ',' '\n' | sed '/^[[:space:]]*$/
 # Убрать порт из списка "a,b,c".
 _drop_port() { echo "$1" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | grep -vx "$2" | paste -sd, ; }
 
+fw_add_port() {
+  local port="$1" proto="${2:-tcp}"
+  _valid_port "$port" || { err "Порт должен быть числом 1-65535."; return 1; }
+  fw_load || return 1
+  case "$proto" in
+    tcp) fw_set EXTRA_TCP "$(_merge_ports "$EXTRA_TCP" "$port")" ;;
+    udp) fw_set EXTRA_UDP "$(_merge_ports "$EXTRA_UDP" "$port")" ;;
+    *) err "Протокол должен быть tcp или udp."; return 1 ;;
+  esac
+  if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
+    apply_firewall
+  else
+    warn "${port}/${proto} сохранён; применится после protect."
+  fi
+}
+
 # Выключить ufw, чтобы не было ВТОРОГО фаервола с «запретить всё».
 fw_neutralize_ufw() {
+  local rc=0
   command -v ufw >/dev/null 2>&1 || return 0
   if ufw status 2>/dev/null | grep -qi '^Status: active'; then
     warn "ufw был включён — выключаю. Оставляем ОДИН фаервол (nftables), иначе порты конфликтуют."
+    ufw --force disable >/dev/null 2>&1 || rc=1
   fi
-  ufw --force disable >/dev/null 2>&1 || true
-  systemctl disable --now ufw >/dev/null 2>&1 || true
-  # Жёстко (чтобы сторонние установщики снова не включили) — раскомментируй при желании:
-  # wait_for_apt; apt-get purge -y ufw >/dev/null 2>&1 || true
+  if systemctl list-unit-files ufw.service --no-legend 2>/dev/null | grep -q '^ufw\.service'; then
+    systemctl disable --now ufw >/dev/null 2>&1 || rc=1
+  fi
+  [ "$rc" -eq 0 ] || err "Не удалось полностью отключить UFW."
+  return "$rc"
+}
+
+fw_restore_ufw() {
+  local was_active="${1:-1}" was_enabled="${2:-1}" rc=0 now_active=0
+  if ! command -v ufw >/dev/null 2>&1; then
+    [ "$was_active" -eq 0 ] && [ "$was_enabled" -eq 0 ] && return 0
+    err "UFW исчез во время rollback."
+    return 1
+  fi
+  warn "Возвращаю исходное состояние UFW: замена nftables не была успешно применена."
+
+  if [ "$was_active" -eq 1 ]; then
+    ufw --force enable >/dev/null 2>&1 || rc=1
+  else
+    ufw --force disable >/dev/null 2>&1 || rc=1
+  fi
+  if systemctl list-unit-files ufw.service --no-legend 2>/dev/null | grep -q '^ufw\.service'; then
+    if [ "$was_enabled" -eq 1 ]; then
+      systemctl enable ufw >/dev/null 2>&1 || rc=1
+      [ "$was_active" -eq 0 ] || systemctl start ufw >/dev/null 2>&1 || rc=1
+    else
+      systemctl disable ufw >/dev/null 2>&1 || rc=1
+      [ "$was_active" -eq 1 ] || systemctl stop ufw >/dev/null 2>&1 || rc=1
+    fi
+  fi
+  ufw status 2>/dev/null | grep -qi '^Status: active' && now_active=1
+  [ "$now_active" -eq "$was_active" ] || rc=1
+  if [ "$rc" -ne 0 ]; then
+    err "КРИТИЧНО: автоматический rollback UFW не подтверждён. Не закрывай текущую SSH-сессию."
+    return 1
+  fi
+  ok "Исходное состояние UFW восстановлено."
+}
+
+fw_verify_na_filter() {
+  local rules
+  command -v nft >/dev/null 2>&1 || return 1
+  rules="$(nft list table inet na_filter 2>/dev/null)" || return 1
+  printf '%s\n' "$rules" | grep -qE 'hook[[:space:]]+input' || return 1
+  printf '%s\n' "$rules" | grep -Eq "(^|[^0-9])${SSH_PORT}([^0-9]|$)" || return 1
 }
 
 # ПРИМЕНИТЬ: убить ufw + открыть ВЕСЬ набор портов из реестра одним фаерволом.
 apply_firewall() {
-  fw_load
-  fw_neutralize_ufw
-  local tcp udp tmp
+  local tcp udp tmp previous_na rc=0 ufw_was_active=0 ufw_was_enabled=0 \
+        na_filter_existed=0 rollback_armed=0 rollback_rc=0
+
+  _nodeforge_fw_rollback() {
+    [ "$rollback_armed" -eq 1 ] || return 0
+    rollback_armed=0
+    rollback_rc=0
+    if command -v nft >/dev/null 2>&1; then
+      nft delete table inet na_filter >/dev/null 2>&1 || true
+      if [ "$na_filter_existed" -eq 1 ]; then
+        nft -f "$previous_na" >/dev/null 2>&1 || rollback_rc=1
+      fi
+    fi
+    fw_restore_ufw "$ufw_was_active" "$ufw_was_enabled" || rollback_rc=1
+    rm -f "$tmp" "$previous_na"
+    if [ "$rollback_rc" -ne 0 ]; then
+      err "КРИТИЧНО: полный rollback firewall не подтверждён. Не закрывай SSH."
+      return 1
+    fi
+  }
+
+  fw_load || return 1
   tcp="$(_merge_ports "${TCP_PORTS:-443}" "${EXTRA_TCP:-}")"
   udp="$(_merge_ports "${UDP_PORTS:-443}" "${EXTRA_UDP:-}")"
   echo
   info "Применяю фаервол: SSH=${SSH_PORT}  NODE=${NODE_PORT}  TCP=${tcp}  UDP=${udp}"
   [ -n "${WHITELIST:-}" ] && info "Whitelist (без лимитов): ${WHITELIST}"
   tmp="$(mktemp)"
-  if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
-    err "Не удалось скачать node-accelerator."; rm -f "$tmp"; return 1
+  previous_na="$(mktemp)"
+  if command -v nft >/dev/null 2>&1 \
+     && nft list table inet na_filter > "$previous_na" 2>/dev/null; then
+    na_filter_existed=1
   fi
-  SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}" NODE_PORT="${NODE_PORT:-2222}" \
-  TCP_PORTS="$tcp" UDP_PORTS="$udp" WHITELIST="${WHITELIST:-}" \
-  ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-1}" BLOCK_TOR="${BLOCK_TOR:-0}" \
-  SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
-    bash "$tmp" protect || warn "protect вернул ненулевой код — см. вывод выше."
-  rm -f "$tmp"
+  # Сначала получаем и проверяем замену; до этого действующий UFW не трогаем.
+  if ! fetch_verified_script "node-accelerator" \
+      "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" "$tmp"; then
+    rm -f "$tmp" "$previous_na"
+    return 1
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    ufw_was_active=1
+  fi
+  if systemctl is-enabled --quiet ufw 2>/dev/null; then ufw_was_enabled=1; fi
+
+  rollback_armed=1
+  trap '_nodeforge_fw_rollback' EXIT
+  trap '_nodeforge_fw_rollback; trap - EXIT HUP INT TERM; exit 130' HUP INT TERM
+  if ! fw_neutralize_ufw; then
+    _nodeforge_fw_rollback || true
+    trap - EXIT HUP INT TERM
+    rm -f "$tmp" "$previous_na"
+    return 1
+  fi
+
+  env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME=/root USER=root LOGNAME=root LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
+    SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}" NODE_PORT="${NODE_PORT:-2222}" \
+    TCP_PORTS="$tcp" UDP_PORTS="$udp" WHITELIST="${WHITELIST:-}" \
+    ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-1}" BLOCK_TOR="${BLOCK_TOR:-0}" \
+    REMNAWAVE_URL="${REMNAWAVE_URL:-}" REMNAWAVE_TOKEN="${REMNAWAVE_TOKEN:-}" \
+    SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
+    bash "$tmp" protect || rc=$?
+
+  if [ "$rc" -ne 0 ] || ! fw_verify_na_filter; then
+    err "protect не создал проверяемую input-chain с SSH-портом ${SSH_PORT} (код ${rc})."
+    _nodeforge_fw_rollback || true
+    trap - EXIT HUP INT TERM
+    rm -f "$tmp" "$previous_na"
+    return 1
+  fi
+  rollback_armed=0
+  trap - EXIT HUP INT TERM
+  rm -f "$tmp" "$previous_na"
   echo
   ok "Готово. ⚠️ ПЕРЕПОДКЛЮЧИСЬ по SSH в течение 5 минут — иначе сейфти-таймер откатит правила."
   warn "Быстрый статус потом: na-fw-status"
@@ -1324,6 +1770,33 @@ _default_iface() {
   ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
+# Сохраняем только проверенные данные, а не исполняемый shell-конфиг.
+_shaper_save() {
+  local iface="$1" mode="$2" rate="${3:-200mbit}" perip="${4:-6250}" \
+        vpnport="${5:-443}" proto="${6:-tcp}" tmp k v enc
+  [[ "$iface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || { err "Некорректное имя интерфейса."; return 1; }
+  [[ "$mode" =~ ^(off|fair|total|perip)$ ]] || { err "Некорректный режим шейпера."; return 1; }
+  [[ "$rate" =~ ^[0-9]+(kbit|mbit|gbit)$ ]] || { err "Лимит должен выглядеть как 300mbit или 1gbit."; return 1; }
+  is_uint "$perip" && [ "$perip" -gt 0 ] || { err "Некорректный per-IP лимит."; return 1; }
+  _valid_port "$vpnport" || { err "Некорректный VPN-порт."; return 1; }
+  [[ "$proto" =~ ^(tcp|udp)$ ]] || { err "Протокол должен быть tcp или udp."; return 1; }
+
+  install -d -m 700 /etc/nodeforge
+  [ -L "$SHAPER_CONF" ] && { err "Отказываюсь использовать symlink: ${SHAPER_CONF}"; return 1; }
+  tmp="$(mktemp "${SHAPER_CONF}.tmp.XXXXXX")"
+  printf '# nodeforge shaper registry base64-v1\n' > "$tmp"
+  for k in IFACE MODE RATE PERIP_RATE VPN_PORT PROTO; do
+    case "$k" in
+      IFACE) v="$iface" ;; MODE) v="$mode" ;; RATE) v="$rate" ;;
+      PERIP_RATE) v="$perip" ;; VPN_PORT) v="$vpnport" ;; PROTO) v="$proto" ;;
+    esac
+    enc="$(printf '%s' "$v" | base64 | tr -d '\r\n')"
+    printf '%s:%s\n' "$k" "$enc" >> "$tmp"
+  done
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SHAPER_CONF"
+}
+
 # Скрипт применения (читает conf, идемпотентен) + systemd-юнит для автозапуска.
 _shaper_write_runtime() {
   cat > "$SHAPER_BIN" <<'EOS'
@@ -1331,15 +1804,29 @@ _shaper_write_runtime() {
 # nodeforge shaper runtime — применяет режим из /etc/nodeforge/shaper.conf
 CONF=/etc/nodeforge/shaper.conf
 [ -f "$CONF" ] || exit 0
-. "$CONF"
-IFACE="${IFACE:-}"
+IFACE=""; MODE="off"; RATE="200mbit"; PERIP_RATE="6250"; VPN_PORT="443"; PROTO="tcp"
+while IFS=: read -r KEY ENCODED; do
+  case "$KEY" in
+    \#*) continue ;;
+    IFACE|MODE|RATE|PERIP_RATE|VPN_PORT|PROTO) ;;
+    *) echo "shaper: неизвестный ключ ${KEY}" >&2; exit 1 ;;
+  esac
+  VALUE="$(printf '%s' "$ENCODED" | base64 --decode 2>/dev/null)" || {
+    echo "shaper: повреждён base64 для ${KEY}" >&2; exit 1;
+  }
+  case "$KEY" in
+    IFACE) [[ "$VALUE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ;;
+    MODE) [[ "$VALUE" =~ ^(off|fair|total|perip)$ ]] ;;
+    RATE) [[ "$VALUE" =~ ^[0-9]+(kbit|mbit|gbit)$ ]] ;;
+    PERIP_RATE) [[ "$VALUE" =~ ^[0-9]+$ ]] && [ "$VALUE" -gt 0 ] ;;
+    VPN_PORT) [[ "$VALUE" =~ ^[0-9]+$ ]] && [ "$VALUE" -ge 1 ] && [ "$VALUE" -le 65535 ] ;;
+    PROTO) [[ "$VALUE" =~ ^(tcp|udp)$ ]] ;;
+  esac || { echo "shaper: некорректное значение ${KEY}" >&2; exit 1; }
+  printf -v "$KEY" '%s' "$VALUE"
+done < "$CONF"
+
 [ -n "$IFACE" ] || IFACE="$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 [ -n "$IFACE" ] || { echo "shaper: интерфейс не найден"; exit 1; }
-MODE="${MODE:-off}"
-RATE="${RATE:-200mbit}"
-PERIP_RATE="${PERIP_RATE:-6250}"   # kbytes/sec
-VPN_PORT="${VPN_PORT:-443}"
-PROTO="${PROTO:-tcp}"
 
 # сброс прошлого состояния
 tc qdisc del dev "$IFACE" root 2>/dev/null
@@ -1413,35 +1900,31 @@ block_shaper() {
   echo
   case "$mode" in
     off)
-      printf 'IFACE="%s"\nMODE="off"\n' "$iface" > "$SHAPER_CONF"
+      _shaper_save "$iface" "off"
       ;;
     fair)
       info "fair — честность между потоками (fq_codel). Никто не сожрёт канал, жёстких лимитов нет."
-      printf 'IFACE="%s"\nMODE="fair"\n' "$iface" > "$SHAPER_CONF"
+      _shaper_save "$iface" "fair"
       ;;
     total)
       info "total — общий потолок ВСЕЙ ноды."
       ask rate "Потолок ноды (например 300mbit / 1gbit)" "300mbit"
-      printf 'IFACE="%s"\nMODE="total"\nRATE="%s"\n' "$iface" "$rate" > "$SHAPER_CONF"
+      _shaper_save "$iface" "total" "$rate"
       ;;
     perip)
       info "perip — лимит на каждый клиентский IP по VPN-порту."
-      while true; do
-        ask vpnport "VPN-порт (порт трафика клиентов)" "443"
-        vpnport="${vpnport%%,*}"
-        if is_uint "$vpnport" && [ "$vpnport" -ge 1 ] && [ "$vpnport" -le 65535 ]; then break; fi
-        warn "Введите номер порта 1–65535."
-      done
+      ask vpnport "VPN-порт (порт трафика клиентов)" "443"
+      vpnport="${vpnport%%,*}"
       choose_from_list proto "Протокол VPN-порта:" "tcp" "tcp" "udp"
       ask perip "Лимит на ОДИН IP, Мбит/с (число)" "50"
-      if ! is_uint "$perip"; then warn "Нужно число."; return 1; fi
+      if ! is_uint "$perip" || [ "$perip" -lt 1 ] || [ "$perip" -gt 100000 ]; then
+        warn "Нужно число 1-100000."; return 1
+      fi
       kb=$(( perip * 125 ))   # Мбит/с → kbytes/sec (mbit*1000/8)
-      printf 'IFACE="%s"\nMODE="perip"\nVPN_PORT="%s"\nPROTO="%s"\nPERIP_RATE="%s"\n' \
-        "$iface" "$vpnport" "$proto" "$kb" > "$SHAPER_CONF"
+      _shaper_save "$iface" "perip" "200mbit" "$kb" "$vpnport" "$proto"
       ;;
     *) warn "Неизвестный режим."; return 1 ;;
   esac
-  chmod 600 "$SHAPER_CONF"
   _shaper_write_runtime
   if "$SHAPER_BIN"; then
     ok "Шейпер применён (режим: ${mode}). Переживёт ребут (systemd: nodeforge-shaper)."
@@ -1507,24 +1990,43 @@ EOS
 #  Шлёт сообщение в Telegram при каждом входе по SSH. Токен/Chat ID — локально.
 # ============================================================================
 block_ssh_notify() {
-  local token chat
+  local token chat token_tmp script_tmp
   info "Уведомление в Telegram при входе по SSH. Нужен бот (@BotFather) и Chat ID."
-  ask_required token "Telegram Bot Token"
+  ask_secret token "Telegram Bot Token"
   ask_required chat  "Chat ID (твой или группы)"
-  install -d -m 755 /etc/nodeforge
-  cat > /etc/nodeforge/ssh-notify.sh <<EOS
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { err "Некорректный формат Telegram Bot Token."; unset token; return 1; }
+  [[ "$chat" =~ ^-?[0-9]+$ ]] || { err "Chat ID должен быть целым числом."; unset token; return 1; }
+
+  install -d -m 700 /etc/nodeforge
+  token_tmp="$(mktemp /etc/nodeforge/.telegram-token.XXXXXX)"
+  printf '%s\n' "$token" > "$token_tmp"
+  chmod 600 "$token_tmp"
+  mv -f "$token_tmp" /etc/nodeforge/telegram-bot-token
+  unset token
+
+  script_tmp="$(mktemp /etc/nodeforge/.ssh-notify.XXXXXX)"
+  cat > "$script_tmp" <<EOS
 #!/bin/bash
 [ "\$PAM_TYPE" = "open_session" ] || exit 0
+TOKEN_FILE=/etc/nodeforge/telegram-bot-token
+[ -r "\$TOKEN_FILE" ] || exit 0
+TOKEN="\$(cat "\$TOKEN_FILE")"
 HOST="\$(hostname)"
 TEXT="🔐 SSH вход: \${PAM_USER}@\${HOST} с \${PAM_RHOST} (\$(date '+%F %T'))"
-curl -s --max-time 10 "https://api.telegram.org/bot${token}/sendMessage" \\
-  -d "chat_id=${chat}" --data-urlencode "text=\${TEXT}" >/dev/null 2>&1 || true
+curl --disable --config - -d "chat_id=${chat}" --data-urlencode "text=\${TEXT}" >/dev/null 2>&1 <<CURL || true
+silent
+show-error
+max-time = 10
+url = "https://api.telegram.org/bot\${TOKEN}/sendMessage"
+CURL
 EOS
-  chmod 700 /etc/nodeforge/ssh-notify.sh
+  chmod 700 "$script_tmp"
+  mv -f "$script_tmp" /etc/nodeforge/ssh-notify.sh
   if grep -q 'nodeforge/ssh-notify.sh' /etc/pam.d/sshd 2>/dev/null; then
+    sed -i -E 's|^session[[:space:]]+optional[[:space:]]+pam_exec\.so([[:space:]]+seteuid)?[[:space:]]+/etc/nodeforge/ssh-notify\.sh$|session optional pam_exec.so /etc/nodeforge/ssh-notify.sh|' /etc/pam.d/sshd
     log "Строка pam_exec уже есть."
   else
-    echo 'session optional pam_exec.so seteuid /etc/nodeforge/ssh-notify.sh' >> /etc/pam.d/sshd
+    echo 'session optional pam_exec.so /etc/nodeforge/ssh-notify.sh' >> /etc/pam.d/sshd
   fi
   ok "Готово. Тест: зайди по SSH в новом окне — должно прийти сообщение."
   warn "Снять: убери строку 'nodeforge/ssh-notify.sh' из /etc/pam.d/sshd."
@@ -1535,31 +2037,55 @@ EOS
 #  b)  БЭКАП КОНФИГОВ  (один архив со всеми важными настройками)
 # ============================================================================
 block_backup() {
-  local stamp dst nft_dump cron_dump
+  local stamp dst nft_dump cron_dump fw_dump p
+  local -a candidates backup_paths
   stamp="$(date +%F-%H%M)"
   dst="/root/nodeforge-backup-${stamp}.tar.gz"
   nft_dump="/root/nft-ruleset-${stamp}.conf"
   cron_dump="/root/crontab-${stamp}.txt"
+  fw_dump="/root/firewall-registry-${stamp}.txt"
 
-  command -v nft >/dev/null 2>&1 && nft list ruleset > "$nft_dump" 2>/dev/null || true
+  : > "$nft_dump"
+  if command -v nft >/dev/null 2>&1; then
+    nft list ruleset > "$nft_dump" 2>/dev/null || warn "Не удалось снять полный дамп nftables."
+  fi
   ( crontab -l 2>/dev/null || true ) > "$cron_dump"
+  : > "$fw_dump"
+  if [ -f "$FW_ENV" ]; then
+    grep -vE '^REMNAWAVE_TOKEN[:=]' "$FW_ENV" > "$fw_dump" || true
+    chmod 600 "$fw_dump"
+  fi
 
-  tar -czf "$dst" 2>/dev/null \
-    /etc/ssh/sshd_config /etc/ssh/sshd_config.d \
-    /etc/nodeforge \
-    /etc/pam.d/sshd \
-    /opt/remnanode/docker-compose.yml /opt/remnanode/nginx.conf \
-    /etc/logrotate.d/remnanode \
-    "$nft_dump" "$cron_dump" || true
+  candidates=(
+    /etc/ssh/sshd_config /etc/ssh/sshd_config.d /etc/nodeforge /etc/pam.d/sshd
+    /opt/remnanode/docker-compose.yml /opt/remnanode/nginx.conf
+    /opt/remnawave/docker-compose.yml /opt/remnawave/nginx.conf
+    /etc/logrotate.d/remnanode "$nft_dump" "$cron_dump" "$fw_dump"
+  )
+  backup_paths=()
+  for p in "${candidates[@]}"; do
+    [ -e "$p" ] && backup_paths+=("${p#/}")
+  done
 
-  if [ -f "$dst" ]; then
-    ok "Бэкап готов: ${dst}"
-    log "Внутри: sshd_config(.d), /etc/nodeforge (реестр портов+шейпер), pam sshd, compose+nginx ноды, logrotate, дамп nft, crontab."
-    warn "Скачать к себе: scp root@<IP>:${dst} ."
-  else
-    err "Не удалось создать архив."
+  if ! tar -C / -czf "$dst" \
+      --exclude='etc/nodeforge/telegram-bot-token' \
+      --exclude='etc/nodeforge/firewall.env' \
+      --exclude='etc/nodeforge/firewall.env.legacy-*' \
+      "${backup_paths[@]}"; then
+    rm -f "$dst"
+    err "Не удалось создать полный архив."
     return 1
   fi
+  chmod 600 "$dst"
+  if ! tar -tzf "$dst" >/dev/null 2>&1; then
+    rm -f "$dst"
+    err "Проверка архива не прошла; повреждённый файл удалён."
+    return 1
+  fi
+
+  ok "Бэкап готов и проверен: ${dst}"
+  log "Внутри конфиги и очищенный реестр; Telegram/Fleet токены намеренно исключены."
+  warn "Скачать к себе: scp root@<IP>:${dst} ."
 }
 
 
@@ -1581,13 +2107,18 @@ block_fleet() {
   info "Fleet-sync: ноды флота whitelist-ят друг друга из API панели Remnawave."
   info "Нужны URL панели и API-токен с правом читать список нод (/api/nodes)."
   ask url   "URL панели (например https://panel.example.com)" "${REMNAWAVE_URL:-}"
-  ask token "API-токен панели" "${REMNAWAVE_TOKEN:-}"
+  if [ -n "${REMNAWAVE_TOKEN:-}" ] && confirm "Использовать уже сохранённый API-токен?"; then
+    token="$REMNAWAVE_TOKEN"
+  else
+    ask_secret token "API-токен панели"
+  fi
   if [ -z "$url" ] || [ -z "$token" ]; then warn "Пусто — отменяю."; return 1; fi
   fw_set REMNAWAVE_URL   "$url"
   fw_set REMNAWAVE_TOKEN "$token"
   ok "Сохранено в реестр. Применяю фаервол — поднимется таймер na-fleet-sync (интервал 5 мин)."
   echo
   apply_firewall
+  unset token REMNAWAVE_TOKEN
   warn "Проверить потом: journalctl -t na-fleet-sync --no-pager | tail"
 }
 
@@ -1650,14 +2181,13 @@ self_update() {
   step "Обновление скрипта"
   log "Источник: ${UPDATE_URL}"
  
-  local dest="$SELF" tmp
+  local dest="$SELF" tmp dest_tmp
   case "$dest" in
     /dev/fd/*|/proc/*|"") dest="$(pwd)/setup.sh" ;;   # запущено не из файла
   esac
  
   tmp="$(mktemp)"
-  if ! curl -fsSL "$UPDATE_URL" -o "$tmp"; then
-    err "Не удалось скачать обновление с ${UPDATE_URL}."
+  if ! fetch_verified_script "self-update" "$UPDATE_URL" "$tmp" "${UPDATE_SHA256:-}"; then
     rm -f "$tmp"; return 1
   fi
   if [ ! -s "$tmp" ] || ! head -n1 "$tmp" | grep -q '^#!'; then
@@ -1670,9 +2200,13 @@ self_update() {
     return 0
   fi
  
-  cat "$tmp" > "$dest"
+  dest_tmp="$(mktemp "${dest}.new.XXXXXX")"
+  if ! install -m 755 "$tmp" "$dest_tmp" || ! mv -f "$dest_tmp" "$dest"; then
+    err "Не удалось атомарно заменить ${dest}."
+    rm -f "$tmp" "$dest_tmp"
+    return 1
+  fi
   rm -f "$tmp"
-  chmod +x "$dest" 2>/dev/null || true
   ok "Скрипт обновлён: ${dest}"
   log "Перезапускаю обновлённую версию..."
   exec bash "$dest"
@@ -1725,7 +2259,6 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 6)${RST} RU-блокировка   ${GRY}— RU geoip/geosite + bind-mount + cron${RST}
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
-   ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -1746,8 +2279,8 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
    ${BOLD}${GRN} b)${RST} Бэкап конфигов     ${GRY}— один архив со всеми настройками${RST}
    ${BOLD}${GRN} u)${RST} Обновить списки    ${GRY}— геолисты/блоклисты/госсети + автообновление${RST}
-   ${BOLD}${GRN} w)${RST} netbird: обновить  ${GRY}— apt-обновление демона до последней версии${RST}
    ${BOLD}${GRN} l)${RST} Fleet-sync         ${GRY}— ноды флота whitelist-ят друг друга${RST}
+   ${BOLD}${GRN} v)${RST} SNI-проверка ноды  ${GRY}— mTLS панель→нода: SNI_VERIFICATION вкл/выкл (node ≥ 3.4)${RST}
  
  ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
    ${BOLD}${YLW}16)${RST} ① До ребута       ${GRY}(1 + 2)  → потом reboot${RST}
@@ -1787,12 +2320,11 @@ menu() {
         f|F) run_block "Починить фаервол" apply_firewall ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
-        r|R) run_block "gRPC" block_grpc ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
-        w|W) run_block "netbird: обновление" netbird_update ;;
         l|L) run_block "Fleet-sync" block_fleet ;;
+        v|V) run_block "SNI-проверка ноды" block_sni_verification ;;
         16) run_block "SSH-харденинг" block_ssh
             run_block "Оптимизация (node-accelerator)" block_optimize ;;
         17) run_block "netbird" block_netbird
