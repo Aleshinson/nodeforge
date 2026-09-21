@@ -322,6 +322,57 @@ compose_add_volume() {
   mv "$tmp" "$f"
 }
  
+# compose_set_env "KEY" "VALUE" — ставит `- KEY=VALUE` в environment: сервиса ноды:
+# существующую строку заменяет, отсутствующую дописывает; без блока environment:
+# (нода на env_file) создаёт его в конце сервиса. В файл ложится только то, что
+# прошло `docker compose config`; оригинал остаётся в docker-compose.yml.bak.
+compose_set_env() {
+  require_node || return 1
+  local key="$1" value="$2" f="${NODE_DIR}/docker-compose.yml" tmp rc=0
+  case "$key" in
+    ''|*[!A-Za-z0-9_]*) err "Некорректное имя переменной: ${key}"; return 1 ;;
+  esac
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" -v service="$NODE_SERVICE" '
+    function flush_hold() { printf "%s", hold; hold = "" }
+    function emit()       { print "      - " key "=" value; done = 1 }
+    function close_env()  { if (in_env && !done) emit(); in_env = 0 }
+    function close_service() {
+      close_env()
+      if (in_service && !have_env) { print "    environment:"; emit() }
+      flush_hold(); in_service = 0
+    }
+    /^[^ ]/ { top = $0 }
+    top ~ /^services:/ && $0 ~ ("^  " service ":[[:space:]]*$") { print; in_service = 1; seen = 1; next }
+    # Пустые строки и комментарии придерживаем: дописанная переменная встанет к своим.
+    in_service && /^[[:space:]]*(#|$)/ { hold = hold $0 "\n"; next }
+    in_service && $0 !~ /^   / { close_service() }
+    in_service && /^    environment:/ {
+      if ($0 !~ /^    environment:[[:space:]]*$/) { bad = 1; exit 3 }
+      flush_hold(); print; in_env = 1; have_env = 1; next
+    }
+    in_env && /^    [^ ]/ { close_env() }
+    in_env && $0 ~ ("^      - \"?" key "=") { flush_hold(); if (!done) emit(); next }
+    in_service { flush_hold() }
+    { print }
+    END { if (bad) exit 3; close_service(); if (!seen) exit 4 }
+  ' "$f" >"$tmp" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) rm -f "$tmp"; err "В ${f} блок environment: сервиса ${NODE_SERVICE} записан в одну строку — правь вручную."; return 1 ;;
+    4) rm -f "$tmp"; err "В ${f} не найден сервис '${NODE_SERVICE}:' под services:."; return 1 ;;
+    *) rm -f "$tmp"; err "Не удалось обработать ${f} (awk вернул ${rc})."; return "$rc" ;;
+  esac
+  if ! docker compose --project-directory "$NODE_DIR" -f "$tmp" config -q; then
+    rm -f "$tmp"
+    err "После правки compose не проходит 'docker compose config' — файл не тронут."
+    return 1
+  fi
+  cp -a "$f" "${f}.bak"
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+ 
 # ============================ БЛОКИ ============================
  
 # ----- 1) SSH-харденинг: порт + пользователь + sudo + ключи + запрет root -----
@@ -895,6 +946,47 @@ block_nginx_upgrade() {
   local now
   now="$(docker inspect -f '{{.Config.Image}}' remnawave-nginx 2>/dev/null || true)"
   log "Готово. Контейнер remnawave-nginx на образе: ${now:-неизвестно}"
+}
+ 
+# ----- SNI-проверка mTLS (панель → нода), remnawave/node >= 3.4 -----
+# https://f.docs.rw/t/topic/639 — в 3.3.x нода обязательно сверяла SNI входящего
+# mTLS-соединения; с 3.4.x проверка выключена и включается SNI_VERIFICATION=true.
+node_env_value() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NODE_CONTAINER" 2>/dev/null \
+    | awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2); exit }'
+}
+
+block_sni_verification() {
+  local live want mode
+  require_node || return 1
+  live="$(node_env_value SNI_VERIFICATION)"
+  log "SNI_VERIFICATION в ${NODE_CONTAINER}: ${live:-не задана (по умолчанию false)}"
+  info "Нужна нода >= 3.4 и панель, которая шлёт ожидаемый SNI. Если нода уйдёт в offline — выключи обратно."
+  choose_from_list mode "Что сделать?" "Включить (SNI_VERIFICATION=true)" \
+    "Включить (SNI_VERIFICATION=true)" \
+    "Выключить (SNI_VERIFICATION=false)"
+  case "$mode" in
+    Включить*) want=true ;;
+    *)         want=false ;;
+  esac
+  if [ "$live" = "$want" ]; then
+    log "Уже SNI_VERIFICATION=${want} — менять нечего."
+    return 0
+  fi
+  if ! confirm "Записать SNI_VERIFICATION=${want} в compose и пересоздать ${NODE_CONTAINER}?"; then
+    warn "Отменено — compose не тронут."
+    return 0
+  fi
+  compose_set_env SNI_VERIFICATION "$want" || return 1
+  log "compose обновлён (бэкап: ${NODE_DIR}/docker-compose.yml.bak). Пересоздаю контейнер."
+  ( cd "$NODE_DIR" && docker compose up -d ) || { err "docker compose up -d не удался — см. вывод выше."; return 1; }
+  sleep 2
+  live="$(node_env_value SNI_VERIFICATION)"
+  if [ "$live" != "$want" ]; then
+    err "В контейнере SNI_VERIFICATION=${live:-<пусто>}, ожидалось ${want} — проверь compose вручную."
+    return 1
+  fi
+  ok "SNI_VERIFICATION=${want} применена. Проверь в панели, что нода online; логи: docker logs --tail 50 ${NODE_CONTAINER}"
 }
  
 # ----- 11) Перезапуск контейнеров (стек ноды или все на хосте) -----
@@ -1748,6 +1840,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} u)${RST} Обновить списки    ${GRY}— геолисты/блоклисты/госсети + автообновление${RST}
    ${BOLD}${GRN} w)${RST} netbird: обновить  ${GRY}— apt-обновление демона до последней версии${RST}
    ${BOLD}${GRN} l)${RST} Fleet-sync         ${GRY}— ноды флота whitelist-ят друг друга${RST}
+   ${BOLD}${GRN} v)${RST} SNI-проверка ноды  ${GRY}— mTLS панель→нода: SNI_VERIFICATION вкл/выкл (node ≥ 3.4)${RST}
  
  ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
    ${BOLD}${YLW}16)${RST} ① До ребута       ${GRY}(1 + 2)  → потом reboot${RST}
@@ -1793,6 +1886,7 @@ menu() {
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
         w|W) run_block "netbird: обновление" netbird_update ;;
         l|L) run_block "Fleet-sync" block_fleet ;;
+        v|V) run_block "SNI-проверка ноды" block_sni_verification ;;
         16) run_block "SSH-харденинг" block_ssh
             run_block "Оптимизация (node-accelerator)" block_optimize ;;
         17) run_block "netbird" block_netbird
