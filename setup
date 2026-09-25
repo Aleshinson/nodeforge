@@ -2345,6 +2345,80 @@ _fix_nginx_restart() {
   ok "nginx (${ngx}) перезапущен — запусти аудит ещё раз, чтобы проверить маскировку."
 }
 
+_fix_certbot_timer() {
+  systemctl enable --now certbot.timer
+  ok "Автопродление certbot включено: $(systemctl list-timers certbot.timer --no-pager --no-legend | awk '{print $1, $2, $3}')"
+}
+
+# Путь к ini с ключами Cloudflare из renewal-конфига certbot.
+_cf_ini() { awk -F' *= *' '$1 == "dns_cloudflare_credentials" {print $2}' "$1"; }
+
+# Глобальный ключ Cloudflare → API-токен зоны. Токен — скрытым вводом, в файл 600.
+# Старый ini не бэкапим: в нём ключ ко всему аккаунту Cloudflare, ему не место на диске.
+# $2=nodry — без проверки вхолостую (её заменит настоящее продление).
+_fix_cf_token() {
+  local conf="$1" ini name tok other
+  name="$(basename "$conf" .conf)"
+  ini="$(_cf_ini "$conf")"
+  other="$(grep -l "dns_cloudflare_credentials *= *${ini}\$" /etc/letsencrypt/renewal/*.conf 2>/dev/null \
+    | grep -vx "$conf" | xargs -r -n1 basename | sed 's/\.conf$//' | paste -sd' ')"
+  info "Нужен API-токен Cloudflare: My Profile → API Tokens → Create Token → шаблон «Edit zone DNS», зона ${name}."
+  if [ -n "$other" ]; then warn "Этим же ${ini} продлеваются ещё: ${other} — токену нужен доступ и к этим зонам."; fi
+  info "Если на другой ноде этой зоны продление работает — подходящий токен лежит там в ${ini}."
+  read -rsp "API-токен Cloudflare (ввод скрыт): " tok; echo
+  if [ -z "$tok" ]; then warn "Токен не введён — ничего не менял."; return 1; fi
+  install -d -m 700 "$(dirname "$ini")"
+  ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$ini" )
+  chmod 600 "$ini"
+  ok "В ${ini} теперь API-токен зоны."
+  if [ "${2:-}" != nodry ]; then
+    log "Проверяю продление вхолостую (certbot --dry-run, 1–2 мин: ждёт DNS)."
+    certbot renew --cert-name "$name" --dry-run
+    ok "Cloudflare принимает токен — автопродление работает."
+  fi
+}
+
+# deploy_hook: после продления перезапустить nginx — он держит сертификат отдельным
+# файлом по симлинку live/ и без рестарта отдаёт старый.
+_fix_cert_hook() {
+  local conf="$1" ngx tmp
+  ngx="$(_nginx_container)"
+  if [ -z "$ngx" ]; then err "Не нашёл nginx-контейнер."; return 1; fi
+  tmp="$(mktemp)"
+  awk -v hook="deploy_hook = $(command -v docker) restart ${ngx}" \
+    '{ print } /^\[renewalparams\]/ { print hook }' "$conf" > "$tmp"
+  cat "$tmp" > "$conf"
+  rm -f "$tmp"
+  ok "После продления certbot перезапустит ${ngx}."
+}
+
+# Продлить сертификат маскировки: при глобальном ключе — сначала токен, потом хук,
+# потом certbot renew; в конце сверяем, что nginx отдаёт уже новый сертификат.
+_fix_cert_renew() {
+  local cert="$1" name conf ini ngx live served
+  name="$(basename "$(dirname "$cert")")"
+  conf="/etc/letsencrypt/renewal/${name}.conf"
+  if [ ! -f "$conf" ]; then
+    err "Сертификат ${name} здесь не выпускался certbot'ом (нет ${conf}) — положи свежий оттуда, где он продлевается, и перезапусти nginx."
+    return 1
+  fi
+  ini="$(_cf_ini "$conf")"
+  if [ -n "$ini" ] && [ -f "$ini" ] && ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini"; then
+    _fix_cf_token "$conf" nodry
+  fi
+  if ! grep -q '^deploy_hook' "$conf"; then _fix_cert_hook "$conf"; fi
+  log "Продлеваю ${name} (DNS-01 через Cloudflare, 1–2 мин)."
+  certbot renew --cert-name "$name"
+  if ! openssl x509 -checkend 86400 -noout -in "$cert" >/dev/null 2>&1; then
+    err "Сертификат не обновился — см. вывод certbot выше."; return 1
+  fi
+  ngx="$(_nginx_container)"
+  live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null)"
+  served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+  if [ -n "$ngx" ] && [ "$live" != "$served" ]; then docker restart "$ngx" >/dev/null; fi
+  ok "Сертификат ${name} действителен до $(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2); nginx отдаёт новый."
+}
+
 # Подтянуть свежий образ ноды и пересоздать контейнер (обрыв ~10 с).
 _fix_node_update() {
   require_node
@@ -2972,11 +3046,73 @@ _audit_camouflage() {
   case "$code" in
     2??|3??) _a_ok "Маскировка: https://${sni} на этой ноде отвечает ${code}, сертификат валиден" ;;
     000|"")
-      _a_fail "Маскировка: на 443 с SNI ${sni} нет TLS с валидным сертификатом — снаружи нода не похожа на сайт"
-      _a_fix "Перезапустить nginx маскировки (~2 с)" 1 _fix_nginx_restart ;;
+      # TLS отвечает, но сертификат не проходит проверку — лечится сертификатом (ниже), не рестартом.
+      code="$(curl -ksS -m 8 -o /dev/null -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)"
+      case "$code" in
+        2??|3??)
+          _a_fail "Маскировка: https://${sni} отдаёт сертификат, который не проходит проверку (просрочен или не тот домен)"
+          _a_hint "зонд DPI видит «сайт» с битым сертификатом; XHTTP/gRPC через TLS не подключатся — см. «Сертификат» ниже" ;;
+        *)
+          _a_fail "Маскировка: на 443 с SNI ${sni} TLS не отвечает — снаружи нода не похожа на сайт"
+          _a_fix "Перезапустить nginx маскировки (~2 с)" 1 _fix_nginx_restart ;;
+      esac ;;
     *) _a_warn "Маскировка: https://${sni} отвечает ${code} — живой сайт отдаёт 200"
        _a_hint "положи страницу в /var/www/html (index.html)" ;;
   esac
+}
+
+# Сертификат маскировки и XHTTP/gRPC: срок, что именно отдаёт nginx, и живо ли
+# продление (certbot + Cloudflare DNS-01). Глобальный ключ Cloudflare ловим заранее:
+# продление с ним падает (9103 Unknown X-Auth-Key), а видно это только в день истечения.
+_audit_cert() {
+  local cert="$1" name conf ini end days live served ngx
+  name="$(basename "$(dirname "$cert")")"
+  conf="/etc/letsencrypt/renewal/${name}.conf"
+  end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
+  days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+  if [ "$days" -lt 0 ]; then
+    _a_fail "Сертификат ${name} истёк $(( -days )) дн. назад — маскировка отдаёт просроченный, XHTTP/gRPC через TLS не подключатся"
+    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+  elif [ "$days" -lt 14 ]; then
+    _a_fail "Сертификат ${name} истекает через ${days} дн. — автопродление не сработало"
+    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+  elif [ "$days" -lt 30 ]; then
+    _a_warn "Сертификат ${name} истекает через ${days} дн. (certbot продлевает за 30 дн. — должен был начать)"
+    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+  else
+    _a_ok "Сертификат ${name} действителен ещё ${days} дн."
+  fi
+
+  # nginx держит сертификат отдельным файлом по симлинку live/ — после продления
+  # без рестарта контейнера он продолжает отдавать старый.
+  ngx="$(_nginx_container)"
+  if [ -n "$ngx" ]; then
+    live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null)"
+    served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)"
+    if [ -n "$served" ] && [ "$live" != "$served" ]; then
+      _a_fail "nginx отдаёт не тот сертификат, что лежит на диске — после продления контейнер не перезапускали"
+      _a_fix "Перезапустить nginx маскировки (~2 с)" 1 _fix_nginx_restart
+    fi
+  fi
+
+  if [ ! -f "$conf" ]; then
+    _a_warn "Сертификат ${name} не продлевается на этой ноде (нет ${conf}) — его сюда положили вручную"
+    _a_hint "продлевать там, откуда он скопирован, и копировать заново — или выпустить certbot'ом здесь"
+    return 0
+  fi
+  if ! systemctl is-enabled --quiet certbot.timer 2>/dev/null && ! systemctl is-active --quiet certbot.timer 2>/dev/null; then
+    _a_warn "Таймер certbot выключен — сертификат сам не продлится"
+    _a_fix "Включить автопродление (certbot.timer)" 0 _fix_certbot_timer
+  fi
+  ini="$(awk -F' *= *' '$1 == "dns_cloudflare_credentials" {print $2}' "$conf")"
+  if [ -n "$ini" ] && [ -f "$ini" ] && ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini"; then
+    _a_fail "Продление через глобальный ключ Cloudflare (${ini}) — оно падает; нужен API-токен зоны"
+    _a_fix "Заменить ключ Cloudflare на API-токен зоны и проверить продление (спросит токен)" 0 _fix_cf_token "$conf"
+  fi
+  if ! grep -q '^deploy_hook' "$conf"; then
+    _a_warn "После продления nginx не перезапускается (нет deploy_hook) — будет отдавать старый сертификат"
+    _a_fix "Прописать перезапуск nginx после продления сертификата" 0 _fix_cert_hook "$conf"
+  fi
 }
 
 # Свежесть образа ноды: сравниваем digest запущенного образа с тегом на Docker Hub.
@@ -3032,7 +3168,7 @@ _audit_xray_log() {
 }
 
 _audit_node() {
-  local ctr c st s rc started age f sock cert end days img sni want
+  local ctr c st s rc started age f sock cert img sni want
   step "Нода"
   if ! require_node >/dev/null 2>&1; then info "Нода (remnanode) не установлена — пропускаю."; return 0; fi
 
@@ -3081,13 +3217,7 @@ _audit_node() {
   fi
 
   cert="$(grep -oE '/etc/letsencrypt/live/[^:]+/fullchain\.pem' "${NODE_DIR}/docker-compose.yml" 2>/dev/null | head -1)"
-  if [ -n "$cert" ] && [ -f "$cert" ]; then
-    end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
-    days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
-    if [ "$days" -lt 14 ]; then _a_fail "Сертификат ${cert%/fullchain.pem} истекает через ${days} дн."
-    elif [ "$days" -lt 30 ]; then _a_warn "Сертификат ${cert%/fullchain.pem} истекает через ${days} дн."
-    else _a_ok "Сертификат действителен ещё ${days} дн."; fi
-  fi
+  if [ -n "$cert" ] && [ -f "$cert" ]; then _audit_cert "$cert"; fi
 
   # compose и живой контейнер должны совпадать: иначе правка compose не применена.
   sni="$(NODE_CONTAINER="${ctr:-$NODE_CONTAINER}" node_env_value SNI_VERIFICATION || true)"
