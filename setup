@@ -2887,6 +2887,7 @@ _audit_system() {
 
 _audit_network() {
   local cc qd probing ct ctmax pct retr outs rp drops d ctt uin urb in6 dns_srv dns_sum dns_n dns_bad ms
+  local conns segs rts live msg
   step "Сеть и MTU"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
@@ -2923,9 +2924,20 @@ _audit_network() {
     fi
   fi
 
-  read -r retr outs < <(awk '/^Tcp:/ { if (!h) { for (i = 1; i <= NF; i++) c[$i] = i; h = 1 } else print $c["RetransSegs"], $c["OutSegs"] }' /proc/net/snmp)
-  if [ "${outs:-0}" -gt 0 ]; then
-    rp="$(awk -v r="$retr" -v o="$outs" 'BEGIN { printf "%.1f", r * 100 / o }')"
+  read -r retr outs < <(_tcp_counters)
+  rp="$(awk -v r="${retr:-0}" -v o="${outs:-0}" 'BEGIN { if (o > 0) printf "%.1f", r * 100 / o }')"
+  # «Сейчас» — по открытым соединениям клиентов; «с загрузки» может хранить давний сбой.
+  read -r conns segs rts < <(_client_retrans)
+  if [ "${segs:-0}" -ge 1000 ]; then
+    live="$(awk -v r="$rts" -v o="$segs" 'BEGIN { printf "%.1f", r * 100 / o }')"
+    msg="Повторные отправки TCP до клиентов ${live}% (${conns} открытых соединений на 443)${rp:+, с загрузки ${rp}%}"
+    if awk -v p="$live" 'BEGIN { exit !(p >= 5) }'; then
+      _a_warn "${msg} — пакеты до клиентов теряются"
+      _a_hint "1–3% — обычные потери мобильных сетей. Больше и потери в «Маршрутах» — сеть хостера; только здесь — путь до клиентов (так выглядит и замедление от ТСПУ)"
+    else
+      _a_ok "$msg"
+    fi
+  elif [ -n "$rp" ]; then
     if awk -v p="$rp" 'BEGIN { exit !(p >= 5) }'; then _a_warn "Повторные отправки TCP ${rp}% с загрузки — большие потери до клиентов"
     else _a_ok "Повторные отправки TCP ${rp}% с загрузки"; fi
   fi
@@ -2997,8 +3009,41 @@ _audit_network() {
 
 # Задержка, джиттер и потери до опорных точек. До Cloudflare (anycast) из дата-центра
 # почти всегда меньше 10 мс — если больше 30, трафик уходит кружным маршрутом.
+# Счётчики TCP ядра: переотправлено сегментов, отправлено всего.
+_tcp_counters() {
+  awk '/^Tcp:/ { if (!h) { for (i = 1; i <= NF; i++) c[$i] = i; h = 1 } else print $c["RetransSegs"], $c["OutSegs"] }' /proc/net/snmp
+}
+
+# Открытые соединения клиентов на 443: сколько их, отправлено сегментов, из них повторно.
+_client_retrans() {
+  ss -tin state established '( sport = :443 )' 2>/dev/null | awk '
+    /segs_out:/ {
+      n++
+      if (match($0, /segs_out:[0-9]+/)) so += substr($0, RSTART + 9, RLENGTH - 9)
+      if (match($0, /retrans:[0-9]+\/[0-9]+/)) { split(substr($0, RSTART + 8, RLENGTH - 8), a, "/"); rt += a[2] }
+    }
+    END { print n + 0, so + 0, rt + 0 }'
+}
+
+# Сколько из $3 TCP-рукопожатий с $1:$2 потеряли пакет. Потерянный SYN или SYN-ACK ядро
+# повторяет через 1 с, так что рукопожатие дольше 0,9 с — потеря. ping цели часто режут
+# по лимиту, а TCP — нет: так «цель экономит ICMP» отличается от потерь в сети.
+_tcp_loss() {
+  local h="$1" p="$2" n="$3" i t0 t1 lost=0
+  for (( i = 0; i < n; i++ )); do
+    t0="${EPOCHREALTIME/,/.}"
+    if timeout 3 bash -c "exec 3<>/dev/tcp/${h}/${p}" 2>/dev/null; then
+      t1="${EPOCHREALTIME/,/.}"
+      if awk -v a="$t0" -v b="$t1" 'BEGIN { exit !(b - a > 0.9) }'; then lost=$(( lost + 1 )); fi
+    else
+      lost=$(( lost + 1 ))
+    fi
+  done
+  echo "$lost"
+}
+
 _audit_routes() {
-  local line host name lim out loss avg mdev msg
+  local line host name lim out loss avg mdev msg tl
   step "Маршруты"
   for line in "1.1.1.1|Cloudflare (anycast)|30" "8.8.8.8|Google DNS|" "77.88.8.8|Яндекс (Москва)|"; do
     IFS='|' read -r host name lim <<<"$line"
@@ -3007,10 +3052,30 @@ _audit_routes() {
     read -r avg mdev < <(printf '%s\n' "$out" | awk -F'[/ ]' '/^(rtt|round-trip)/ {print $8, $10}')
     if [ -z "$avg" ]; then _a_warn "${name}: не отвечает на ping"; continue; fi
     msg="${name}: ${avg} мс, джиттер ${mdev} мс, потери ${loss}%"
-    # 20 пакетов: один потерянный (5%) — бывает и от лимита ICMP у цели, три и больше — потери.
-    if awk -v l="$loss" 'BEGIN { exit !(l >= 15) }'; then
+    # Потери по ping перепроверяем TCP (порт 53 открыт у всех трёх): настоящие ли они.
+    # tl пусто — потерь по ping нет или TCP не с чем сравнить; иначе — потерянных рукопожатий.
+    tl=""
+    if awk -v l="$loss" 'BEGIN { exit !(l > 0) }'; then
+      tl="$(_tcp_loss "$host" 53 30)"
+      if [ "$tl" -eq 0 ]; then
+        msg="${name}: ${avg} мс, джиттер ${mdev} мс; ping теряет ${loss}%, а из 30 TCP-рукопожатий не потеряно ни одного — цель режет ping по лимиту, трафику не мешает"
+        loss=0
+      elif [ "$tl" -ge 30 ]; then
+        msg="${msg} (TCP 53 не отвечает вовсе — перепроверить нечем)"
+        tl=""
+      else
+        msg="${msg}; TCP: потеряно ${tl} из 30 рукопожатий"
+      fi
+    fi
+    if { [ -n "$tl" ] && [ "$tl" -ge 3 ]; } \
+       || { [ -z "$tl" ] && awk -v l="$loss" 'BEGIN { exit !(l >= 15) }'; }; then
       _a_fail "$msg"
-    elif awk -v l="$loss" 'BEGIN { exit !(l > 0) }'; then
+      if [ "$host" = 77.88.8.8 ]; then
+        _a_hint "теряет путь в сторону Москвы. Повторные отправки до клиентов (раздел «Сеть») выше 3% — клиенты это чувствуют, вопрос к хостеру про транзит в РФ; ниже — клиенты ходят другим путём"
+      else
+        _a_hint "потери настоящие. Теряется и до Cloudflare (он в паре мс) — это сеть хостера, в поддержку с временем замера"
+      fi
+    elif { [ -n "$tl" ] && [ "$tl" -gt 0 ]; } || awk -v l="$loss" 'BEGIN { exit !(l > 0) }'; then
       _a_warn "$msg"
     elif [ -n "$lim" ] && awk -v a="$avg" -v m="$lim" 'BEGIN { exit !(a > m) }'; then
       _a_warn "$msg"
@@ -3447,16 +3512,703 @@ _audit_node() {
   esac
 }
 
+# ============================================================================
+#  d)  ДОСТУПНОСТЬ ИЗ РФ — закрыта ли нода и почему
+# ----------------------------------------------------------------------------
+#  Снаружи: зонды Globalping в РФ (домашние провайдеры и дата-центры) и контроль
+#  из Европы — TCP 443, UDP 443, UDP на высоком порту и TLS с SNI ноды. На UDP
+#  отвечает сама нода: на время замера порты открываются и закрываются обратно.
+#  Изнутри: клиенты из РФ по часам и операторам (лог Xray) — когда и у кого пропали;
+#  IP в реестре РКН и community-списке; что на ноде могло её выдать.
+# ============================================================================
+
+# Диапазоны IPv4 российских AS (iptoasn.com, public domain) — обновляются раз в неделю.
+NF_RU_ASN=/var/cache/nodeforge/ru-asn.tsv
+NF_UDP_PROBE_PORT="${NF_UDP_PROBE_PORT:-20560}"
+
+_ru_asn_refresh() {
+  local tmp
+  if [ -s "$NF_RU_ASN" ] && [ -z "$(find "$NF_RU_ASN" -mtime +7 2>/dev/null)" ]; then return 0; fi
+  install -d "$(dirname "$NF_RU_ASN")"
+  tmp="$(mktemp)"
+  if curl -fsS -m 90 https://iptoasn.com/data/ip2asn-v4.tsv.gz | gzip -dc | awk -F'\t' '$4 == "RU"' > "$tmp" \
+     && [ "$(wc -l < "$tmp")" -gt 5000 ]; then
+    mv "$tmp" "$NF_RU_ASN"
+    chmod 644 "$NF_RU_ASN"
+  else
+    rm -f "$tmp"
+    [ -s "$NF_RU_ASN" ]   # старый кэш лучше, чем никакого
+  fi
+}
+
+# Временные правила «пустить UDP-зонды» в na_filter (accept в чужой таблице не спас бы:
+# drop в любой базовой цепочке окончательный). Помечены комментарием — остаток от
+# прерванного замера убирается при следующем.
+_probe_rules_clear() {
+  local h
+  for h in $(nft -a list chain inet na_filter input 2>/dev/null | awk '/nodeforge-probe/ { print $NF }'); do
+    nft delete rule inet na_filter input handle "$h" 2>/dev/null || true
+  done
+}
+
+_probe_rules_open() {
+  local p
+  if ! nft list chain inet na_filter input >/dev/null 2>&1; then return 0; fi
+  for p in "$@"; do
+    nft insert rule inet na_filter input udp dport "$p" accept comment '"nodeforge-probe"'
+  done
+}
+
+_audit_ru() {
+  local ip py kind text
+  local -a logs
+  step "Доступность из РФ"
+  if ! command -v python3 >/dev/null 2>&1; then _a_warn "Нет python3 — доступность из РФ не проверить"; return 0; fi
+  ip="$(curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true)"
+  if [ -z "$ip" ]; then _a_warn "Не узнал внешний IPv4 ноды — доступность из РФ не проверена"; return 0; fi
+  if ! _ru_asn_refresh; then
+    info "Диапазоны российских операторов (iptoasn.com) не скачались — клиентов по странам и операторам не разберу"
+  fi
+  mapfile -t logs < <(ls -1 /var/log/remnanode/access.log.1 /var/log/remnanode/access.log.1.* \
+    /var/log/remnanode/access.log 2>/dev/null || true)
+  info "Зонды стучатся на ${ip}: TCP 443, UDP 443 и UDP ${NF_UDP_PROBE_PORT}. На ~1 мин открываю эти UDP-порты и отвечаю на них сам."
+  py="$(mktemp --suffix=.py)"
+  _ru_py_src > "$py"
+  _probe_rules_clear
+  _probe_rules_open 443 "$NF_UDP_PROBE_PORT"
+  while IFS=$'\t' read -r kind text; do
+    case "$kind" in
+      OK)   _a_ok "$text" ;;
+      WARN) _a_warn "$text" ;;
+      FAIL) _a_fail "$text" ;;
+      HINT) _a_hint "$text" ;;
+      INFO) info "$text" ;;
+      SUB)  printf '  %s%s%s\n' "$BOLD" "$text" "$RST" ;;
+      BOLD) printf '%s%s%s\n' "$BOLD" "$text" "$RST" ;;
+      RAW)  printf '      %s\n' "$text" ;;
+      *)    printf '      %s %s\n' "$kind" "$text" ;;   # трассировка Python и прочее — как есть
+    esac
+  done < <(python3 "$py" "$ip" "$NF_UDP_PROBE_PORT" "$NF_RU_ASN" "${logs[@]}" 2>&1)
+  _probe_rules_clear
+  rm -f "$py"
+}
+
+block_ru_access() {
+  # Только чтение (кроме временных UDP-правил замера): одна упавшая часть не обрывает отчёт.
+  set +e
+  local AUD_WARN=0 AUD_FAIL=0
+  local -a AUD_FIX_DESC=() AUD_FIX_COST=() AUD_FIX_FN=() AUD_FIX_ARG=() AUD_FIX_STATE=()
+  _audit_ru
+  echo
+  hr
+  if [ "$AUD_FAIL" -gt 0 ]; then err "Итог: проблем ${AUD_FAIL}, предупреждений ${AUD_WARN}."
+  elif [ "$AUD_WARN" -gt 0 ]; then warn "Итог: проблем нет, предупреждений ${AUD_WARN}."
+  else ok "Итог: из РФ нода доступна."; fi
+  return 0
+}
+
+# Разбор для «Доступность из РФ» — на Python: JSON Globalping, конфиг Xray, диапазоны IP,
+# двое суток лога Xray, ответчик UDP. Печатает строки «вид<TAB>текст» для _audit_ru.
+_ru_py_src() {
+  cat <<'PY'
+# nodeforge: доступность ноды из РФ. Печатает строки «вид<TAB>текст», их раскрашивает bash.
+# Аргументы: внешний IPv4 ноды, высокий UDP-порт, файл диапазонов RU-операторов, логи Xray.
+import bisect, collections, datetime as dt, gzip, io, ipaddress, json, os, re, select
+import socket, subprocess, sys, threading, time, urllib.error, urllib.request
+
+NODE_IP, HIGH, RU_ASN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+LOGS = sys.argv[4:]
+UA = {"User-Agent": "nodeforge-audit (+https://github.com/Aleshinson/nodeforge)"}
+GP = "https://api.globalping.io/v1/measurements"
+MSK = dt.timedelta(hours=3)
+
+
+def fetch(url, timeout=20):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+        return r.read()
+
+
+def safe(what, fn, *args):
+    """Упавшая часть не должна гасить остальные — её место займёт предупреждение."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 — отчёт важнее
+        return [("WARN", f"{what}: не получилось ({type(e).__name__}: {e})")], None
+
+
+# ---------------------------------------------------------------- снаружи: Globalping
+def gp_create(body):
+    req = urllib.request.Request(GP, data=json.dumps(body).encode(), method="POST",
+                                 headers={**UA, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)["id"], None
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            msg = e.reason
+        return None, f"HTTP {e.code}: {msg}"
+    except (OSError, ValueError, KeyError) as e:
+        return None, str(e)
+
+
+def gp_wait(ids, limit=45):
+    done, end = {}, time.time() + limit
+    while ids and time.time() < end:
+        time.sleep(1.5)
+        for name, mid in list(ids.items()):
+            try:
+                d = json.loads(fetch(f"{GP}/{mid}"))
+            except (OSError, ValueError):
+                continue
+            if d.get("status") != "in-progress":
+                done[name] = d
+                del ids[name]
+    return done
+
+
+class UdpAnswer(threading.Thread):
+    """Отвечает на DNS-запросы зондов: пакет дошёл до ноды и ответ дошёл обратно."""
+
+    def __init__(self, ports):
+        super().__init__(daemon=True)
+        self.socks, self.busy, self.stop = [], [], False
+        for p in ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.bind(("0.0.0.0", p))
+                self.socks.append(s)
+            except OSError:
+                self.busy.append(p)
+                s.close()
+
+    def run(self):
+        while not self.stop:
+            ready, _, _ = select.select(self.socks, [], [], 0.5)
+            for s in ready:
+                try:
+                    d, addr = s.recvfrom(2048)
+                except OSError:
+                    continue
+                if len(d) < 17:
+                    continue
+                i = 12
+                while i < len(d) and d[i]:
+                    i += d[i] + 1
+                # Тот же ID, «ответ, без ошибок», вопрос как был — ответ не больше запроса.
+                s.sendto(d[:2] + b"\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + d[12:i + 5], addr)
+
+
+def gp_pick(meas, i, probe):
+    res = (meas or {}).get("results") or []
+    same = lambda r: (r["probe"].get("asn"), r["probe"].get("city")) == (probe.get("asn"), probe.get("city"))
+    if i < len(res) and same(res[i]):
+        return res[i]
+    return next((r for r in res if same(r)), None)
+
+
+def gp_cell(key, r):
+    if r is None:
+        return None
+    st = r.get("result") or {}
+    if st.get("status") == "offline":
+        return None
+    if key == "tcp":
+        s = st.get("stats") or {}
+        return (True, f"{s.get('avg') or 0:.0f}мс") if (s.get("rcv") or 0) > 0 else (False, "")
+    if key == "tls":
+        return st.get("status") == "finished" and st.get("statusCode") is not None, ""
+    return st.get("status") == "finished" and bool(st.get("statusCodeName")), ""
+
+
+def probes(sni):
+    lines = [("SUB", "Снаружи: зонды Globalping в РФ (дом — домашние провайдеры, дц — дата-центры), для сравнения — Европа")]
+    loc = [{"country": "RU", "tags": ["eyeball-network"], "limit": 6},
+           {"country": "RU", "tags": ["datacenter-network"], "limit": 2},
+           {"country": "DE", "limit": 1}, {"country": "NL", "limit": 1}]
+    tcp = lambda where: {"type": "ping", "target": NODE_IP, "locations": where,
+                         "measurementOptions": {"protocol": "TCP", "port": 443, "packets": 3}}
+    first, err = gp_create(tcp(loc))
+    if not first and err and err.startswith("HTTP 422"):   # зондов с такими метками сейчас нет
+        first, err = gp_create(tcp([{"country": "RU", "limit": 8}, {"country": "DE", "limit": 1}]))
+    if not first:
+        lines.append(("WARN", f"Globalping не принял замер ({err}) — снаружи не проверено"))
+        if err and "429" in err:
+            lines.append(("HINT", "лимит — 250 замеров в час с IP ноды; повтори позже"))
+        return lines, {}
+
+    ids, tests = {"tcp": first}, [("tcp", "TCP 443")]
+    answer = UdpAnswer([443, HIGH])
+    answer.start()
+    for port in (443, HIGH):
+        if port in answer.busy:
+            lines.append(("INFO", f"UDP {port} занят другой программой — его не проверяю"))
+            continue
+        mid, _ = gp_create({"type": "dns", "target": "example.com", "locations": first,
+                            "measurementOptions": {"query": {"type": "A"}, "resolver": NODE_IP,
+                                                   "port": port, "protocol": "UDP"}})
+        if mid:
+            ids[f"udp{port}"] = mid
+            tests.append((f"udp{port}", f"UDP {port}"))
+    if sni:
+        mid, _ = gp_create({"type": "http", "target": NODE_IP, "locations": first,
+                            "measurementOptions": {"protocol": "HTTPS", "port": 443,
+                                                   "request": {"method": "GET", "host": sni, "path": "/"}}})
+        if mid:
+            ids["tls"] = mid
+            tests.append(("tls", "TLS (SNI)"))
+    res = gp_wait(dict(ids))
+    answer.stop = True
+
+    rows = []
+    for i, r in enumerate((res.get("tcp") or {}).get("results") or []):
+        p = r["probe"]
+        tags = p.get("tags") or []
+        kind = " дом" if "eyeball-network" in tags else (" дц" if "datacenter-network" in tags else "")
+        name = f"{p.get('country')} {p.get('city', '')}, {(p.get('network') or '')[:18]}{kind}"
+        rows.append((p.get("country") == "RU", name,
+                     {k: gp_cell(k, gp_pick(res.get(k), i, p)) for k, _ in tests}))
+    if not rows:
+        lines.append(("WARN", "Globalping не вернул результатов — снаружи не проверено"))
+        return lines, {}
+    lines.append(("RAW", "зонд".ljust(40) + "".join(lbl.ljust(11) for _, lbl in tests)))
+    for _, name, cells in rows:
+        marks = ("·" if c is None else (f"✓ {c[1]}".strip() if c[0] else "✗") for c in (cells[k] for k, _ in tests))
+        lines.append(("RAW", name[:38].ljust(40) + "".join(m.ljust(11) for m in marks)))
+
+    summary = {}
+    for key, lbl in tests:
+        ru = [(n, c) for is_ru, n, cs in rows if is_ru for c in [cs[key]] if c is not None]
+        ctl = [c for is_ru, _, cs in rows if not is_ru for c in [cs[key]] if c is not None]
+        ok_ru, ok_ctl = sum(c[0] for _, c in ru), sum(c[0] for c in ctl)
+        text = f"{lbl} из РФ: {ok_ru} из {len(ru)}" + (f", из Европы {ok_ctl} из {len(ctl)}" if ctl else "")
+        bad = "; ".join(n for n, c in ru if not c[0])
+        heavy = "FAIL" if key in ("tcp", "tls") else "WARN"
+        if ctl and ok_ctl == 0:
+            summary[key] = "local"
+            lines.append((heavy, f"{lbl}: не проходит и из Европы — режет фаервол ноды или хостер, РФ ни при чём"))
+        elif not ru:
+            summary[key] = "none"
+            lines.append(("INFO", f"{lbl}: зонды в РФ не ответили — не проверено"))
+        elif ok_ru >= 0.8 * len(ru):
+            summary[key] = "ok"
+            lines.append(("OK", text))
+        elif ok_ru >= 0.3 * len(ru):
+            summary[key] = "part"
+            lines.append(("WARN", f"{text} — не проходит у: {bad}"))
+        else:
+            summary[key] = "blocked"
+            lines.append((heavy, f"{text} — из РФ не проходит"))
+    if summary.get("udp443") in ("blocked", "part") or summary.get(f"udp{HIGH}") in ("blocked", "part"):
+        lines.append(("HINT", "UDP нужен протоколам поверх UDP (Hysteria, WireGuard, QUIC); VLESS по TCP это не задевает"))
+    return lines, summary
+
+
+# ---------------------------------------------------------------- изнутри: клиенты по логу Xray
+# Оператор целиком, а не его региональные AS: ТСПУ и «белые списки» включают по оператору.
+OPERATORS = [("МТС", r"(^|[^A-Z])MTS|SPBMTS"), ("МегаФон", r"MEGAFON|^MF-"), ("Билайн", r"VIMPELCOM|BEELINE|CORBINA"),
+             ("T2", r"^T2-|TELE2|T2 RUSSIA"), ("Ростелеком", r"ROSTELECOM"), ("Дом.ру", r"(^|[^A-Z])ER-TELECOM"),
+             ("Yota", r"SCARTEL"), ("МГТС", r"MGTS")]
+OPERATORS = [(name, re.compile(rx, re.I)) for name, rx in OPERATORS]
+
+
+class RuRanges:
+    """Диапазоны IPv4 российских AS (iptoasn.com): начало, конец, AS, страна, имя."""
+
+    def __init__(self, path):
+        rows = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 5:
+                    try:
+                        rows.append((self.num(p[0]), self.num(p[1]), p[2], p[4]))
+                    except OSError:
+                        pass
+        rows.sort()
+        self.starts = [r[0] for r in rows]
+        self.ends = [r[1] for r in rows]
+        self.asns = [r[2] for r in rows]
+        self.names = {r[2]: r[3] for r in rows}
+
+    @staticmethod
+    def num(ip):
+        return int.from_bytes(socket.inet_aton(ip), "big")
+
+    def asn(self, ip):
+        try:
+            x = self.num(ip)
+        except OSError:
+            return None
+        i = bisect.bisect_right(self.starts, x) - 1
+        return self.asns[i] if i >= 0 and x <= self.ends[i] else None
+
+    def label(self, a):
+        name = self.names.get(a, "?")
+        return next((op for op, rx in OPERATORS if rx.search(name)), f"{name.split()[0][:20]} (AS{a})")
+
+
+def open_log(path):
+    try:
+        if path.endswith(".zst"):
+            p = subprocess.Popen(["zstd", "-dcq", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            return io.TextIOWrapper(p.stdout, encoding="utf-8", errors="replace")
+        if path.endswith(".gz"):
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        return open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def clients():
+    rr = RuRanges(RU_ASN) if os.path.isfile(RU_ASN) and os.path.getsize(RU_ASN) else None
+    who = "из РФ" if rr else "(все: диапазонов РФ нет)"
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)   # Xray пишет время в UTC
+    cur = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
+    key = lambda t: t.strftime("%Y/%m/%d %H:%M")[:15]              # 10-минутная корзина
+    lo, hi = key(cur - dt.timedelta(hours=51)), key(cur)
+    buckets = collections.defaultdict(set)
+    for path in LOGS:
+        f = open_log(path)
+        if f is None:
+            continue
+        with f:
+            for line in f:
+                if " accepted " not in line:
+                    continue
+                k = line[:15]
+                if k < lo or k >= hi:
+                    continue
+                i = line.find(" from ")
+                if i < 0:
+                    continue
+                rest = line[i + 6:]
+                if rest[:4] in ("tcp:", "udp:"):
+                    rest = rest[4:]
+                ip = rest[:rest.find(":")]
+                if ip.count(".") == 3:
+                    buckets[k].add(ip)
+    if not buckets:
+        return [("INFO", "В логе Xray нет подключений за двое суток — клиентов оценить не по чему")], None
+    first = min(buckets)
+    cache = {}
+
+    def asn(ip):
+        if ip not in cache:
+            cache[ip] = rr.asn(ip) if rr else "?"
+        return cache[ip]
+
+    def window(k, hours=1):
+        """IP из РФ (→ AS) и число прочих за hours часов, закончившихся k часов назад."""
+        end = cur - dt.timedelta(hours=k)
+        start = end - dt.timedelta(hours=hours)
+        if key(start) < first:
+            return None
+        ips, t = set(), start
+        while t < end:
+            ips |= buckets.get(key(t), set())
+            t += dt.timedelta(minutes=10)
+        ru = {ip: asn(ip) for ip in ips if asn(ip)}
+        return ru, len(ips) - len(ru)
+
+    wins = [window(k) for k in range(48)]
+    ru_n = [len(w[0]) if w else None for w in wins]
+    ot_n = [w[1] if w else None for w in wins]
+    day = [ru_n[k] for k in range(23, -1, -1)]
+    known = [v for v in day if v is not None]
+    peak = max(known) if known else 0
+    t0 = (cur - dt.timedelta(hours=24) + MSK).strftime("%H:%M")
+    t1 = (cur + MSK).strftime("%H:%M")
+    lines = [("SUB", f"Живые клиенты {who} по логу Xray: разных IP за каждый час, МСК {t0} → {t1}")]
+    if peak:
+        bars = "▁▂▃▄▅▆▇█"
+        spark = "".join(" " if v is None else bars[v * 8 // (peak + 1)] for v in day)
+        total = window(0, 24)
+        lines.append(("RAW", f"{spark}   пик {peak} IP/ч" + (f", за сутки {len(total[0])} разных IP" if total else "")))
+
+    state = "ok"
+    now_r, yd_r, now_o, yd_o = ru_n[0], ru_n[24], ot_n[0], ot_n[24]
+    if now_r is None:
+        lines.append(("INFO", "Лог Xray короче часа — сравнивать не с чем"))
+        return lines, None
+    if yd_r is not None and yd_r >= 20:
+        if now_r < 0.3 * yd_r:
+            k0 = 0
+            while (k0 < 23 and ru_n[k0 + 1] is not None and (ru_n[k0 + 25] or 0) >= 10
+                   and ru_n[k0 + 1] < 0.3 * ru_n[k0 + 25]):
+                k0 += 1
+            since = (cur - dt.timedelta(hours=k0 + 1) + MSK).strftime("%d.%m %H:%M")
+            if rr and yd_o >= 10 and now_o < 0.3 * yd_o:
+                state = "all"
+                lines.append(("FAIL", f"Пропали все клиенты примерно с {since} МСК: из РФ {now_r} IP за час (сутки назад {yd_r}), "
+                                      f"не из РФ {now_o} ({yd_o})"))
+                lines.append(("HINT", "ушли и зарубежные — значит, не блокировка РФ: нода выпала из подписки или балансировки, "
+                                      "панель её не видит, или она недоступна вообще"))
+            else:
+                state = "drop"
+                lines.append(("FAIL", f"Клиенты {who} пропали примерно с {since} МСК: за последний час {now_r} IP, "
+                                      f"сутки назад в это время {yd_r}"))
+                if rr and yd_o:
+                    lines.append(("HINT", f"клиенты не из РФ на месте ({now_o} против {yd_o}) — нода работает, режут по пути из РФ"))
+        elif now_r < 0.6 * yd_r:
+            state = "less"
+            lines.append(("WARN", f"Клиентов {who} меньше обычного: {now_r} IP за час, сутки назад в это время {yd_r}"))
+        else:
+            lines.append(("OK", f"Клиенты {who} на месте: {now_r} IP за последний час (сутки назад {yd_r})"
+                                + (f", не из РФ {now_o}" if rr else "")))
+    elif peak >= 30 and now_r < 0.1 * peak:
+        state = "drop"
+        lines.append(("WARN", f"Клиентов {who} за последний час {now_r} при пике суток {peak} — похоже, пропали "
+                              "(того же часа вчера в логе нет, сравнить точнее нельзя)"))
+    elif peak:
+        lines.append(("OK", f"За последний час {now_r} IP {who} (пик суток {peak}); того же часа вчера в логе нет"))
+    else:
+        lines.append(("INFO", f"Клиентов {who} в логе за сутки нет"))
+
+    if rr:
+        a_now, a_yd = window(0, 3), window(24, 3)
+        if a_now and a_yd:
+            cn = collections.Counter(rr.label(a) for a in a_now[0].values())
+            cy = collections.Counter(rr.label(a) for a in a_yd[0].values())
+            lost = [(op, cn.get(op, 0), c) for op, c in cy.most_common() if c >= 8 and cn.get(op, 0) <= 0.25 * c]
+            if lost:
+                txt = ", ".join(f"{op} {c}→{n}" for op, n, c in lost[:6])
+                if state == "ok":
+                    state = "ops"
+                    lines.append(("WARN", f"У части операторов клиенты пропали (3 ч против тех же часов вчера): {txt}"))
+                    lines.append(("HINT", "блок у отдельных провайдеров или «белые списки» мобильного интернета в регионах"))
+                else:
+                    lines.append(("HINT", f"по операторам (3 ч против тех же часов вчера): {txt}"))
+        if a_now and a_now[0]:
+            top = collections.Counter(rr.label(a) for a in a_now[0].values()).most_common(6)
+            lines.append(("INFO", "Операторы за 3 ч: " + ", ".join(f"{op} {n}" for op, n in top)))
+    return lines, state
+
+
+# ---------------------------------------------------------------- реестр и списки
+AF = [("ip", "https://antifilter.download/list/ip.lst"),
+      ("subnet", "https://antifilter.download/list/subnet.lst"),
+      ("community", "https://community.antifilter.download/list/community.lst"),
+      ("ipsum", "https://antifilter.download/list/ipsum.lst")]
+
+
+def lists():
+    lines = [("SUB", "Реестр РКН и списки блокировок (antifilter), хостинг")]
+    ip, hits, bad = ipaddress.ip_address(NODE_IP), {}, []
+    for name, url in AF:
+        try:
+            body = fetch(url, 30).decode("ascii", "replace")
+        except OSError:
+            bad.append(name)
+            continue
+        for tok in body.split():
+            try:
+                if ip in ipaddress.ip_network(tok, strict=False):
+                    hits[name] = tok
+                    break
+            except ValueError:
+                continue
+    found = []
+    if "ip" in hits or "subnet" in hits:
+        tok = hits.get("ip") or hits["subnet"]
+        lines.append(("FAIL", f"{tok} в реестре РКН — адрес блокируется официально, у всех провайдеров"))
+        found.append("IP в реестре РКН")
+    if "community" in hits:
+        lines.append(("FAIL", f"{hits['community']} в community-списке antifilter — пользователи находят этот адрес "
+                              "заблокированным (ТСПУ, без реестра)"))
+        found.append("адрес в community-списке блокируемых")
+    elif "ipsum" in hits and not found:
+        lines.append(("WARN", f"В подсети {hits['ipsum']} много адресов из реестра — «грязная» подсеть хостера"))
+        found.append("подсеть хостера с адресами из реестра")
+    if not hits and len(bad) < len(AF):
+        lines.append(("OK", f"{NODE_IP} нет ни в реестре РКН, ни в community-списке antifilter"))
+    elif len(bad) == len(AF):
+        lines.append(("INFO", "Списки antifilter недоступны — реестр не проверен"))
+    try:
+        d = json.loads(fetch(f"https://stat.ripe.net/data/prefix-overview/data.json?resource={NODE_IP}", 15))["data"]
+        a = (d.get("asns") or [{}])[0]
+        if a:
+            lines.append(("INFO", f"Хостинг: AS{a.get('asn')} {a.get('holder')}, сеть {d.get('resource')}"))
+    except (OSError, ValueError, KeyError):
+        pass
+    return lines, found
+
+
+# ---------------------------------------------------------------- что на ноде может её выдать
+def xray_config():
+    """Конфиг, который панель отдала Xray: rw-core держит внутренний API на абстрактном сокете."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "rw-core":
+                    continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        arg = next((a.decode() for a in args if a.startswith(b"@rwint")), "")
+        if ":" not in arg:
+            return None
+        name, path = arg[1:].split(":", 1)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect("\0" + name)
+        s.sendall(f"GET {path} HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        cfg = json.loads(data.split(b"\r\n\r\n", 1)[1])
+        return cfg.get("config", cfg) if isinstance(cfg, dict) else None
+    return None
+
+
+VPN_PROCS = {"openvpn": "OpenVPN", "hysteria": "Hysteria", "sing-box": "sing-box", "ss-server": "Shadowsocks",
+             "ssserver": "Shadowsocks", "ocserv": "OpenConnect", "tuic-server": "TUIC", "xray": "ещё один Xray",
+             "v2ray": "V2Ray", "x-ui": "3x-ui", "trojan-go": "Trojan"}
+VPN_IMAGES = re.compile(r"amnezia|shadowbox|outline|wg-easy|wireguard|3x-ui|x-ui|marzban|hiddify|openvpn|ipsec|l2tp|"
+                        r"hysteria|sing-box|shadowsocks", re.I)
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def causes():
+    lines, found, sni = [("SUB", "Что на ноде может её выдать")], [], ""
+    cfg = xray_config()
+    if cfg is None:
+        lines.append(("INFO", "Конфиг Xray не прочитан (rw-core не найден) — инбаунды не проверены"))
+    for ib in (cfg or {}).get("inbounds") or []:
+        port, listen = ib.get("port"), str(ib.get("listen") or "0.0.0.0")
+        proto, tag = ib.get("protocol") or "", ib.get("tag") or "?"
+        if not port or listen[:1] in "/@" or listen.startswith("127.") or listen == "::1" \
+                or proto in ("dokodemo-door", "tunnel"):
+            continue
+        st = ib.get("streamSettings") or {}
+        sec, net = st.get("security") or "none", st.get("network") or "tcp"
+        if sec == "reality":
+            for name in (st.get("realitySettings") or {}).get("serverNames") or []:
+                try:
+                    addrs = sorted({a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)})
+                except OSError:
+                    addrs = []
+                if NODE_IP in addrs:
+                    sni = sni or name
+                    lines.append(("OK", f"Reality {tag}: SNI {name} указывает на эту ноду"))
+                else:
+                    found.append(f"SNI {name} смотрит не на этот IP")
+                    lines.append(("FAIL", f"Reality {tag}: SNI {name} резолвится в {', '.join(addrs) or 'никуда'}, "
+                                          f"а не в {NODE_IP}"))
+                    lines.append(("HINT", "ТСПУ сверяет SNI с адресом: чужой домен на нашем IP — готовый признак прокси. "
+                                          "Нужен свой домен с A-записью на эту ноду (selfsteal)"))
+        elif sec != "tls" and (proto in ("vless", "vmess", "trojan", "shadowsocks", "wireguard", "hysteria")
+                               or net in ("kcp", "mkcp", "quic", "hysteria")):
+            found.append(f"{proto}/{net} без маскировки на порту {port}")
+            lines.append(("WARN", f"Инбаунд {tag}: {proto}/{net} на порту {port} без TLS/Reality — ТСПУ узнаёт такой трафик, "
+                                  "а банит IP целиком, вместе с 443"))
+    other = set()
+    for line in run("ss", "-H", "-lnptu").splitlines():
+        cols = line.split()
+        if len(cols) < 5 or cols[4].startswith(("127.", "[::1]", "100.")):
+            continue
+        for proc, label in VPN_PROCS.items():
+            if f'(("{proc}",' in line:
+                other.add(f"{label} ({cols[0]} {cols[4].rsplit(':', 1)[-1]})")
+    for line in run("ip", "-br", "link", "show", "type", "wireguard").splitlines():
+        name = line.split()[0] if line.split() else ""
+        if name and name != "wt0":   # wt0 — netbird: связь с панелью, наружу его трафик в РФ не идёт
+            other.add(f"WireGuard ({name})")
+    for line in run("docker", "ps", "--format", "{{.Names}}\t{{.Image}}").splitlines():
+        if VPN_IMAGES.search(line) and not re.search(r"remna", line, re.I):
+            other.add(f"контейнер {line.split(chr(9))[0]}")
+    if other:
+        found.append("на IP ещё: " + ", ".join(sorted(other)))
+        lines.append(("WARN", "На IP ноды работает ещё: " + ", ".join(sorted(other))
+                      + " — такой протокол ТСПУ узнаёт, а банит весь IP, вместе с 443"))
+    if cfg is not None and not found:
+        lines.append(("OK", "Лишних протоколов и чужих SNI на ноде нет"))
+    return lines, (found, sni)
+
+
+# ---------------------------------------------------------------- итог
+def verdict(summary, cl_state, found, sni):
+    tcp, tls = summary.get("tcp"), summary.get("tls")
+    udp = [v for k, v in summary.items() if k.startswith("udp")]
+    bad = tcp == "blocked" or tls == "blocked" or cl_state in ("drop", "ops")
+    if tcp == "blocked" and udp and all(v == "blocked" for v in udp):
+        text = "IP ноды закрыт в РФ целиком: не проходят ни TCP, ни UDP. Такой бан снимает только новый IP"
+    elif tcp == "local":
+        text = "TCP 443 не проходит и из Европы — нода недоступна вообще (фаервол, хостер, Xray), РФ тут ни при чём"
+    elif tcp == "blocked":
+        text = "в РФ закрыт TCP 443 этого IP, а UDP проходит: ТСПУ опознал VPN на 443 и закрыл адрес:порт. Лечится новым IP"
+    elif tls == "blocked":
+        text = f"TCP до ноды доходит, а TLS с SNI {sni} в РФ обрывается — блок по SNI или отпечатку TLS"
+    elif cl_state in ("drop", "ops") and tcp == "ok":
+        text = ("зонды в РФ ноду видят, а часть реальных клиентов пропала — блок у отдельных операторов "
+                "(часто мобильные «белые списки»); зондов у них нет")
+    elif cl_state in ("drop", "ops"):
+        text = "реальные клиенты из РФ пропали — см. выше, у кого и с какого часа"
+    elif cl_state == "all":
+        text = "пропали все клиенты, не только из РФ — ищи причину в ноде, панели или балансировке"
+    elif tcp == "part":
+        text = "в РФ нода доступна не у всех провайдеров"
+    elif tcp == "ok":
+        text = "блокировки из РФ не видно"
+    else:
+        text = "снаружи проверить не удалось — смотри клиентов по логу"
+    out = [("BOLD", "Вывод: " + text)]
+    if found:
+        out.append(("HINT", "что на ноде могло её выдать: " + "; ".join(found)))
+    elif bad:
+        out.append(("HINT", "на самой ноде улик нет. Частые причины снаружи: ключи ноды в открытом доступе, много клиентов "
+                            "на одном IP, «грязная» подсеть хостера. Если новые IP банят быстро — менять хостера или подсеть"))
+    return out
+
+
+def emit(lines):
+    for kind, text in lines:
+        print(f"{kind}\t{text}", flush=True)
+
+
+def main():
+    cause_lines, extra = safe("Проверка инбаундов", causes)
+    found, sni = extra if extra else ([], "")
+    box = {}
+    th = threading.Thread(target=lambda: box.update(res=safe("Замер Globalping", probes, sni)), daemon=True)
+    th.start()
+    cl_lines, cl_state = safe("Разбор лога Xray", clients)
+    li_lines, li_found = safe("Проверка реестра", lists)
+    th.join(120)
+    pr_lines, summary = box.get("res") or ([("WARN", "Замер Globalping не завершился за 2 мин")], None)
+    for part in (pr_lines, cl_lines, li_lines, cause_lines):
+        emit(part)
+    emit(verdict(summary or {}, cl_state, (li_found or []) + found, sni))
+
+
+main()
+PY
+}
+
 # Все проверки заново: счётчики и список исправлений собираются с нуля.
 _audit_run() {
   AUD_WARN=0 AUD_FAIL=0
   AUD_FIX_DESC=() AUD_FIX_COST=() AUD_FIX_FN=() AUD_FIX_ARG=() AUD_FIX_STATE=()
   echo
-  info "Аудит ноды: проверка только читает, 1–2 минуты (замеры MTU, маршрутов, DNS). Починка — в конце, по выбору."
+  info "Аудит ноды: 2–3 минуты (замеры MTU, маршрутов, DNS, доступности из РФ). Проверка только читает —"
+  info "кроме замера UDP из РФ: на минуту открывает UDP 443 и ${NF_UDP_PROBE_PORT}. Починка — в конце, по выбору."
   _audit_system
   _audit_network
   _audit_routes
   _audit_geo
+  _audit_ru
   _audit_firewall
   _audit_logs
   _audit_node
@@ -3571,6 +4323,7 @@ ${BOLD}${CYN}══════════════════════�
  
  ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
    ${BOLD}${GRN} a)${RST} ${WHT}Аудит ноды${RST} ${GRN}★${RST}   ${GRY}— проверка MTU, фризов ВМ, GeoIP, фаервола, логов + починка по выбору${RST}
+   ${BOLD}${GRN} d)${RST} ${WHT}Доступность из РФ${RST}  ${GRY}— TCP/UDP с зондов в РФ, клиенты по часам и операторам, реестр, причины бана${RST}
    ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: аудит / node-diagnostic / node-accelerator${RST}
    ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
    ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
@@ -3625,6 +4378,7 @@ menu() {
         14) submenu_checks ;;
         15) self_update ;;
         a|A) run_block "Аудит ноды" block_audit ;;
+        d|D) run_block "Доступность из РФ" block_ru_access ;;
         p|P) block_ports ;;
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
