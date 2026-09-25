@@ -2461,9 +2461,35 @@ _audit_fix_list() {
   done
 }
 
+# Всё несделанное, кроме исправлений функцией $1 (если задана), — в массив sel.
+# Если среди выбранного есть обрыв или перезагрузка — спросить подтверждение.
+_audit_pick_pending() {
+  local skip="${1:-}" i brief=0 reboot=0
+  for i in "${!AUD_FIX_FN[@]}"; do
+    if [ -n "${AUD_FIX_STATE[$i]}" ] || [ "${AUD_FIX_FN[$i]}" = "$skip" ]; then continue; fi
+    sel+=("$i")
+    if [ "${AUD_FIX_COST[$i]}" = 1 ]; then brief=$(( brief + 1 )); fi
+    if [ "${AUD_FIX_COST[$i]}" = 2 ]; then reboot=1; fi
+  done
+  if [ $(( brief + reboot )) -gt 0 ] \
+     && ! confirm "Среди выбранного ${brief} исправл. с коротким обрывом$( [ "$reboot" = 1 ] && printf ' и перезагрузка' ) — выполнить?"; then
+    sel=()
+    return 1
+  fi
+}
+
+# Есть ли в списке несделанное исправление функцией $1.
+_audit_has_pending() {
+  local i
+  for i in "${!AUD_FIX_FN[@]}"; do
+    if [ "${AUD_FIX_FN[$i]}" = "$1" ] && [ -z "${AUD_FIX_STATE[$i]}" ]; then return 0; fi
+  done
+  return 1
+}
+
 # Меню починки: после каждого исправления — обратно к списку, а не в главное меню.
 _audit_fix_menu() {
-  local i n c choice brief reboot
+  local i n c choice
   local -a sel
   while true; do
     _audit_fix_list
@@ -2472,6 +2498,11 @@ _audit_fix_menu() {
     echo
     if [ "$n" -gt 0 ]; then
       echo "   ${BOLD}${GRN} a)${RST} Починить всё, что ещё не сделано"
+      # location в nginx без инбаунда часто — заготовка: инбаунд включат в панели,
+      # и он подхватится без рестарта nginx. Поэтому «всё, кроме них» — отдельно.
+      if _audit_has_pending _fix_dead_location; then
+        echo "   ${BOLD}${GRN} n)${RST} Починить всё, кроме location в nginx (заготовки под gRPC/XHTTP)"
+      fi
       echo "   ${BOLD}${GRN} s)${RST} Только то, что без простоя"
     fi
     echo "   ${BOLD}${CYN} r)${RST} Провести аудит ещё раз"
@@ -2481,18 +2512,8 @@ _audit_fix_menu() {
     case "$choice" in
       ""|0) return 0 ;;
       r|R|к|К) _audit_run; continue ;;
-      a|A|ф|Ф)
-        brief=0; reboot=0
-        for i in "${!AUD_FIX_FN[@]}"; do
-          if [ -n "${AUD_FIX_STATE[$i]}" ]; then continue; fi
-          sel+=("$i")
-          if [ "${AUD_FIX_COST[$i]}" = 1 ]; then brief=$(( brief + 1 )); fi
-          if [ "${AUD_FIX_COST[$i]}" = 2 ]; then reboot=1; fi
-        done
-        if [ $(( brief + reboot )) -gt 0 ] \
-           && ! confirm "В списке ${brief} исправл. с коротким обрывом$( [ "$reboot" = 1 ] && printf ' и перезагрузка' ) — выполнить всё?"; then
-          continue
-        fi ;;
+      a|A|ф|Ф) _audit_pick_pending || continue ;;
+      n|N|т|Т) _audit_pick_pending _fix_dead_location || continue ;;
       s|S|ы|Ы)
         for i in "${!AUD_FIX_FN[@]}"; do
           if [ -z "${AUD_FIX_STATE[$i]}" ] && [ "${AUD_FIX_COST[$i]}" = 0 ]; then sel+=("$i"); fi
@@ -3051,8 +3072,9 @@ _audit_node() {
     while read -r sock; do
       if [ -S "$sock" ]; then _a_ok "nginx → ${sock}: инбаунд слушает"
       else
-        _a_warn "nginx ведёт в ${sock}, а такого инбаунда нет — мёртвый location"
-        _a_hint "не нужен — убрать; нужен — добавить инбаунд в профиль ноды в панели"
+        # Не предупреждение: location часто оставляют заготовкой — инбаунд включат
+        # в панели, и он подхватится без рестарта nginx.
+        info "nginx → ${sock}: инбаунда пока нет — заготовка под будущий инбаунд или лишний location"
         _a_fix "Убрать из nginx.conf location, ведущий в ${sock} (рестарт nginx ~2 с)" 1 _fix_dead_location "$sock"
       fi
     done < <(grep -oE 'unix:/dev/shm/[^;[:space:]]+\.socket' "$f" | sed 's/^unix://' | sort -u)
