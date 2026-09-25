@@ -419,17 +419,11 @@ block_ssh() {
   # порт
   log "Ставлю SSH-порт ${port}."
   set_sshd_option Port "$port"
-  # ЕДИНЫЙ ФАЕРВОЛ: ufw НЕ трогаем. Пишем порт в реестр; если na_filter уже поднят —
-  # сразу переприменяем, иначе порт подхватит пункт 3 (protect).
+  # ЕДИНЫЙ ФАЕРВОЛ: ufw НЕ трогаем. Пишем порт в реестр; na_filter переприменяется
+  # в конце, когда sshd уже слушает новый порт (иначе вход на него не проверить).
   fw_set SSH_PORT "$port"
   fw_neutralize_ufw
-  if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
-    apply_firewall
-  else
-    warn "Фаервол ещё не поднят (na_filter нет). Новый порт ${port} сохранён в реестр и откроется в пункте 3 (protect)."
-    warn "Сейчас активного фаервола нет — для свежего сервера это нормально, доступ открыт."
-  fi
- 
+
   # пользователь + sudo
   log "Создаю/настраиваю пользователя ${user}."
   apt-get update -y
@@ -459,6 +453,12 @@ block_ssh() {
  
   disable_conflicting_dropins
   apply_sshd
+  if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
+    apply_firewall
+  else
+    warn "Фаервол ещё не поднят (na_filter нет). Новый порт ${port} сохранён в реестр и откроется в пункте 3 (protect)."
+    warn "Сейчас активного фаервола нет — для свежего сервера это нормально, доступ открыт."
+  fi
   echo
   warn "В НОВОМ окне проверьте вход (НЕ закрывая текущую сессию!):"
   warn "    ssh -p ${port} ${user}@<IP_СЕРВЕРА>"
@@ -490,7 +490,7 @@ block_optimize() {
 block_protect() {
   local node_port tcp_ports udp_ports whitelist ssh_port
   info "Защита: ЕДИНЫЙ фаервол nftables (na_filter) + CrowdSec + блоклисты. Один владелец — без ufw."
-  warn "Запускай ПОСЛЕ поднятия ноды. Сейфти-таймер: если SSH отвалится и не переподключишься за 5 мин — откат."
+  warn "Запускай ПОСЛЕ поднятия ноды. В конце спрошу, работает ли вход в новом окне: без «да» фаервол через 5 мин удалится сам."
   echo
   fw_load
   ssh_port="$(detect_ssh_port 2>/dev/null || echo "${SSH_PORT:-22}")"
@@ -498,7 +498,8 @@ block_protect() {
   ask node_port "Порт ноды (NODE_PORT)"                 "${NODE_PORT:-2222}"
   ask tcp_ports "Сервисные TCP-порты (через запятую)"   "${TCP_PORTS:-443}"
   ask udp_ports "Сервисные UDP-порты (через запятую)"   "${UDP_PORTS:-443}"
-  warn "ВАЖНО: впиши свой постоянный IP (домашний/VPN/панель), чтобы лимиты тебя не банили."
+  _ask_panel_ips "$node_port" || { warn "Отменено."; return 1; }
+  warn "ВАЖНО: впиши свой постоянный IP (домашний/VPN), чтобы лимиты тебя не банили. Панель добавится сама."
   ask whitelist "WHITELIST (IP/CIDR через запятую; пусто — ок)" "${WHITELIST:-}"
   if confirm "Включить статич-блоклисты (Spamhaus DROP + FireHOL L1) — режут сканеры/ботов?"; then
     fw_set ENABLE_BLOCKLISTS 1
@@ -728,8 +729,30 @@ EOS
 EOJSON
 }
  
+# Забрать каталог $1 у чужих станз logrotate (кроме нашей $2). node-accelerator
+# (пункт optimize) по умолчанию сам ротирует /var/log/remnanode в na-node-logs;
+# две станзы на один файл = logrotate падает на каждом прогоне и одну пропускает.
+# При повторном optimize na сам уступает маску, занятую чужой станзой.
+_logrotate_release_dir() {
+  local dir="$1" own="$2" f bak
+  for f in /etc/logrotate.d/*; do
+    [ -f "$f" ] && [ "$f" != "$own" ] || continue
+    grep -qF "$dir" "$f" || continue
+    bak="/root/logrotate.$(basename "$f").bak-$(date +%F-%H%M)"
+    cp -a "$f" "$bak"
+    sed -i -E "/\{/ s#[[:space:]]*${dir}[^[:space:]{]*##g" "$f"
+    if grep -qE '^[[:space:]]*\{' "$f"; then
+      rm -f "$f"
+      log "Станза ${f} ротировала только ${dir} — убрал (бэкап: ${bak})."
+    else
+      log "Забрал ${dir} у ${f} (бэкап: ${bak})."
+    fi
+  done
+}
+
 # ----- 8) Логи ноды (logrotate + zstd) -----
 block_logs() {
+  local lr_errs
   require_node || return 1
 
   log "Гарантирую папку логов и том логов в compose."
@@ -747,6 +770,7 @@ block_logs() {
   apt-get install -y logrotate zstd
 
   log "Пишу /etc/logrotate.d/remnanode."
+  _logrotate_release_dir /var/log/remnanode/ /etc/logrotate.d/remnanode
 
   cat >/etc/logrotate.d/remnanode <<'EOF'
   /var/log/remnanode/*.log {
@@ -765,10 +789,14 @@ block_logs() {
   }
 EOF
 
-  if logrotate -d /etc/logrotate.d/remnanode >/dev/null 2>&1; then
-    log "Конфиг logrotate корректен."
+  # Проверяем весь конфиг, а не один файл: дубль станз виден только целиком.
+  lr_errs="$(logrotate -d /etc/logrotate.conf 2>&1 | grep -E '^error' || true)"
+  if [ -z "$lr_errs" ]; then
+    log "logrotate без ошибок."
+    systemctl reset-failed logrotate.service na-logrotate.service 2>/dev/null || true
   else
-    warn "logrotate сообщил о проблеме — проверь конфиг."
+    warn "logrotate сообщает об ошибках:"
+    printf '%s\n' "$lr_errs" | sed 's/^/   /' >&2
   fi
 
   echo
@@ -1054,7 +1082,13 @@ block_beszel_agent() {
   warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
   ask token "Token (Enter — пропустить)" ""
   ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
- 
+  # Хаб стоит у панели и подключается к агенту сам: порт агента нужен только ему.
+  fw_load
+  if [ -z "${PANEL_IPS:-}" ]; then
+    info "Порт агента ${port} откроем только для панели (хаб Beszel стоит у неё)."
+    _ask_panel_ips "${NODE_PORT:-2222}" || { warn "Отменено."; return 1; }
+  fi
+
   tmp="$(mktemp)"
   log "Скачиваю install-agent.sh."
   if ! curl -fsSL https://get.beszel.dev -o "$tmp"; then
@@ -1072,9 +1106,10 @@ block_beszel_agent() {
   "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
   rm -f "$tmp"
  
-  # ЕДИНЫЙ ФАЕРВОЛ: не трогаем ufw — регистрируем порт и переприменяем na_filter.
-  fw_add_port "$port" tcp
- 
+  # Порт агента — служебный, как порт ноды: в интернет не открываем, только панели.
+  fw_set PANEL_PORTS "$(_merge_ports "${PANEL_PORTS:-}" "$port")"
+  panel_only_apply
+
   echo
   if systemctl is-active --quiet beszel-agent 2>/dev/null; then
     ok "beszel-agent запущен. Проверь, что в хабе нода стала зелёной."
@@ -1166,6 +1201,7 @@ ${BOLD}${CYN}══════════════════════�
 ${BOLD}${CYN}══════════════════════════════════════════════════════════════${RST}
    ${BOLD}${CYN} 1)${RST} node-diagnostic    ${GRY}— проверка ноды, может предложить фиксы${RST}
    ${BOLD}${CYN} 2)${RST} node-accelerator   ${GRY}— ядро/sysctl/сеть/firewall, только чтение${RST}
+   ${BOLD}${GRN} 3)${RST} Аудит ноды         ${GRY}— встроенный: MTU, фризы ВМ, GeoIP, фаервол, логи${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Назад${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
  ${DIM}Можно оба сразу:  1 2${RST}
@@ -1182,6 +1218,7 @@ submenu_diag() {
       case "$c" in
         1) run_block "Диагностика ноды (node-diagnostic)" block_diag ;;
         2) run_block "Диагностика (node-accelerator)" block_na_diagnose ;;
+        3) run_block "Аудит ноды" block_audit ;;
         0) return 0 ;;
         *) warn "Неизвестный пункт: ${c}" ;;
       esac
@@ -1281,6 +1318,8 @@ fw_init() {
     "EXTRA_TCP=" \
     "EXTRA_UDP=" \
     "WHITELIST=" \
+    "PANEL_IPS=" \
+    "PANEL_PORTS=" \
     "ENABLE_BLOCKLISTS=1" \
     "BLOCK_TOR=0"; do
     k="${kv%%=*}"; v="${kv#*=}"
@@ -1306,6 +1345,9 @@ _merge_ports() { { echo "$1"; echo "$2"; } | tr ',' '\n' | sed '/^[[:space:]]*$/
 # Убрать порт из списка "a,b,c".
 _drop_port() { echo "$1" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | grep -vx "$2" | paste -sd, ; }
 
+# Объединить списки адресов "a,b" + "c" → "a,b,c" (uniq, без пробелов и пустых).
+_merge_list() { { echo "$1"; echo "$2"; } | tr ', ' '\n' | sed '/^$/d' | sort -u | paste -sd, ; }
+
 # Выключить ufw, чтобы не было ВТОРОГО фаервола с «запретить всё».
 fw_neutralize_ufw() {
   command -v ufw >/dev/null 2>&1 || return 0
@@ -1322,25 +1364,76 @@ fw_neutralize_ufw() {
 apply_firewall() {
   fw_load
   fw_neutralize_ufw
-  local tcp udp tmp
+  local tcp udp wl tmp
   tcp="$(_merge_ports "${TCP_PORTS:-443}" "${EXTRA_TCP:-}")"
   udp="$(_merge_ports "${UDP_PORTS:-443}" "${EXTRA_UDP:-}")"
+  # Панель ходит на служебные порты (порт ноды, beszel) — её адреса всегда в whitelist,
+  # иначе na_filter отбросит её раньше, чем пакет дойдёт до фильтра panel-only.
+  wl="$(_merge_list "${WHITELIST:-}" "${PANEL_IPS:-}")"
   echo
   info "Применяю фаервол: SSH=${SSH_PORT}  NODE=${NODE_PORT}  TCP=${tcp}  UDP=${udp}"
-  [ -n "${WHITELIST:-}" ] && info "Whitelist (без лимитов): ${WHITELIST}"
+  [ -n "$wl" ] && info "Whitelist (без лимитов): ${wl}"
   tmp="$(mktemp)"
   if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
     err "Не удалось скачать node-accelerator."; rm -f "$tmp"; return 1
   fi
   SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}" NODE_PORT="${NODE_PORT:-2222}" \
-  TCP_PORTS="$tcp" UDP_PORTS="$udp" WHITELIST="${WHITELIST:-}" \
+  TCP_PORTS="$tcp" UDP_PORTS="$udp" WHITELIST="$wl" \
   ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-1}" BLOCK_TOR="${BLOCK_TOR:-0}" \
   SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
     bash "$tmp" protect || warn "protect вернул ненулевой код — см. вывод выше."
   rm -f "$tmp"
-  echo
-  ok "Готово. ⚠️ ПЕРЕПОДКЛЮЧИСЬ по SSH в течение 5 минут — иначе сейфти-таймер откатит правила."
+  panel_only_apply
+  fw_confirm_safety
   warn "Быстрый статус потом: na-fw-status"
+}
+
+# Сейфти-таймер node-accelerator: если его не снять, через SAFETY_DELAY секунд
+# na_filter удаляется, а автозагрузка правил выключается — молча, одной строкой
+# в журнале. В неинтерактивном режиме protect его сам не снимает, и переподключение
+# по SSH его тоже НЕ снимает: только явная остановка таймера (или pid-фолбэка).
+na_safety_armed() {
+  systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
+    || [ -s /var/lib/node-accelerator/na-fw-safety.pid ]
+}
+
+na_safety_disarm() {
+  local pidf=/var/lib/node-accelerator/na-fw-safety.pid
+  systemctl stop na-fw-safety.timer 2>/dev/null || true
+  if [ -s "$pidf" ]; then
+    kill "$(cat "$pidf")" 2>/dev/null || true
+    rm -f "$pidf"
+  fi
+}
+
+# Спросить, работает ли вход в новом окне, и снять сейфти; затем проверить результат.
+fw_confirm_safety() {
+  local ip
+  if na_safety_armed; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)"
+    echo
+    warn "Сейфти-таймер взведён: через 5 минут фаервол САМ удалится. Переподключение его НЕ снимает."
+    warn "Открой НОВОЕ окно и проверь вход:  ssh -p ${SSH_PORT:-$(detect_ssh_port)} <пользователь>@${ip:-<IP_СЕРВЕРА>}"
+    if confirm "Вход в новом окне работает — оставить фаервол включённым?"; then
+      na_safety_disarm
+      ok "Сейфти-таймер снят."
+    else
+      warn "Сейфти оставлен: через несколько минут na_filter удалится и защиты не будет."
+      warn "Проверишь позже — сними сам: systemctl stop na-fw-safety.timer"
+    fi
+  fi
+  fw_verify
+}
+
+# Фаервол реально стоит и переживёт ребут? Печатает итог, ничего не меняет.
+fw_verify() {
+  local bad=0
+  if nft list table inet na_filter >/dev/null 2>&1; then ok "na_filter загружен."
+  else err "na_filter НЕ загружен — защиты нет."; bad=1; fi
+  if systemctl is-enabled --quiet na-firewall.service 2>/dev/null; then ok "na-firewall в автозагрузке."
+  else err "na-firewall НЕ в автозагрузке — после ребута защиты не будет."; bad=1; fi
+  if na_safety_armed; then warn "Сейфти-таймер всё ещё взведён."; bad=1; fi
+  if [ "$bad" -ne 0 ]; then warn "Повтори «f) Починить фаервол»."; fi
 }
 
 # Показать, что реально слушает на сервере (порт, протокол, процесс).
@@ -1365,7 +1458,8 @@ block_ports() {
     echo
     echo "${BOLD}Фаервол ДЕРЖИТ ОТКРЫТЫМИ (реестр):${RST}"
     printf '   SSH:  %s\n'  "${SSH_PORT}"
-    printf '   NODE: %s   %s\n' "${NODE_PORT}" "${GRY}(связь ноды с панелью по IP)${RST}"
+    printf '   NODE: %s   %s\n' "$(_merge_ports "${NODE_PORT}" "${PANEL_PORTS:-}")" \
+      "${GRY}(только для панели: ${PANEL_IPS:-НЕ задано — пункт «k»})${RST}"
     printf '   TCP:  %s\n'  "$(_merge_ports "${TCP_PORTS}" "${EXTRA_TCP}")"
     printf '   UDP:  %s\n'  "$(_merge_ports "${UDP_PORTS}" "${EXTRA_UDP}")"
     [ -n "${WHITELIST}" ] && printf '   WL:   %s   %s\n' "${WHITELIST}" "${GRY}(IP без лимитов)${RST}"
@@ -1642,11 +1736,12 @@ block_backup() {
     /etc/pam.d/sshd \
     /opt/remnanode/docker-compose.yml /opt/remnanode/nginx.conf \
     /etc/logrotate.d/remnanode \
+    /etc/network/interfaces /etc/netplan \
     "$nft_dump" "$cron_dump" || true
 
   if [ -f "$dst" ]; then
     ok "Бэкап готов: ${dst}"
-    log "Внутри: sshd_config(.d), /etc/nodeforge (реестр портов+шейпер), pam sshd, compose+nginx ноды, logrotate, дамп nft, crontab."
+    log "Внутри: sshd_config(.d), /etc/nodeforge (реестр портов, IP панели, шейпер), pam sshd, compose+nginx ноды, logrotate, сеть (MTU), дамп nft, crontab."
     warn "Скачать к себе: scp root@<IP>:${dst} ."
   else
     err "Не удалось создать архив."
@@ -1731,6 +1826,620 @@ block_update_lists() {
   systemctl list-timers --all 2>/dev/null | grep -E 'na-blocklist|na-fleet' | sed 's/^/      /' || echo "      (нет)"
   echo
   ok "Готово."
+}
+
+
+# ============================================================================
+#  k)  СЛУЖЕБНЫЕ ПОРТЫ — ТОЛЬКО ДЛЯ ПАНЕЛИ  (порт ноды + PANEL_PORTS, напр. beszel)
+# ----------------------------------------------------------------------------
+#  Порт ноды нужен только панели, порт агента beszel — только хабу рядом с ней.
+#  Своя nft-таблица + systemd-юнит: не зависит от na_filter (сейфти и rollback
+#  node-accelerator её не снимают) и не обходится netbird'ом (см. runtime).
+# ============================================================================
+PANEL_ONLY_BIN="/usr/local/sbin/nodeforge-panel-only"
+
+_panel_only_write_runtime() {
+  cat > "$PANEL_ONLY_BIN" <<'EOS'
+#!/bin/bash
+# nodeforge panel-only — служебные порты (порт ноды + PANEL_PORTS, напр. beszel)
+# принимают соединения только с PANEL_IPS. Читает /etc/nodeforge/firewall.env.
+# Хук prerouting, а не input: netbird в nftables-режиме вставляет
+# `iifname "wt0" accept` в начало всех input-цепочек и обнулил бы фильтр.
+set -eu
+ENV=/etc/nodeforge/firewall.env
+[ -f "$ENV" ] && . "$ENV"
+list() { printf '%s\n' "$@" | tr ', ' '\n\n' | sed '/^$/d' | sort -u | paste -sd, ; }
+ports="$(list "${NODE_PORT:-}" "${PANEL_PORTS:-}")"
+ips="$(list "${PANEL_IPS:-}")"
+if [ -z "$ports" ] || [ -z "$ips" ]; then
+  nft delete table inet nodeforge_panel_only 2>/dev/null || true
+  echo "panel-only: не заданы PANEL_IPS или порты — фильтр снят"
+  exit 0
+fi
+nft -f - <<NFT
+table inet nodeforge_panel_only
+delete table inet nodeforge_panel_only
+table inet nodeforge_panel_only {
+	chain pre {
+		type filter hook prerouting priority -150; policy accept;
+		tcp dport { ${ports} } fib daddr type local ip saddr { ${ips} } accept
+		tcp dport { ${ports} } fib daddr type local iifname != "lo" counter drop
+	}
+}
+NFT
+echo "panel-only: порты ${ports} открыты только для ${ips}"
+EOS
+  chmod 755 "$PANEL_ONLY_BIN"
+  cat > /etc/systemd/system/nodeforge-panel-only.service <<'EOS'
+[Unit]
+Description=nodeforge: service ports reachable only from the panel
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nodeforge-panel-only
+ExecStop=/usr/sbin/nft delete table inet nodeforge_panel_only
+
+[Install]
+WantedBy=multi-user.target
+EOS
+  systemctl daemon-reload
+}
+
+# "a,b/cidr,…" — только IPv4 и подсети: правило пишется для `ip saddr`.
+_valid_ipv4_list() {
+  local x
+  [ -n "$1" ] || return 1
+  for x in ${1//,/ }; do
+    [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]] || return 1
+  done
+}
+
+# Кто сейчас держит соединение с портом ноды — это и есть панель.
+_panel_peers() {
+  ss -Htn state established "( sport = :${1} )" 2>/dev/null \
+    | awk '{print $4}' | sed -E 's/^\[?(::ffff:)?//; s/\]?:[0-9]+$//' \
+    | grep -E '^[0-9.]+$' | sort -u | paste -sd, || true
+}
+
+# Спросить IP панели (подсказка — кто сейчас подключён к порту ноды) и сохранить в реестр.
+_ask_panel_ips() {
+  local node_port="$1" peers ips p
+  peers="$(_panel_peers "$node_port")"
+  if [ -n "$peers" ]; then info "Сейчас к порту ноды ${node_port} подключены: ${peers} — это панель."; fi
+  while true; do
+    ask ips "IP панели — только ей можно на порт ноды и beszel (через запятую; «-» — не ограничивать)" "${PANEL_IPS:-$peers}"
+    ips="${ips// /}"
+    if [ "$ips" = "-" ]; then ips=""; break; fi
+    if _valid_ipv4_list "$ips"; then break; fi
+    warn "Нужны IPv4-адреса или подсети через запятую, напр. 100.109.8.19 (netbird-IP, если панель ходит по netbird)."
+  done
+  if [ -z "$ips" ]; then
+    warn "Без IP панели порт ноды${PANEL_PORTS:+ и ${PANEL_PORTS}} остаются доступны всем, кого пропускает na_filter."
+  fi
+  for p in ${peers//,/ }; do
+    if [ -n "$ips" ] && [[ ",${ips}," != *",${p},"* ]]; then
+      warn "Панель сейчас подключена с ${p}, а его нет в списке — нода уйдёт в offline."
+      confirm "Всё равно сохранить?" || return 1
+    fi
+  done
+  fw_set PANEL_IPS "$ips"
+}
+
+# Все PANEL_IPS уже в whitelist na_filter? (если na_filter не загружен — да, мешать некому)
+_panel_in_na_whitelist() {
+  local ip
+  nft list table inet na_filter >/dev/null 2>&1 || return 0
+  for ip in ${PANEL_IPS//,/ }; do
+    nft get element inet na_filter whitelist_v4 "{ ${ip} }" >/dev/null 2>&1 || return 1
+  done
+}
+
+# Поставить/обновить фильтр по реестру (идемпотентно, переживает ребут).
+panel_only_apply() {
+  local ports
+  fw_load
+  ports="$(_merge_ports "${NODE_PORT:-2222}" "${PANEL_PORTS:-}")"
+  _panel_only_write_runtime
+  systemctl enable --quiet nodeforge-panel-only.service
+  systemctl restart nodeforge-panel-only.service
+  if [ -z "${PANEL_IPS:-}" ]; then
+    warn "PANEL_IPS не задан — порты ${ports} открыты всем, кого пропускает na_filter (пункт «k»)."
+    return 0
+  fi
+  ok "Порты ${ports} принимают соединения только с ${PANEL_IPS}."
+  if ! _panel_in_na_whitelist; then
+    warn "Панели нет в whitelist na_filter: если она ходит не через netbird, na_filter отбросит её раньше."
+    warn "Добавит её туда пункт «f) Починить фаервол»."
+  fi
+}
+
+block_panel_only() {
+  fw_load
+  info "Порт ноды ${NODE_PORT} и PANEL_PORTS (${PANEL_PORTS:-пусто}) будут принимать соединения только с адресов панели."
+  _ask_panel_ips "${NODE_PORT:-2222}" || { warn "Отменено."; return 1; }
+  panel_only_apply
+}
+
+
+# ============================================================================
+#  m)  MTU  (путь до интернета уже, чем MTU интерфейса)
+# ----------------------------------------------------------------------------
+#  У части хостеров трафик идёт через туннель (GRE и т.п.), и путь пропускает
+#  меньше 1500 байт, а интерфейс остаётся 1500. Тогда каждый новый поток теряет
+#  первый большой пакет и ждёт ICMP «frag needed»; где ICMP режут — висит совсем.
+# ============================================================================
+MTU_TARGETS="1.1.1.1 8.8.8.8 77.88.8.8 9.9.9.9"
+
+# Пройдёт ли до $1 пакет размером $2 (с заголовками IP+ICMP) без фрагментации.
+_df_ping() { ping -Mdo -c2 -i0.3 -W1 -q -s $(( $2 - 28 )) "$1" >/dev/null 2>&1; }
+
+# Путь MTU до $1 в пределах [1280, $2]: бинарный поиск. Код 1 — цель молчит.
+_path_mtu() {
+  local host="$1" lo=1280 hi="$2" mid
+  _df_ping "$host" "$lo" || return 1
+  if _df_ping "$host" "$hi"; then echo "$hi"; return 0; fi
+  while [ $(( hi - lo )) -gt 1 ]; do
+    mid=$(( (lo + hi) / 2 ))
+    if _df_ping "$host" "$mid"; then lo=$mid; else hi=$mid; fi
+  done
+  echo "$lo"
+}
+
+# Меряет путь до MTU_TARGETS. Итог — в MTU_IFACE / MTU_CUR / MTU_PATH (минимум по целям).
+mtu_probe() {
+  local t m
+  MTU_IFACE="$(_default_iface)"
+  MTU_CUR="" MTU_PATH=""
+  [ -n "$MTU_IFACE" ] || return 1
+  MTU_CUR="$(cat "/sys/class/net/${MTU_IFACE}/mtu")"
+  for t in $MTU_TARGETS; do
+    if m="$(_path_mtu "$t" "$MTU_CUR")"; then
+      printf '   %-10s путь MTU %s\n' "$t" "$m"
+      if [ -z "$MTU_PATH" ] || [ "$m" -lt "$MTU_PATH" ]; then MTU_PATH="$m"; fi
+    else
+      printf '   %-10s %sне отвечает на ping%s\n' "$t" "$GRY" "$RST"
+    fi
+  done
+  [ -n "$MTU_PATH" ]
+}
+
+# Кто поднимает интерфейс — туда MTU и пишем, чтобы пережил ребут.
+# Печатает «ifupdown <файл>», «netplan <id>», «networkd <.network>» или «unit».
+_net_backend() {
+  local ifc="$1" f nf
+  if systemctl is-enabled --quiet networking.service 2>/dev/null; then
+    for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+      [ -f "$f" ] || continue
+      if grep -qE "^[[:space:]]*iface[[:space:]]+${ifc}[[:space:]]" "$f"; then echo "ifupdown $f"; return 0; fi
+    done
+  fi
+  nf="$(networkctl status "$ifc" 2>/dev/null | awk -F': ' '/Network File:/ {print $2; exit}' || true)"
+  case "$nf" in
+    /run/systemd/network/10-netplan-*.network)
+      nf="${nf##*/10-netplan-}"; echo "netplan ${nf%.network}"; return 0 ;;
+    /etc/systemd/network/*|/usr/lib/systemd/network/*|/lib/systemd/network/*)
+      echo "networkd ${nf}"; return 0 ;;
+  esac
+  echo "unit"
+}
+
+_mtu_persist() {
+  local ifc="$1" mtu="$2" kind="$3" where="$4" bak=/root/nodeforge-bak tmp name
+  mkdir -p "$bak"
+  case "$kind" in
+    ifupdown)
+      cp -a "$where" "${bak}/$(basename "$where").$(date +%F-%H%M)"
+      tmp="$(mktemp)"
+      # mtu — первой строкой стансы интерфейса; прежние mtu в ней убираем.
+      awk -v ifc="$ifc" -v mtu="$mtu" '
+        $1 == "iface" { in_s = ($2 == ifc); print; if (in_s) print "    mtu " mtu; next }
+        /^[^[:space:]#]/ { in_s = 0 }
+        in_s && $1 == "mtu" { next }
+        { print }' "$where" > "$tmp"
+      cat "$tmp" > "$where"
+      rm -f "$tmp"
+      if ! ifquery "$ifc" 2>/dev/null | grep -qx "mtu: ${mtu}"; then
+        err "ifquery не видит mtu ${mtu} в ${where} — проверь вручную (бэкап в ${bak})."; return 1
+      fi
+      ;;
+    netplan)
+      cp -a /etc/netplan "${bak}/netplan.$(date +%F-%H%M)"
+      netplan set "ethernets.${where}.mtu=${mtu}"
+      netplan generate
+      ;;
+    networkd)
+      name="$(basename "$where")"
+      install -d "/etc/systemd/network/${name}.d"
+      printf '[Link]\nMTUBytes=%s\n' "$mtu" > "/etc/systemd/network/${name}.d/nodeforge-mtu.conf"
+      ;;
+    unit)
+      cat > /etc/systemd/system/nodeforge-mtu.service <<EOS
+[Unit]
+Description=nodeforge: MTU ${mtu} on ${ifc} (path MTU of the provider)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$(command -v ip) link set ${ifc} mtu ${mtu}
+
+[Install]
+WantedBy=multi-user.target
+EOS
+      systemctl daemon-reload
+      systemctl enable --quiet nodeforge-mtu.service
+      ;;
+  esac
+}
+
+block_mtu() {
+  local ifc cur path kind where ipbin
+  info "Меряю путь MTU: ping с запретом фрагментации до ${MTU_TARGETS// /, }…"
+  mtu_probe || { err "Ни одна контрольная точка не ответила на ping — путь MTU не измерить."; return 1; }
+  ifc="$MTU_IFACE"; cur="$MTU_CUR"; path="$MTU_PATH"
+  if [ "$path" -ge "$cur" ]; then
+    ok "Интерфейс ${ifc}: MTU ${cur}, путь пропускает столько же — менять нечего."
+    return 0
+  fi
+  warn "Путь пропускает ${path} байт, а ${ifc} шлёт по ${cur}: каждое новое направление теряет первый большой пакет."
+  read -r kind where <<<"$(_net_backend "$ifc")"
+  info "Интерфейс настраивает: ${kind}${where:+ (${where})}"
+  confirm "Выставить MTU ${path} на ${ifc} — сейчас и после перезагрузки?" || { warn "Отменено."; return 1; }
+  ipbin="$(command -v ip)"
+  # Страховка: если связь пропадёт (скрипт умрёт вместе с SSH) — через 3 минуты MTU вернётся.
+  systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+  systemd-run --quiet --unit=nodeforge-mtu-revert --on-active=180 "$ipbin" link set "$ifc" mtu "$cur"
+  "$ipbin" link set "$ifc" mtu "$path"
+  sleep 2
+  if ! curl -fsS -m 10 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
+    err "После смены MTU HTTPS наружу не работает — возвращаю ${cur}."
+    "$ipbin" link set "$ifc" mtu "$cur"
+    systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+    return 1
+  fi
+  _mtu_persist "$ifc" "$path" "$kind" "$where"
+  systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+  ok "MTU ${ifc} = ${path} — сейчас и после перезагрузки. Живые соединения не рвутся."
+}
+
+
+# ============================================================================
+#  a)  АУДИТ НОДЫ  (встроенный, только чтение)
+# ----------------------------------------------------------------------------
+#  Ловит то, что тихо портит ноду и не видно в панели: путь MTU уже интерфейса,
+#  фризы ВМ у хостера, «чужая» страна по GeoIP, кривые маршруты, слетевший
+#  фаервол (сработал сейфти), открытый всем порт ноды, дубли logrotate,
+#  мёртвые location в nginx, истекающий сертификат. Ничего не меняет.
+# ============================================================================
+_a_ok()   { ok "$*"; }
+_a_warn() { AUD_WARN=$(( AUD_WARN + 1 )); warn "$*"; }
+_a_fail() { AUD_FAIL=$(( AUD_FAIL + 1 )); err "$*"; }
+_a_hint() { printf '    %s→ %s%s\n' "$GRY" "$*" "$RST" >&2; }
+
+# Признаки того, что ВМ стояла: ядро не получало CPU или сетевая карта не отвечала.
+AUD_FREEZE_RE='soft lockup|rcu_(preempt|sched) (self-)?detected stall|rcu.*kthread starved|NETDEV WATCHDOG|TX timeout|Long readout interval|blocked for more than'
+
+_audit_system() {
+  local s1 s2 i total steal pct frz span n used ntp failed pkgs
+  step "Система"
+  info "$(. /etc/os-release && echo "$PRETTY_NAME") · ядро $(uname -r) · vCPU $(nproc) · RAM $(free -m | awk '/^Mem:/ {print $2}') МБ · $(uptime -p)"
+
+  read -r -a s1 < /proc/stat; sleep 3; read -r -a s2 < /proc/stat   # cpu user nice system idle iowait irq softirq steal
+  total=0
+  for i in 1 2 3 4 5 6 7 8; do total=$(( total + s2[i] - s1[i] )); done
+  steal=$(( s2[8] - s1[8] ))
+  pct=$(( total > 0 ? steal * 100 / total : 0 ))
+  if [ "$pct" -ge 10 ]; then _a_fail "CPU steal ${pct}% — хостер отдаёт процессор соседям"
+  elif [ "$pct" -ge 3 ]; then _a_warn "CPU steal ${pct}%"
+  else _a_ok "CPU steal ${pct}%"; fi
+
+  # Время берём из dmesg: journald ставит метку, когда ВМ ожила и сбросила буфер,
+  # а не когда ядро зависло. Прошлые загрузки видны только в журнале.
+  frz="$(dmesg --time-format iso 2>/dev/null | grep -E "$AUD_FREEZE_RE")"; span="с загрузки"
+  if [ -z "$frz" ]; then
+    frz="$(journalctl -k --since '-7 days' -o short-iso --no-pager 2>/dev/null | grep -E "$AUD_FREEZE_RE")"; span="за 7 дней"
+  fi
+  if [ -n "$frz" ]; then
+    n="$(printf '%s\n' "$frz" | wc -l)"
+    _a_fail "ВМ зависала ${span}: ${n} записей ядра (soft lockup / RCU stall / TX timeout), $(printf '%s\n' "$frz" | head -1 | cut -c1-16 | tr T ' ') … $(printf '%s\n' "$frz" | tail -1 | cut -c1-16 | tr T ' ')"
+    _a_hint "это сторона хостера: ВМ не получала CPU или сеть. Повторяется — в поддержку с этими временами."
+  else
+    _a_ok "Зависаний ВМ за 7 дней не было"
+  fi
+
+  n="$(journalctl -k --since '-7 days' --no-pager 2>/dev/null | grep -cE 'Out of memory|oom-kill')"
+  if [ "${n:-0}" -gt 0 ]; then _a_fail "OOM за 7 дней: ${n} — не хватает памяти"; fi
+
+  failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | paste -sd' ')"
+  if [ -n "$failed" ]; then _a_fail "Упавшие сервисы: ${failed}"; _a_hint "systemctl status <имя>"
+  else _a_ok "Упавших сервисов нет"; fi
+
+  used="$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9)"
+  if [ "${used:-0}" -ge 90 ]; then _a_fail "Диск / заполнен на ${used}%"
+  elif [ "${used:-0}" -ge 80 ]; then _a_warn "Диск / заполнен на ${used}%"
+  else _a_ok "Диск / заполнен на ${used}%"; fi
+
+  ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+  if [ "$ntp" = yes ]; then _a_ok "Часы синхронизированы (NTP)"
+  else _a_warn "Часы НЕ синхронизированы — TLS и Reality чувствительны ко времени"; _a_hint "timedatectl set-ntp true"; fi
+
+  if [ -f /var/run/reboot-required ]; then
+    pkgs="$(sort -u /var/run/reboot-required.pkgs 2>/dev/null)"
+    # Обновилось штатное generic-ядро, а работает XanMod — перезагрузка его не включит.
+    case "$(uname -r)" in
+      *generic*) ;;
+      *) pkgs="$(printf '%s\n' "$pkgs" | grep -vE '^linux-(image|headers|modules)[^ ]*-generic$|^linux-base$')" ;;
+    esac
+    if [ -n "$pkgs" ]; then _a_warn "Система ждёт перезагрузки: $(printf '%s\n' "$pkgs" | paste -sd' ' | cut -c1-80)"; fi
+  fi
+}
+
+_audit_network() {
+  local cc qd probing ct ctmax pct retr outs rp drops d
+  step "Сеть и MTU"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  if [ "$cc" = bbr ]; then _a_ok "TCP: ${cc} + ${qd}"
+  else _a_warn "TCP: ${cc} + ${qd} — для VPN-ноды нужен bbr"; _a_hint "пункт 2) optimize"; fi
+
+  if mtu_probe; then
+    if [ "$MTU_PATH" -lt "$MTU_CUR" ]; then
+      _a_fail "MTU: ${MTU_IFACE}=${MTU_CUR}, а путь пропускает ${MTU_PATH} — первый большой пакет каждого нового потока теряется"
+      _a_hint "пункт m) MTU — выставит ${MTU_PATH} сейчас и после ребута"
+    else
+      _a_ok "MTU: ${MTU_IFACE}=${MTU_CUR}, путь пропускает столько же"
+    fi
+  else
+    _a_warn "MTU: ни одна контрольная точка не ответила на ping — путь не измерен"
+  fi
+
+  probing="$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)"
+  if [ "${probing:-0}" -ge 1 ]; then _a_ok "tcp_mtu_probing=${probing} (страховка, если ICMP режут)"
+  else _a_warn "tcp_mtu_probing=0 — где режут ICMP, большие потоки могут виснуть"; _a_hint "пункт 2) optimize"; fi
+
+  ct="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+  ctmax="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+  if [ -n "$ct" ] && [ "${ctmax:-0}" -gt 0 ]; then
+    pct=$(( ct * 100 / ctmax ))
+    if [ "$pct" -ge 80 ]; then _a_fail "conntrack заполнен на ${pct}% (${ct}/${ctmax}) — новые соединения теряются"
+    elif [ "$pct" -ge 60 ]; then _a_warn "conntrack заполнен на ${pct}% (${ct}/${ctmax})"
+    else _a_ok "conntrack ${pct}% (${ct}/${ctmax})"; fi
+  fi
+
+  read -r retr outs < <(awk '/^Tcp:/ { if (!h) { for (i = 1; i <= NF; i++) c[$i] = i; h = 1 } else print $c["RetransSegs"], $c["OutSegs"] }' /proc/net/snmp)
+  if [ "${outs:-0}" -gt 0 ]; then
+    rp="$(awk -v r="$retr" -v o="$outs" 'BEGIN { printf "%.1f", r * 100 / o }')"
+    if awk -v p="$rp" 'BEGIN { exit !(p >= 5) }'; then _a_warn "Повторные отправки TCP ${rp}% с загрузки — большие потери до клиентов"
+    else _a_ok "Повторные отправки TCP ${rp}% с загрузки"; fi
+  fi
+
+  drops=0
+  while read -r _ d _; do drops=$(( drops + 16#$d )); done < /proc/net/softnet_stat
+  if [ "$drops" -gt 0 ]; then _a_warn "Ядро отбросило ${drops} входящих пакетов (очередь softnet)"; _a_hint "netdev_max_backlog / RPS — пункт 2) optimize"
+  else _a_ok "Очередь softnet без потерь"; fi
+}
+
+# Задержка, джиттер и потери до опорных точек. До Cloudflare (anycast) из дата-центра
+# почти всегда меньше 10 мс — если больше 30, трафик уходит кружным маршрутом.
+_audit_routes() {
+  local line host name lim out loss avg mdev msg
+  step "Маршруты"
+  for line in "1.1.1.1|Cloudflare (anycast)|30" "8.8.8.8|Google DNS|" "77.88.8.8|Яндекс (Москва)|"; do
+    IFS='|' read -r host name lim <<<"$line"
+    out="$(ping -c 20 -i 0.2 -W 2 -q "$host" 2>/dev/null)"
+    loss="$(printf '%s\n' "$out" | grep -oE '[0-9.]+% packet loss' | cut -d% -f1)"
+    read -r avg mdev < <(printf '%s\n' "$out" | awk -F'[/ ]' '/^(rtt|round-trip)/ {print $8, $10}')
+    if [ -z "$avg" ]; then _a_warn "${name}: не отвечает на ping"; continue; fi
+    msg="${name}: ${avg} мс, джиттер ${mdev} мс, потери ${loss}%"
+    # 20 пакетов: один потерянный (5%) — бывает и от лимита ICMP у цели, три и больше — потери.
+    if awk -v l="$loss" 'BEGIN { exit !(l >= 15) }'; then
+      _a_fail "$msg"
+    elif awk -v l="$loss" 'BEGIN { exit !(l > 0) }'; then
+      _a_warn "$msg"
+    elif [ -n "$lim" ] && awk -v a="$avg" -v m="$lim" 'BEGIN { exit !(a > m) }'; then
+      _a_warn "$msg"
+      _a_hint "до ближайшего Cloudflare обычно <10 мс — маршрут кружной, вопрос к хостеру"
+    elif awk -v d="$mdev" 'BEGIN { exit !(d > 10) }'; then
+      _a_warn "${msg} — сильный джиттер"
+    else
+      _a_ok "$msg"
+    fi
+  done
+}
+
+# Страна по коду точки Cloudflare (IATA) — где трафик физически входит в сеть.
+_cf_colo_country() {
+  case "$1" in
+    FRA|MUC|DUS|HAM|BER|TXL|STR) echo DE ;;   AMS) echo NL ;;   HEL) echo FI ;;
+    ARN|GOT) echo SE ;;   CPH) echo DK ;;   OSL) echo NO ;;   WAW) echo PL ;;   PRG) echo CZ ;;
+    VIE) echo AT ;;   ZRH|GVA) echo CH ;;   MXP|FCO|PMO) echo IT ;;   MAD|BCN) echo ES ;;
+    CDG|MRS) echo FR ;;   LHR|MAN|EDI) echo GB ;;   DUB) echo IE ;;   BRU) echo BE ;;
+    LUX) echo LU ;;   RIX) echo LV ;;   TLL) echo EE ;;   VNO) echo LT ;;   KIV) echo MD ;;
+    OTP) echo RO ;;   SOF) echo BG ;;   BUD) echo HU ;;   ATH) echo GR ;;   IST) echo TR ;;
+    DME|SVO|LED|SVX|KJA) echo RU ;;   ALA|NQZ) echo KZ ;;   TAS) echo UZ ;;   TBS) echo GE ;;
+    EVN) echo AM ;;   DXB|FJR) echo AE ;;   TLV) echo IL ;;   NRT|HND|KIX|FUK|OKA) echo JP ;;
+    ICN) echo KR ;;   HKG) echo HK ;;   SIN) echo SG ;;   TPE) echo TW ;;   BOM|DEL|MAA|BLR) echo IN ;;
+    SYD|MEL) echo AU ;;   YYZ|YUL|YVR) echo CA ;;   GRU) echo BR ;;
+    JFK|EWR|IAD|ORD|DFW|LAX|SJC|SEA|MIA|ATL|DEN|PHX|BOS) echo US ;;
+  esac
+}
+
+# Страна по GeoIP против физического местоположения (точка Cloudflare).
+# Расхождение = сайты видят пользователей ноды «не там»: язык, выдача, гео-блоки.
+_audit_geo() {
+  local a b trace loc colo cc
+  step "GeoIP"
+  a="$(curl -fsS -m 6 https://ipinfo.io/country 2>/dev/null | tr -dc 'A-Z')"
+  b="$(curl -fsS -m 6 https://api.country.is/ 2>/dev/null | grep -oE '"country":"[A-Z]{2}"' | cut -d'"' -f4)"
+  trace="$(curl -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+  loc="$(printf '%s\n' "$trace" | awk -F= '$1 == "loc" {print $2}')"
+  colo="$(printf '%s\n' "$trace" | awk -F= '$1 == "colo" {print $2}')"
+  cc="$(_cf_colo_country "$colo")"
+  info "ipinfo: ${a:-?} · country.is: ${b:-?} · Cloudflare: ${loc:-?} (точка ${colo:-?}${cc:+ = ${cc}})"
+  if [ -n "$cc" ] && [ -n "$loc" ] && [ "$loc" != "$cc" ]; then
+    _a_warn "Сайты видят сервер в ${loc}, а трафик физически входит в сеть в ${colo} (${cc})"
+    _a_hint "язык, выдача и гео-блоки будут как в ${loc}; лечит только хостер (исправить геолокацию IP или выдать другой)"
+  elif [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
+    _a_warn "Базы GeoIP расходятся: ipinfo ${a}, country.is ${b}"
+  else
+    _a_ok "GeoIP согласован: ${loc:-${a:-?}}"
+  fi
+}
+
+_audit_firewall() {
+  local fired ports lst p open known
+  step "Фаервол"
+  if [ -f "$FW_ENV" ]; then . "$FW_ENV"; fi   # только читаем: fw_load создал бы файл
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    _a_fail "ufw включён — второй фаервол поверх na_filter"; _a_hint "пункт f) Починить фаервол выключит его"
+  fi
+
+  if nft list table inet na_filter >/dev/null 2>&1; then
+    _a_ok "na_filter загружен"
+  elif [ -d /etc/node-accelerator ]; then
+    _a_fail "na_filter НЕ загружен — ноду не защищает ничего, кроме CrowdSec"
+    if [ -s /var/lib/node-accelerator/safety-fired.last ]; then
+      fired="$(date -d "@$(cat /var/lib/node-accelerator/safety-fired.last)" '+%F %T' 2>/dev/null)"
+      _a_hint "причина: ${fired} сработал сейфти-таймер protect — подтверждения не было, защита снялась сама"
+    fi
+    _a_hint "пункт f) Починить фаервол"
+  else
+    _a_warn "Фаервол (protect) не ставился"; _a_hint "пункт 3) protect"
+  fi
+  if [ -d /etc/node-accelerator ]; then
+    if systemctl is-enabled --quiet na-firewall.service 2>/dev/null; then _a_ok "na-firewall в автозагрузке"
+    else _a_fail "na-firewall не в автозагрузке — после ребута защиты не будет"; fi
+  fi
+  if na_safety_armed; then
+    _a_warn "Сейфти-таймер взведён — если не снять, na_filter удалится сам"
+    _a_hint "проверил вход по SSH — systemctl stop na-fw-safety.timer"
+  fi
+  if nft list chain inet na_filter input 2>/dev/null | grep -qE 'iifname "wt0" (counter packets [0-9]+ bytes [0-9]+ )?accept'; then
+    info "Трафик из netbird (wt0) минует na_filter — это правило вставляет сам netbird; служебные порты держит panel-only"
+  fi
+
+  ports="$(_merge_ports "${NODE_PORT:-2222}" "${PANEL_PORTS:-}")"
+  if nft list table inet nodeforge_panel_only >/dev/null 2>&1; then
+    _a_ok "Порты ${ports} открыты только панели (${PANEL_IPS:-?})"
+  else
+    _a_fail "Порты ${ports} открыты не только панели (через netbird — всем пирам сети)"
+    _a_hint "пункт k) — оставить их только панели"
+  fi
+
+  # Без na_filter наружу открыто всё, что слушает; показываем то, чего нет в реестре.
+  if ! nft list table inet na_filter >/dev/null 2>&1; then
+    open=""
+    known=",${SSH_PORT:-$(detect_ssh_port)},$(_merge_ports "${TCP_PORTS:-443}" "${EXTRA_TCP:-}"),"
+    lst="$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|100\.)' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un)"
+    for p in $lst; do
+      if [[ "$known" == *",${p},"* ]]; then continue; fi
+      if nft list table inet nodeforge_panel_only >/dev/null 2>&1 && [[ ",${ports}," == *",${p},"* ]]; then continue; fi
+      open="${open:+${open},}${p}"
+    done
+    if [ -n "$open" ]; then _a_warn "Без na_filter из интернета доступны TCP-порты вне реестра: ${open}"; fi
+  fi
+}
+
+_audit_logs() {
+  local errs
+  step "Логи"
+  errs="$(logrotate -d /etc/logrotate.conf 2>&1 | grep -E '^error' | sort -u)"
+  if [ -n "$errs" ]; then
+    _a_fail "logrotate с ошибками — падает на каждом прогоне:"
+    printf '%s\n' "$errs" | head -5 | sed 's/^/      /' >&2
+    if printf '%s\n' "$errs" | grep -q 'duplicate log entry'; then
+      _a_hint "два конфига на одни файлы; пункт 7) Логи ноды заберёт /var/log/remnanode себе"
+    fi
+  else
+    _a_ok "logrotate без ошибок"
+  fi
+  if [ -d /var/log/remnanode ]; then info "/var/log/remnanode: $(du -sh /var/log/remnanode 2>/dev/null | cut -f1)"; fi
+  info "journald: $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1)"
+}
+
+_audit_node() {
+  local ctr c st s rc started age f sock cert end days img sni want
+  step "Нода"
+  if ! require_node >/dev/null 2>&1; then info "Нода (remnanode) не установлена — пропускаю."; return 0; fi
+
+  ctr="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "(^|_)${NODE_CONTAINER}\$" | head -1)"
+  if [ -n "$ctr" ] && [ "$ctr" != "$NODE_CONTAINER" ]; then
+    _a_warn "Контейнер ноды называется «${ctr}», а не «${NODE_CONTAINER}» — compose не довёл пересоздание до переименования"
+    _a_hint "всё, что обращается к ноде по имени (cron update-geo.sh, RU-блокировка, SNI), тут падает; без простоя: docker rename ${ctr} ${NODE_CONTAINER}"
+  fi
+  for c in "${ctr:-$NODE_CONTAINER}" remnawave-nginx; do
+    st="$(docker inspect -f '{{.State.Status}} {{.RestartCount}} {{.State.StartedAt}}' "$c" 2>/dev/null)"
+    if [ -z "$st" ]; then _a_fail "Контейнер ${c} не найден"; continue; fi
+    read -r s rc started <<<"$st"
+    if [ "$s" != running ]; then _a_fail "Контейнер ${c}: ${s}"
+    else _a_ok "Контейнер ${c} работает с $(date -d "$started" '+%F %H:%M' 2>/dev/null) (перезапусков: ${rc})"; fi
+  done
+
+  if pgrep -x rw-core >/dev/null; then
+    age="$(ps -o etimes= -p "$(pgrep -xo rw-core)" | tr -d ' ')"
+    info "Xray (rw-core) работает $(( age / 3600 )) ч — перезапускается и при смене профиля в панели"
+  else
+    _a_fail "Xray (rw-core) не запущен — нода не обслуживает клиентов"
+  fi
+
+  f="${NODE_DIR}/nginx.conf"
+  if [ -f "$f" ]; then
+    if grep -q 'nginx.sock' "$f"; then
+      if [ -S /dev/shm/nginx.sock ]; then _a_ok "Фолбэк Reality → nginx.sock на месте"
+      else _a_fail "Reality отдаёт фолбэк в /dev/shm/nginx.sock, а сокета нет — маскировка сломана"; fi
+    fi
+    while read -r sock; do
+      if [ -S "$sock" ]; then _a_ok "nginx → ${sock}: инбаунд слушает"
+      else _a_warn "nginx ведёт в ${sock}, а такого инбаунда нет — мёртвый location"; _a_hint "убери location из ${f} или добавь инбаунд в профиль панели"; fi
+    done < <(grep -oE 'unix:/dev/shm/[^;[:space:]]+\.socket' "$f" | sed 's/^unix://' | sort -u)
+  fi
+
+  cert="$(grep -oE '/etc/letsencrypt/live/[^:]+/fullchain\.pem' "${NODE_DIR}/docker-compose.yml" 2>/dev/null | head -1)"
+  if [ -n "$cert" ] && [ -f "$cert" ]; then
+    end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
+    days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+    if [ "$days" -lt 14 ]; then _a_fail "Сертификат ${cert%/fullchain.pem} истекает через ${days} дн."
+    elif [ "$days" -lt 30 ]; then _a_warn "Сертификат ${cert%/fullchain.pem} истекает через ${days} дн."
+    else _a_ok "Сертификат действителен ещё ${days} дн."; fi
+  fi
+
+  # compose и живой контейнер должны совпадать: иначе правка compose не применена.
+  NODE_CONTAINER="${ctr:-$NODE_CONTAINER}"
+  sni="$(node_env_value SNI_VERIFICATION || true)"
+  want="$(grep -oE 'SNI_VERIFICATION=[a-z]+' "${NODE_DIR}/docker-compose.yml" 2>/dev/null | head -1 | cut -d= -f2)"
+  if [ -n "$want" ] && [ "$sni" != "$want" ]; then
+    _a_warn "SNI_VERIFICATION: в compose ${want}, в контейнере ${sni:-не задана} — контейнер не пересоздан"
+    _a_hint "пункт 10) Перезапуск → пересоздать"
+  else
+    info "SNI_VERIFICATION: ${sni:-не задана (по умолчанию false)}"
+  fi
+  img="$(docker inspect -f '{{.Config.Image}}' remnawave-nginx 2>/dev/null)"
+  case "$img" in
+    nginx:1.28*) _a_warn "nginx ${img#nginx:} — в 1.28 есть CVE"; _a_hint "пункт 9) nginx → ${NGINX_TARGET}" ;;
+  esac
+}
+
+block_audit() {
+  # Только чтение: одна упавшая проверка не должна обрывать весь отчёт.
+  set +e
+  local AUD_WARN=0 AUD_FAIL=0
+  info "Аудит ноды: только чтение, около минуты (замеры MTU и маршрутов)."
+  _audit_system
+  _audit_network
+  _audit_routes
+  _audit_geo
+  _audit_firewall
+  _audit_logs
+  _audit_node
+  echo
+  hr
+  if [ "$AUD_FAIL" -gt 0 ]; then err "Итог: проблем ${AUD_FAIL}, предупреждений ${AUD_WARN}."
+  elif [ "$AUD_WARN" -gt 0 ]; then warn "Итог: проблем нет, предупреждений ${AUD_WARN}."
+  else ok "Итог: всё в порядке."; fi
+  return 0
 }
 
 
@@ -1826,13 +2535,16 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN}12)${RST} Обновить Beszel  ${GRY}(агент и/или хаб)${RST}
  
  ${BOLD}${MAG}Диагностика / сервис${RST}${GRY}:${RST}
-   ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: node-diagnostic / node-accelerator${RST}
+   ${BOLD}${GRN} a)${RST} ${WHT}Аудит ноды${RST} ${GRN}★${RST}   ${GRY}— MTU, фризы ВМ, GeoIP, маршруты, фаервол, логи (только чтение)${RST}
+   ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: аудит / node-diagnostic / node-accelerator${RST}
    ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
    ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
  
  ${BOLD}${MAG}Дополнительно (опционально)${RST}${GRY}:${RST}
    ${BOLD}${GRN} p)${RST} Порты              ${GRY}— показать активные + добавить/убрать/применить${RST}
    ${BOLD}${GRN} f)${RST} Починить фаервол   ${GRY}— открыть все порты из реестра разом${RST}
+   ${BOLD}${GRN} k)${RST} Порты для панели   ${GRY}— порт ноды и beszel только с IP панели${RST}
+   ${BOLD}${GRN} m)${RST} MTU                ${GRY}— замерить путь и выставить MTU интерфейса${RST}
    ${BOLD}${GRN} s)${RST} Шейпер скорости    ${GRY}— лимиты на уровне ноды${RST}
    ${BOLD}${GRN} g)${RST} Блок РФ-госсетей   ${GRY}— прятать ноду от зондов госсетей${RST}
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
@@ -1849,7 +2561,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → 13.  Можно несколько номеров через пробел.${RST}
+ ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → m → a.  Можно несколько номеров через пробел.${RST}
 EOF
 }
  
@@ -1876,8 +2588,11 @@ menu() {
         13) submenu_diag ;;
         14) submenu_checks ;;
         15) self_update ;;
+        a|A) run_block "Аудит ноды" block_audit ;;
         p|P) block_ports ;;
         f|F) run_block "Починить фаервол" apply_firewall ;;
+        k|K) run_block "Порты для панели" block_panel_only ;;
+        m|M) run_block "MTU" block_mtu ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
