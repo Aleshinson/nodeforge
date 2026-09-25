@@ -2353,29 +2353,104 @@ _fix_certbot_timer() {
 # Путь к ini с ключами Cloudflare из renewal-конфига certbot.
 _cf_ini() { awk -F' *= *' '$1 == "dns_cloudflare_credentials" {print $2}' "$1"; }
 
-# Глобальный ключ Cloudflare → API-токен зоны. Токен — скрытым вводом, в файл 600.
-# Старый ini не бэкапим: в нём ключ ко всему аккаунту Cloudflare, ему не место на диске.
-# $2=nodry — без проверки вхолостую (её заменит настоящее продление).
-_fix_cf_token() {
-  local conf="$1" ini name tok other
-  name="$(basename "$conf" .conf)"
-  ini="$(_cf_ini "$conf")"
-  other="$(grep -l "dns_cloudflare_credentials *= *${ini}\$" /etc/letsencrypt/renewal/*.conf 2>/dev/null \
-    | grep -vx "$conf" | xargs -r -n1 basename | sed 's/\.conf$//' | paste -sd' ')"
-  info "Нужен API-токен Cloudflare: My Profile → API Tokens → Create Token → шаблон «Edit zone DNS», зона ${name}."
-  if [ -n "$other" ]; then warn "Этим же ${ini} продлеваются ещё: ${other} — токену нужен доступ и к этим зонам."; fi
-  info "Если на другой ноде этой зоны продление работает — подходящий токен лежит там в ${ini}."
-  read -rsp "API-токен Cloudflare (ввод скрыт): " tok; echo
-  if [ -z "$tok" ]; then warn "Токен не введён — ничего не менял."; return 1; fi
-  install -d -m 700 "$(dirname "$ini")"
-  ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$ini" )
-  chmod 600 "$ini"
-  ok "В ${ini} теперь API-токен зоны."
-  if [ "${2:-}" != nodry ]; then
-    log "Проверяю продление вхолостую (certbot --dry-run, 1–2 мин: ждёт DNS)."
-    certbot renew --cert-name "$name" --dry-run
-    ok "Cloudflare принимает токен — автопродление работает."
+# Сертификаты certbot (имена), которые продлеваются через ini $1.
+_cf_certs_for_ini() {
+  grep -l "^dns_cloudflare_credentials *= *${1}\$" /etc/letsencrypt/renewal/*.conf 2>/dev/null \
+    | xargs -r -n1 basename | sed 's/\.conf$//' | paste -sd' ' || true
+}
+
+# Что сейчас лежит в ini: токен, глобальный ключ или ничего.
+_cf_ini_kind() {
+  if [ ! -s "$1" ]; then echo "файла нет"
+  elif grep -q '^[[:space:]]*dns_cloudflare_api_token' "$1"; then echo "API-токен"
+  else echo "глобальный ключ (email + api_key) — продление с ним падает"; fi
+}
+
+# Запрос к API Cloudflare с токеном из $CF_TOKEN; заголовок — через stdin, не в argv.
+_cf_api() {
+  curl -fsS -m 10 -H @- "https://api.cloudflare.com/client/v4/$1" <<<"Authorization: Bearer ${CF_TOKEN}"
+}
+
+# Спросить API-токен (скрытый ввод), проверить в Cloudflare и записать в ini $1 (600).
+# До записи: токен активен и видит зоны всех сертификатов этого ini. Старый ключ на диск
+# не бэкапим — в нём может быть ключ ко всему аккаунту Cloudflare.
+_cf_token_set() {
+  local ini="$1" names zones n d uncovered="" CF_TOKEN
+  names="$(_cf_certs_for_ini "$ini")"
+  info "Токен: Cloudflare → My Profile → API Tokens → Create Token → шаблон «Edit zone DNS»; зоны сертификатов: ${names:-?}."
+  info "Если на другой ноде этих зон продление работает — подходящий токен лежит там в ${ini}."
+  read -rsp "API-токен Cloudflare (ввод скрыт): " CF_TOKEN; echo
+  if [ -z "$CF_TOKEN" ]; then warn "Токен не введён — ничего не менял."; return 1; fi
+  if ! _cf_api user/tokens/verify 2>/dev/null | grep -q '"status":"active"'; then
+    err "Cloudflare не принимает токен (неверный, отозван или истёк) — ничего не менял."; return 1
   fi
+  zones="$(_cf_api 'zones?per_page=50' 2>/dev/null \
+    | python3 -c 'import json,sys; print("\n".join(z["name"] for z in json.load(sys.stdin).get("result", [])))' 2>/dev/null || true)"
+  for n in $names; do
+    for d in $(openssl x509 -noout -ext subjectAltName -in "/etc/letsencrypt/live/${n}/cert.pem" 2>/dev/null \
+                 | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://; s/^\*\.//' | sort -u || true); do
+      if ! printf '%s\n' "$zones" | awk -v d="$d" 'd == $0 || substr(d, length(d) - length($0)) == "." $0 { f = 1 } END { exit !f }'; then
+        uncovered="${uncovered:+${uncovered} }${d}"
+      fi
+    done
+  done
+  if [ -n "$uncovered" ]; then
+    warn "Токен активен, но не видит зоны для: ${uncovered} — продление этих имён упадёт."
+    confirm "Записать токен всё равно?" || { warn "Не записал."; return 1; }
+  else
+    ok "Токен активен и видит зоны: $(printf '%s\n' "$zones" | paste -sd' ')"
+  fi
+  install -d -m 700 "$(dirname "$ini")"
+  ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$CF_TOKEN" > "$ini" )
+  chmod 600 "$ini"
+  ok "Токен записан в ${ini}."
+}
+
+# Продление вхолостую для всех сертификатов ini $1; код 1 — хоть одно упало.
+_cf_dry_run() {
+  local n bad=0
+  for n in $(_cf_certs_for_ini "$1"); do
+    log "certbot --dry-run для ${n} (1–2 мин: ждёт DNS)…"
+    if certbot renew --cert-name "$n" --dry-run --quiet; then ok "${n}: продление работает."
+    else err "${n}: продление вхолостую упало (вывод выше)."; bad=1; fi
+  done
+  return "$bad"
+}
+
+# Из аудита: глобальный ключ → API-токен. $2=nodry — без проверки вхолостую
+# (её заменит настоящее продление сразу следом).
+_fix_cf_token() {
+  local ini
+  ini="$(_cf_ini "$1")"
+  _cf_token_set "$ini"
+  if [ "${2:-}" != nodry ]; then _cf_dry_run "$ini"; fi
+}
+
+# ----- c) Токен Cloudflare для автопродления сертификатов (ротация) -----
+block_cf_token() {
+  local -a inis
+  local ini old rc
+  mapfile -t inis < <(grep -h '^dns_cloudflare_credentials' /etc/letsencrypt/renewal/*.conf 2>/dev/null \
+    | awk -F' *= *' '{print $2}' | sort -u)
+  if [ "${#inis[@]}" -eq 0 ]; then
+    err "Здесь нет сертификатов certbot, которые продлеваются через Cloudflare (dns-cloudflare)."; return 1
+  fi
+  if [ "${#inis[@]}" -eq 1 ]; then ini="${inis[0]}"
+  else choose_from_list ini "Какой файл ключей Cloudflare менять?" "" "${inis[@]}"; fi
+  info "Файл: ${ini}"
+  info "Продлеваются через него: $(_cf_certs_for_ini "$ini")"
+  info "Сейчас в нём: $(_cf_ini_kind "$ini")"
+  old="$(cat "$ini" 2>/dev/null || true)"   # только в памяти — на случай отката
+  _cf_token_set "$ini" || return 1
+  if confirm "Проверить продление вхолостую сейчас (certbot --dry-run, 1–2 мин на сертификат)?"; then
+    rc=0; _cf_dry_run "$ini" || rc=$?
+    if [ "$rc" -ne 0 ] && [ -n "$old" ] && confirm "Вернуть прежнее содержимое ${ini}?"; then
+      ( umask 077; printf '%s\n' "$old" > "$ini" )
+      warn "Вернул прежний ключ. Разберись с токеном и повтори пункт."
+      return 1
+    fi
+  fi
+  ok "Готово. Полную проверку продления (таймер, хук nginx, срок) покажет аудит (a)."
 }
 
 # deploy_hook: после продления перезапустить nginx — он держит сертификат отдельным
@@ -2408,12 +2483,17 @@ _fix_cert_renew() {
   fi
   if ! grep -q '^deploy_hook' "$conf"; then _fix_cert_hook "$conf"; fi
   log "Продлеваю ${name} (DNS-01 через Cloudflare, 1–2 мин)."
-  certbot renew --cert-name "$name"
+  if ! certbot renew --cert-name "$name"; then
+    # Частая причина — токен отозван, истёк или без доступа к зоне: сменить и повторить.
+    if [ -z "$ini" ] || ! confirm "Продление упало. Сменить токен Cloudflare и попробовать ещё раз?"; then return 1; fi
+    _cf_token_set "$ini"
+    certbot renew --cert-name "$name"
+  fi
   if ! openssl x509 -checkend 86400 -noout -in "$cert" >/dev/null 2>&1; then
     err "Сертификат не обновился — см. вывод certbot выше."; return 1
   fi
   ngx="$(_nginx_container)"
-  live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null)"
+  live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null || true)"
   served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
   if [ -n "$ngx" ] && [ "$live" != "$served" ]; then docker restart "$ngx" >/dev/null; fi
   ok "Сертификат ${name} действителен до $(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2); nginx отдаёт новый."
@@ -2449,8 +2529,8 @@ _fix_logrotate_opts() {
 _fix_na_limits() {
   local cur_conn cur_syn nc ns conf=/etc/node-accelerator/protect.conf
   fw_load
-  cur_conn="${CONN_LIMIT:-$(grep -oE 'CONN_LIMIT:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"
-  cur_syn="${SYN_RATE:-$(grep -oE 'SYN_RATE:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"
+  cur_conn="${CONN_LIMIT:-$(grep -oE 'CONN_LIMIT:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2 || true)}"
+  cur_syn="${SYN_RATE:-$(grep -oE 'SYN_RATE:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2 || true)}"
   cur_conn="${cur_conn:-2048}"; cur_syn="${cur_syn:-200}"
   while true; do
     ask nc "Макс. одновременных соединений с одного IP (сейчас ${cur_conn})" "$(( cur_conn * 4 ))"
@@ -3089,7 +3169,7 @@ _audit_cert() {
   if [ -n "$ngx" ]; then
     live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null)"
     served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)"
-    if [ -n "$served" ] && [ "$live" != "$served" ]; then
+    if [ -n "$served" ] && [ "$live" != "$served" ] && [ "$days" -ge 0 ]; then
       _a_fail "nginx отдаёт не тот сертификат, что лежит на диске — после продления контейнер не перезапускали"
       _a_fix "Перезапустить nginx маскировки (~2 с)" 1 _fix_nginx_restart
     fi
@@ -3104,7 +3184,7 @@ _audit_cert() {
     _a_warn "Таймер certbot выключен — сертификат сам не продлится"
     _a_fix "Включить автопродление (certbot.timer)" 0 _fix_certbot_timer
   fi
-  ini="$(awk -F' *= *' '$1 == "dns_cloudflare_credentials" {print $2}' "$conf")"
+  ini="$(_cf_ini "$conf")"
   if [ -n "$ini" ] && [ -f "$ini" ] && ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini"; then
     _a_fail "Продление через глобальный ключ Cloudflare (${ini}) — оно падает; нужен API-токен зоны"
     _a_fix "Заменить ключ Cloudflare на API-токен зоны и проверить продление (спросит токен)" 0 _fix_cf_token "$conf"
@@ -3112,6 +3192,10 @@ _audit_cert() {
   if ! grep -q '^deploy_hook' "$conf"; then
     _a_warn "После продления nginx не перезапускается (нет deploy_hook) — будет отдавать старый сертификат"
     _a_fix "Прописать перезапуск nginx после продления сертификата" 0 _fix_cert_hook "$conf"
+  fi
+  # Сертификат не продлился, хотя в ini уже токен, — токен мог быть отозван или истечь.
+  if [ "$days" -lt 30 ] && [ -n "$ini" ]; then
+    _a_fix "Сменить API-токен Cloudflare и проверить продление (спросит токен)" 0 _fix_cf_token "$conf"
   fi
 }
 
@@ -3369,6 +3453,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} f)${RST} Починить фаервол   ${GRY}— открыть все порты из реестра разом${RST}
    ${BOLD}${GRN} k)${RST} Порты для панели   ${GRY}— порт ноды и beszel только с IP панели${RST}
    ${BOLD}${GRN} m)${RST} MTU                ${GRY}— замерить путь и выставить MTU интерфейса${RST}
+   ${BOLD}${GRN} c)${RST} Токен Cloudflare   ${GRY}— сменить для автопродления сертификатов (с проверкой)${RST}
    ${BOLD}${GRN} s)${RST} Шейпер скорости    ${GRY}— лимиты на уровне ноды${RST}
    ${BOLD}${GRN} g)${RST} Блок РФ-госсетей   ${GRY}— прятать ноду от зондов госсетей${RST}
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
@@ -3417,6 +3502,7 @@ menu() {
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
         m|M) run_block "MTU" block_mtu ;;
+        c|C) run_block "Токен Cloudflare" block_cf_token ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
