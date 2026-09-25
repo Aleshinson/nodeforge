@@ -2293,6 +2293,20 @@ _fix_ct_timeout() {
   ok "conntrack держит простаивающие TCP 2 ч 04 мин (${NF_SYSCTL})."
 }
 
+# Потолок conntrack по памяти: запись ~320 байт, таблица растёт по мере надобности.
+_ct_max_target() {
+  local mb
+  mb="$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)"
+  if [ "${mb:-0}" -ge 1500 ]; then echo 262144; else echo 131072; fi
+}
+
+_fix_ct_max() {
+  local v
+  v="$(_ct_max_target)"
+  _sysctl_persist net.netfilter.nf_conntrack_max "$v"
+  ok "Потолок conntrack: ${v} (${NF_SYSCTL})."
+}
+
 _fix_disable_ipv6() {
   _sysctl_persist net.ipv6.conf.all.disable_ipv6 1
   _sysctl_persist net.ipv6.conf.default.disable_ipv6 1
@@ -2343,11 +2357,6 @@ _fix_nginx_restart() {
   docker restart "$ngx" >/dev/null
   sleep 2
   ok "nginx (${ngx}) перезапущен — запусти аудит ещё раз, чтобы проверить маскировку."
-}
-
-_fix_certbot_timer() {
-  systemctl enable --now certbot.timer
-  ok "Автопродление certbot включено: $(systemctl list-timers certbot.timer --no-pager --no-legend | awk '{print $1, $2, $3}')"
 }
 
 # Путь к ini с ключами Cloudflare из renewal-конфига certbot.
@@ -2406,97 +2415,127 @@ _cf_token_set() {
   ok "Токен записан в ${ini}."
 }
 
-# Продление вхолостую для всех сертификатов ini $1; код 1 — хоть одно упало.
-_cf_dry_run() {
-  local n bad=0
-  for n in $(_cf_certs_for_ini "$1"); do
-    log "certbot --dry-run для ${n} (1–2 мин: ждёт DNS)…"
-    if certbot renew --cert-name "$n" --dry-run --quiet; then ok "${n}: продление работает."
-    else err "${n}: продление вхолостую упало (вывод выше)."; bad=1; fi
-  done
-  return "$bad"
+# ============================================================================
+#  c)  СЕРТИФИКАТ НОДЫ — одно действие на всё
+# ----------------------------------------------------------------------------
+#  Состояние → токен Cloudflare (обязательно при глобальном ключе, по желанию —
+#  сменить) → хук рестарта nginx → таймер certbot → продление (если пора или
+#  попросили) либо проверка вхолостую → nginx отдаёт ровно тот сертификат, что
+#  на диске. Этим же зовётся исправление из аудита.
+# ============================================================================
+
+# Хук-файл certbot: вызывается после каждого продления и, в отличие от строки
+# deploy_hook в renewal-конфиге, не теряется, когда certbot этот конфиг переписывает.
+NF_CERT_HOOK=/etc/letsencrypt/renewal-hooks/deploy/nodeforge-restart-nginx.sh
+
+_cert_hook_ok() {
+  [ -x "$NF_CERT_HOOK" ] || grep -qE '^(deploy_hook|renew_hook)[[:space:]]*=' "$1" 2>/dev/null
 }
 
-# Из аудита: глобальный ключ → API-токен. $2=nodry — без проверки вхолостую
-# (её заменит настоящее продление сразу следом).
-_fix_cf_token() {
-  local ini
-  ini="$(_cf_ini "$1")"
-  _cf_token_set "$ini"
-  if [ "${2:-}" != nodry ]; then _cf_dry_run "$ini"; fi
-}
-
-# ----- c) Токен Cloudflare для автопродления сертификатов (ротация) -----
-block_cf_token() {
-  local -a inis
-  local ini old rc
-  mapfile -t inis < <(grep -h '^dns_cloudflare_credentials' /etc/letsencrypt/renewal/*.conf 2>/dev/null \
-    | awk -F' *= *' '{print $2}' | sort -u)
-  if [ "${#inis[@]}" -eq 0 ]; then
-    err "Здесь нет сертификатов certbot, которые продлеваются через Cloudflare (dns-cloudflare)."; return 1
-  fi
-  if [ "${#inis[@]}" -eq 1 ]; then ini="${inis[0]}"
-  else choose_from_list ini "Какой файл ключей Cloudflare менять?" "" "${inis[@]}"; fi
-  info "Файл: ${ini}"
-  info "Продлеваются через него: $(_cf_certs_for_ini "$ini")"
-  info "Сейчас в нём: $(_cf_ini_kind "$ini")"
-  old="$(cat "$ini" 2>/dev/null || true)"   # только в памяти — на случай отката
-  _cf_token_set "$ini" || return 1
-  if confirm "Проверить продление вхолостую сейчас (certbot --dry-run, 1–2 мин на сертификат)?"; then
-    rc=0; _cf_dry_run "$ini" || rc=$?
-    if [ "$rc" -ne 0 ] && [ -n "$old" ] && confirm "Вернуть прежнее содержимое ${ini}?"; then
-      ( umask 077; printf '%s\n' "$old" > "$ini" )
-      warn "Вернул прежний ключ. Разберись с токеном и повтори пункт."
-      return 1
-    fi
-  fi
-  ok "Готово. Полную проверку продления (таймер, хук nginx, срок) покажет аудит (a)."
-}
-
-# deploy_hook: после продления перезапустить nginx — он держит сертификат отдельным
-# файлом по симлинку live/ и без рестарта отдаёт старый.
-_fix_cert_hook() {
-  local conf="$1" ngx tmp
+_cert_hook_ensure() {
+  local ngx
   ngx="$(_nginx_container)"
-  if [ -z "$ngx" ]; then err "Не нашёл nginx-контейнер."; return 1; fi
-  tmp="$(mktemp)"
-  awk -v hook="deploy_hook = $(command -v docker) restart ${ngx}" \
-    '{ print } /^\[renewalparams\]/ { print hook }' "$conf" > "$tmp"
-  cat "$tmp" > "$conf"
-  rm -f "$tmp"
-  ok "После продления certbot перезапустит ${ngx}."
+  if [ -z "$ngx" ]; then warn "Не нашёл nginx-контейнер — хук после продления не ставлю."; return 0; fi
+  install -d /etc/letsencrypt/renewal-hooks/deploy
+  cat > "$NF_CERT_HOOK" <<EOS
+#!/bin/sh
+# nodeforge: nginx ноды держит сертификат файлом по симлинку live/ и без рестарта
+# отдаёт старый. certbot вызывает этот файл после каждого успешного продления.
+$(command -v docker) restart ${ngx} >/dev/null 2>&1 || true
+EOS
+  chmod 755 "$NF_CERT_HOOK"
+  ok "После продления certbot перезапустит ${ngx} (${NF_CERT_HOOK})."
 }
 
-# Продлить сертификат маскировки: при глобальном ключе — сначала токен, потом хук,
-# потом certbot renew; в конце сверяем, что nginx отдаёт уже новый сертификат.
-_fix_cert_renew() {
-  local cert="$1" name conf ini ngx live served
+# Дней до истечения сертификата $1 (отрицательное — уже истёк).
+_cert_days() {
+  local end
+  end="$(openssl x509 -enddate -noout -in "$1" 2>/dev/null | cut -d= -f2 || true)"
+  echo $(( ( $(date -d "${end:-now}" +%s) - $(date +%s) ) / 86400 ))
+}
+
+# Сертификат на диске и тот, что реально отдаёт nginx, — разные? Тогда рестарт nginx.
+_cert_nginx_sync() {
+  local cert="$1" ngx live served
+  ngx="$(_nginx_container)"
+  if [ -z "$ngx" ]; then return 0; fi
+  live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null || true)"
+  served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+  if [ "$live" != "$served" ]; then
+    docker restart "$ngx" >/dev/null
+    ok "nginx (${ngx}) перезапущен — отдаёт сертификат с диска."
+  fi
+}
+
+# certbot renew; упало — предложить сменить токен и повторить. $3=force — досрочно.
+_cert_renew() {
+  local name="$1" ini="$2"
+  local -a args=(renew --cert-name "$name")
+  if [ "${3:-}" = force ]; then args+=(--force-renewal); fi
+  log "Продлеваю ${name} (DNS-01 через Cloudflare, 1–2 мин)."
+  if ! certbot "${args[@]}"; then
+    if [ -z "$ini" ] || ! confirm "Продление упало. Сменить токен Cloudflare и попробовать ещё раз?"; then return 1; fi
+    _cf_token_set "$ini"
+    certbot "${args[@]}"
+  fi
+}
+
+cert_maintain() {
+  local cert="$1" name conf ini days
   name="$(basename "$(dirname "$cert")")"
   conf="/etc/letsencrypt/renewal/${name}.conf"
   if [ ! -f "$conf" ]; then
     err "Сертификат ${name} здесь не выпускался certbot'ом (нет ${conf}) — положи свежий оттуда, где он продлевается, и перезапусти nginx."
     return 1
   fi
+  days="$(_cert_days "$cert")"
+  if [ "$days" -lt 0 ]; then info "Сертификат ${name}: истёк $(( -days )) дн. назад."
+  else info "Сертификат ${name}: действителен ещё ${days} дн."; fi
+
   ini="$(_cf_ini "$conf")"
-  if [ -n "$ini" ] && [ -f "$ini" ] && ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini"; then
-    _fix_cf_token "$conf" nodry
+  if [ -n "$ini" ]; then
+    info "Ключ Cloudflare (${ini}): $(_cf_ini_kind "$ini")"
+    if ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini" 2>/dev/null; then
+      _cf_token_set "$ini"
+    elif confirm "Сменить токен Cloudflare?"; then
+      _cf_token_set "$ini"
+    fi
   fi
-  if ! grep -q '^deploy_hook' "$conf"; then _fix_cert_hook "$conf"; fi
-  log "Продлеваю ${name} (DNS-01 через Cloudflare, 1–2 мин)."
-  if ! certbot renew --cert-name "$name"; then
-    # Частая причина — токен отозван, истёк или без доступа к зоне: сменить и повторить.
-    if [ -z "$ini" ] || ! confirm "Продление упало. Сменить токен Cloudflare и попробовать ещё раз?"; then return 1; fi
-    _cf_token_set "$ini"
-    certbot renew --cert-name "$name"
+  if ! _cert_hook_ok "$conf"; then _cert_hook_ensure; fi
+  if ! systemctl is-enabled --quiet certbot.timer 2>/dev/null; then
+    systemctl enable --now certbot.timer
+    ok "Автопродление по таймеру (certbot.timer) включено."
   fi
-  if ! openssl x509 -checkend 86400 -noout -in "$cert" >/dev/null 2>&1; then
-    err "Сертификат не обновился — см. вывод certbot выше."; return 1
+
+  if [ "$days" -lt 30 ]; then
+    _cert_renew "$name" "$ini"
+  elif confirm "Продлевать рано (ещё ${days} дн.) — продлить принудительно сейчас?"; then
+    _cert_renew "$name" "$ini" force
+  else
+    log "Проверяю продление вхолостую (certbot --dry-run, 1–2 мин: ждёт DNS)."
+    if certbot renew --cert-name "$name" --dry-run --quiet; then ok "Автопродление работает (проверено вхолостую)."
+    else err "Продление вхолостую упало — см. вывод выше; частая причина — токен Cloudflare."; return 1; fi
   fi
-  ngx="$(_nginx_container)"
-  live="$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null || true)"
-  served="$(docker exec "$ngx" sh -c 'cat /etc/nginx/ssl/*/fullchain.pem' 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
-  if [ -n "$ngx" ] && [ "$live" != "$served" ]; then docker restart "$ngx" >/dev/null; fi
-  ok "Сертификат ${name} действителен до $(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2); nginx отдаёт новый."
+  _cert_nginx_sync "$cert"
+  days="$(_cert_days "$cert")"
+  if [ "$days" -lt 1 ]; then err "Сертификат ${name} так и не обновился — см. вывод certbot выше."; return 1; fi
+  ok "Сертификат ${name} действителен ещё ${days} дн.; автопродление настроено."
+}
+
+# Сертификат ноды — тот, что монтирует nginx из compose; иначе — выбор из certbot.
+block_cert() {
+  local cert name
+  local -a names
+  cert="$(grep -ohE '/etc/letsencrypt/live/[^:]+/fullchain\.pem' /opt/remnanode/docker-compose.yml /opt/remnawave/docker-compose.yml 2>/dev/null | head -1 || true)"
+  if [ -z "$cert" ]; then
+    mapfile -t names < <(find /etc/letsencrypt/renewal -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//')
+    if [ "${#names[@]}" -eq 0 ]; then err "Сертификатов certbot на этой ноде нет."; return 1; fi
+    if [ "${#names[@]}" -eq 1 ]; then name="${names[0]}"
+    else choose_from_list name "Какой сертификат?" "" "${names[@]}"; fi
+    cert="/etc/letsencrypt/live/${name}/fullchain.pem"
+  fi
+  cert_maintain "$cert"
 }
 
 # Подтянуть свежий образ ноды и пересоздать контейнер (обрыв ~10 с).
@@ -2689,7 +2728,7 @@ _audit_fix_menu() {
 AUD_FREEZE_RE='soft lockup|rcu_(preempt|sched) (self-)?detected stall|rcu.*kthread starved|NETDEV WATCHDOG|TX timeout|Long readout interval|blocked for more than'
 
 _audit_system() {
-  local s1 s2 i total steal pct frz span n used ntp failed pkgs mt ma si so l1 l5
+  local s1 s2 i total steal pct frz span n used ntp failed pkgs mt ma si l1 l5 u
   step "Система"
   info "$(. /etc/os-release && echo "$PRETTY_NAME") · ядро $(uname -r) · vCPU $(nproc) · RAM $(free -m | awk '/^Mem:/ {print $2}') МБ · $(uptime -p)"
 
@@ -2722,7 +2761,12 @@ _audit_system() {
   # logrotate разбирается в разделе «Логи» — там видна причина и есть починка.
   failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' \
     | grep -vxE 'logrotate\.service|na-logrotate\.service' | paste -sd' ')"
-  if [ -n "$failed" ]; then _a_fail "Упавшие сервисы: ${failed}"; _a_hint "systemctl status <имя>"
+  if [ -n "$failed" ]; then
+    _a_fail "Упавшие сервисы: ${failed}"
+    for u in $failed; do
+      _a_hint "${u}: $(journalctl -u "$u" -b -n 30 --no-pager -o cat 2>/dev/null \
+        | grep -vE '^(Starting|Stopping|Stopped|Finished|Failed to start|.*\.service: )' | tail -1 | cut -c1-110)"
+    done
   else _a_ok "Упавших сервисов нет"; fi
 
   # Память, swap и нагрузка: при 1 vCPU и 1–2 ГБ это первое, что даёт задержки в пик.
@@ -2731,9 +2775,12 @@ _audit_system() {
   if [ "$pct" -lt 10 ]; then _a_fail "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ) — на грани OOM"
   elif [ "$pct" -lt 20 ]; then _a_warn "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ)"
   else _a_ok "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ)"; fi
-  read -r si so < <(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $7, $8}')
-  if [ $(( ${si:-0} + ${so:-0} )) -gt 0 ]; then
-    _a_warn "Идёт обмен со swap (in ${si}, out ${so} стр./с) — отсюда задержки"; _a_hint "памяти не хватает: меньше сервисов на ноде или больше RAM"
+  # Задержки даёт чтение ИЗ swap (si): процесс ждёт, пока страница вернётся с диска.
+  # Вытеснение в swap (so) при свободной памяти — ядро убирает простаивающее, это норма.
+  si="$(vmstat 1 4 2>/dev/null | tail -3 | awk '{ s += $7 } END { print int(s / 3) }')"
+  if [ "${si:-0}" -ge 10 ]; then
+    _a_warn "Идёт чтение из swap (${si} стр./с) — процессы ждут диск, отсюда задержки"
+    _a_hint "памяти не хватает: меньше сервисов на ноде или больше RAM"
   fi
   read -r l1 l5 _ < /proc/loadavg
   if awk -v l="$l5" -v n="$(nproc)" 'BEGIN { exit !(l > n) }'; then
@@ -2799,6 +2846,12 @@ _audit_network() {
     if [ "$pct" -ge 80 ]; then _a_fail "conntrack заполнен на ${pct}% (${ct}/${ctmax}) — новые соединения теряются"
     elif [ "$pct" -ge 60 ]; then _a_warn "conntrack заполнен на ${pct}% (${ct}/${ctmax})"
     else _a_ok "conntrack ${pct}% (${ct}/${ctmax})"; fi
+    # Потолок меньше 64k: каждый клиент держит десятки соединений — при росте нагрузки
+    # таблица кончится, и ядро начнёт молча дропать новые соединения.
+    if [ "$ctmax" -lt 65536 ]; then
+      _a_warn "Потолок conntrack всего ${ctmax} — при росте числа клиентов новые соединения начнут теряться"
+      _a_fix "Поднять потолок conntrack до $(_ct_max_target) (sysctl)" 0 _fix_ct_max
+    fi
   fi
 
   read -r retr outs < <(awk '/^Tcp:/ { if (!h) { for (i = 1; i <= NF; i++) c[$i] = i; h = 1 } else print $c["RetransSegs"], $c["OutSegs"] }' /proc/net/snmp)
@@ -3145,20 +3198,23 @@ _audit_camouflage() {
 # продление (certbot + Cloudflare DNS-01). Глобальный ключ Cloudflare ловим заранее:
 # продление с ним падает (9103 Unknown X-Auth-Key), а видно это только в день истечения.
 _audit_cert() {
-  local cert="$1" name conf ini end days live served ngx
+  local cert="$1" name conf ini days live served ngx fix_renew fix_setup
   name="$(basename "$(dirname "$cert")")"
   conf="/etc/letsencrypt/renewal/${name}.conf"
-  end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
-  days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+  days="$(_cert_days "$cert")"
+  # Всё про сертификат чинит одно действие (cert_maintain): из списка исправлений
+  # в него ведёт одна строка, с формулировкой под найденное.
+  fix_renew="Сертификат ${name}: продлить и наладить автопродление (спросит токен Cloudflare, если нужен; рестарт nginx ~2 с)"
+  fix_setup="Сертификат ${name}: наладить автопродление (токен Cloudflare, хук nginx, таймер) и проверить вхолостую"
   if [ "$days" -lt 0 ]; then
     _a_fail "Сертификат ${name} истёк $(( -days )) дн. назад — маскировка отдаёт просроченный, XHTTP/gRPC через TLS не подключатся"
-    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+    _a_fix "$fix_renew" 1 cert_maintain "$cert"
   elif [ "$days" -lt 14 ]; then
     _a_fail "Сертификат ${name} истекает через ${days} дн. — автопродление не сработало"
-    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+    _a_fix "$fix_renew" 1 cert_maintain "$cert"
   elif [ "$days" -lt 30 ]; then
     _a_warn "Сертификат ${name} истекает через ${days} дн. (certbot продлевает за 30 дн. — должен был начать)"
-    _a_fix "Продлить сертификат ${name} (при глобальном ключе Cloudflare спросит токен; рестарт nginx ~2 с)" 1 _fix_cert_renew "$cert"
+    _a_fix "$fix_renew" 1 cert_maintain "$cert"
   else
     _a_ok "Сертификат ${name} действителен ещё ${days} дн."
   fi
@@ -3182,20 +3238,16 @@ _audit_cert() {
   fi
   if ! systemctl is-enabled --quiet certbot.timer 2>/dev/null && ! systemctl is-active --quiet certbot.timer 2>/dev/null; then
     _a_warn "Таймер certbot выключен — сертификат сам не продлится"
-    _a_fix "Включить автопродление (certbot.timer)" 0 _fix_certbot_timer
+    _a_fix "$fix_setup" 0 cert_maintain "$cert"
   fi
   ini="$(_cf_ini "$conf")"
   if [ -n "$ini" ] && [ -f "$ini" ] && ! grep -q '^[[:space:]]*dns_cloudflare_api_token' "$ini"; then
     _a_fail "Продление через глобальный ключ Cloudflare (${ini}) — оно падает; нужен API-токен зоны"
-    _a_fix "Заменить ключ Cloudflare на API-токен зоны и проверить продление (спросит токен)" 0 _fix_cf_token "$conf"
+    _a_fix "$fix_setup" 0 cert_maintain "$cert"
   fi
-  if ! grep -q '^deploy_hook' "$conf"; then
-    _a_warn "После продления nginx не перезапускается (нет deploy_hook) — будет отдавать старый сертификат"
-    _a_fix "Прописать перезапуск nginx после продления сертификата" 0 _fix_cert_hook "$conf"
-  fi
-  # Сертификат не продлился, хотя в ini уже токен, — токен мог быть отозван или истечь.
-  if [ "$days" -lt 30 ] && [ -n "$ini" ]; then
-    _a_fix "Сменить API-токен Cloudflare и проверить продление (спросит токен)" 0 _fix_cf_token "$conf"
+  if ! _cert_hook_ok "$conf"; then
+    _a_warn "После продления nginx не перезапускается — будет отдавать старый сертификат"
+    _a_fix "$fix_setup" 0 cert_maintain "$cert"
   fi
 }
 
@@ -3453,7 +3505,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} f)${RST} Починить фаервол   ${GRY}— открыть все порты из реестра разом${RST}
    ${BOLD}${GRN} k)${RST} Порты для панели   ${GRY}— порт ноды и beszel только с IP панели${RST}
    ${BOLD}${GRN} m)${RST} MTU                ${GRY}— замерить путь и выставить MTU интерфейса${RST}
-   ${BOLD}${GRN} c)${RST} Токен Cloudflare   ${GRY}— сменить для автопродления сертификатов (с проверкой)${RST}
+   ${BOLD}${GRN} c)${RST} Сертификат ноды    ${GRY}— продлить, сменить токен Cloudflare, наладить автопродление${RST}
    ${BOLD}${GRN} s)${RST} Шейпер скорости    ${GRY}— лимиты на уровне ноды${RST}
    ${BOLD}${GRN} g)${RST} Блок РФ-госсетей   ${GRY}— прятать ноду от зондов госсетей${RST}
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
@@ -3502,7 +3554,7 @@ menu() {
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
         m|M) run_block "MTU" block_mtu ;;
-        c|C) run_block "Токен Cloudflare" block_cf_token ;;
+        c|C) run_block "Сертификат ноды" block_cert ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
