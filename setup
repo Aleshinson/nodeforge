@@ -772,6 +772,8 @@ block_logs() {
   log "Пишу /etc/logrotate.d/remnanode."
   _logrotate_release_dir /var/log/remnanode/ /etc/logrotate.d/remnanode
   # Срок хранения, заданный раньше (например, аудитом), не сбрасываем.
+  # compressoptions — без кавычек: logrotate передаёт их в zstd буквально,
+  # и тот отвечает «Incorrect parameters» — сжатие падает, несжатые логи копятся.
   keep="$(awk '$1 == "rotate" {print $2; exit}' /etc/logrotate.d/remnanode 2>/dev/null || true)"
 
   cat >/etc/logrotate.d/remnanode <<EOF
@@ -780,7 +782,7 @@ block_logs() {
     rotate ${keep:-9999}
     compress
     compresscmd /usr/bin/zstd
-    compressoptions "-19 --quiet --rm"
+    compressoptions -19 --quiet
     compressext .zst
     uncompresscmd /usr/bin/unzstd
     missingok
@@ -1333,6 +1335,10 @@ fw_init() {
     "WHITELIST=" \
     "PANEL_IPS=" \
     "PANEL_PORTS=" \
+    "CONN_LIMIT=" \
+    "SYN_RATE=" \
+    "SYN_BURST=" \
+    "ENABLE_PORTSCAN_BAN=" \
     "ENABLE_BLOCKLISTS=1" \
     "BLOCK_TOR=0"; do
     k="${kv%%=*}"; v="${kv#*=}"
@@ -1390,8 +1396,12 @@ apply_firewall() {
   if ! curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/${NA_REF}/install.sh" -o "$tmp"; then
     err "Не удалось скачать node-accelerator."; rm -f "$tmp"; return 1
   fi
+  # Пустые CONN_LIMIT/SYN_*/ENABLE_PORTSCAN_BAN = «как решил node-accelerator»
+  # (его protect.conf подставляет своё значение вместо пустого).
   SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}" NODE_PORT="${NODE_PORT:-2222}" \
   TCP_PORTS="$tcp" UDP_PORTS="$udp" WHITELIST="$wl" \
+  CONN_LIMIT="${CONN_LIMIT:-}" SYN_RATE="${SYN_RATE:-}" SYN_BURST="${SYN_BURST:-}" \
+  ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-}" \
   ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-1}" BLOCK_TOR="${BLOCK_TOR:-0}" \
   SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
     bash "$tmp" protect || warn "protect вернул ненулевой код — см. вывод выше."
@@ -2140,7 +2150,7 @@ _a_fix() {
   for i in "${!AUD_FIX_FN[@]}"; do
     if [ "${AUD_FIX_FN[$i]}" = "$3" ] && [ "${AUD_FIX_ARG[$i]}" = "${4:-}" ]; then return 0; fi
   done
-  AUD_FIX_DESC+=("$1"); AUD_FIX_COST+=("$2"); AUD_FIX_FN+=("$3"); AUD_FIX_ARG+=("${4:-}")
+  AUD_FIX_DESC+=("$1"); AUD_FIX_COST+=("$2"); AUD_FIX_FN+=("$3"); AUD_FIX_ARG+=("${4:-}"); AUD_FIX_STATE+=("")
 }
 
 # ----- Исправления, которые предлагает аудит -----
@@ -2162,7 +2172,7 @@ _fix_ntp() {
 # Последние ошибки ротации из журнала: dry-run (logrotate -d) ловит только ошибки конфига.
 _logrotate_last_errors() {
   journalctl -u logrotate.service -u na-logrotate.service -n 300 --no-pager -o cat 2>/dev/null \
-    | grep -E '^error' | tail -3 || true
+    | grep -vE '^(Starting|Started|Finished|Failed to start|.*\.service: )' | grep -v '^$' | tail -4 || true
 }
 
 # Прогнать ротацию сейчас — так видно, чинится ли она. zstd доставим, если станза его ждёт.
@@ -2264,6 +2274,149 @@ _fix_dead_location() {
   fi
 }
 
+# Свой sysctl-файл: сортируется после node-accelerator и /etc/sysctl.conf, переживает ребут.
+NF_SYSCTL=/etc/sysctl.d/99-zz-nodeforge.conf
+
+_sysctl_persist() {
+  local k="$1" v="$2" re="${1//./\\.}"
+  touch "$NF_SYSCTL"
+  if grep -qE "^${re}[[:space:]]*=" "$NF_SYSCTL"; then
+    sed -i -E "s|^${re}[[:space:]]*=.*|${k} = ${v}|" "$NF_SYSCTL"
+  else
+    printf '%s = %s\n' "$k" "$v" >> "$NF_SYSCTL"
+  fi
+  sysctl -q -w "${k}=${v}"
+}
+
+_fix_ct_timeout() {
+  _sysctl_persist net.netfilter.nf_conntrack_tcp_timeout_established 7440
+  ok "conntrack держит простаивающие TCP 2 ч 04 мин (${NF_SYSCTL})."
+}
+
+_fix_disable_ipv6() {
+  _sysctl_persist net.ipv6.conf.all.disable_ipv6 1
+  _sysctl_persist net.ipv6.conf.default.disable_ipv6 1
+  ok "IPv6 выключен (${NF_SYSCTL}): сайты открываются по IPv4 без ожидания IPv6."
+}
+
+# Время резолва домена через системный резолвер (им пользуется Xray), мс; пусто — не резолвится.
+_dns_ms() {
+  local t0 t1
+  t0="${EPOCHREALTIME/,/.}"   # в части локалей разделитель — запятая
+  resolvectl query --cache=no "$1" >/dev/null 2>&1 || return 1
+  t1="${EPOCHREALTIME/,/.}"
+  awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%d", (b - a) * 1000 }'
+}
+
+AUD_DNS_NAMES="google.com telegram.org wikipedia.org cloudflare.com"
+
+_fix_dns() {
+  local d ms
+  install -d /etc/systemd/resolved.conf.d
+  cat > /etc/systemd/resolved.conf.d/nodeforge-dns.conf <<'EOS'
+# nodeforge: резолвер ноды — Cloudflare/Google, а не DNS хостера.
+# Domains=~. — все запросы идут сюда; узкие домены netbird остаются на wt0.
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=9.9.9.9
+Domains=~.
+EOS
+  systemctl restart systemd-resolved
+  sleep 1
+  for d in $AUD_DNS_NAMES; do
+    if ms="$(_dns_ms "$d")"; then printf '   %-16s %s мс\n' "$d" "$ms"; else err "${d}: не резолвится"; return 1; fi
+  done
+  ok "Резолвер ноды: 1.1.1.1, 8.8.8.8 (/etc/systemd/resolved.conf.d/nodeforge-dns.conf)."
+}
+
+_fix_netbird_restart() {
+  systemctl restart netbird
+  sleep 8
+  if netbird status 2>/dev/null | grep -q 'Management: Connected'; then ok "netbird подключён."
+  else err "netbird не подключился — проверь: netbird status"; return 1; fi
+}
+
+_fix_nginx_restart() {
+  local ngx
+  ngx="$(_nginx_container)"
+  if [ -z "$ngx" ]; then err "Не нашёл nginx-контейнер."; return 1; fi
+  docker restart "$ngx" >/dev/null
+  sleep 2
+  ok "nginx (${ngx}) перезапущен — запусти аудит ещё раз, чтобы проверить маскировку."
+}
+
+# Подтянуть свежий образ ноды и пересоздать контейнер (обрыв ~10 с).
+_fix_node_update() {
+  require_node
+  ( cd "$NODE_DIR" && docker compose pull "$NODE_SERVICE" )
+  _fix_node_recreate
+}
+
+# compressoptions в кавычках → logrotate отдаёт их zstd буквально, сжатие падает.
+# Правим станзу и дожимаем уже накопившиеся несжатые логи в фоне.
+_fix_logrotate_opts() {
+  local f=/etc/logrotate.d/remnanode x n=0
+  cp -a "$f" "/root/logrotate.remnanode.bak-$(date +%F-%H%M)"
+  sed -i -E '/^[[:space:]]*compressoptions/ { s/"//g; s/[[:space:]]+--rm//g }' "$f"
+  for x in /var/log/remnanode/*.log-[0-9]*; do
+    case "$x" in *.zst|*.gz) continue ;; esac
+    if [ -f "$x" ]; then n=$(( n + 1 )); fi
+  done
+  if [ "$n" -gt 0 ]; then
+    systemctl stop nodeforge-zstd-backlog 2>/dev/null || true
+    systemd-run --quiet --unit=nodeforge-zstd-backlog --nice=19 -p IOSchedulingClass=idle \
+      /bin/sh -c 'for x in /var/log/remnanode/*.log-[0-9]*; do case "$x" in *.zst|*.gz) continue ;; esac; [ -f "$x" ] && zstd -q -19 --rm "$x"; done'
+    info "Дожимаю ${n} несжатых логов в фоне (низкий приоритет): systemctl status nodeforge-zstd-backlog"
+  fi
+  _fix_logrotate_run
+}
+
+# Лимиты na_filter на один IP: за CGNAT мобильного оператора сидят сотни абонентов.
+_fix_na_limits() {
+  local cur_conn cur_syn nc ns conf=/etc/node-accelerator/protect.conf
+  fw_load
+  cur_conn="${CONN_LIMIT:-$(grep -oE 'CONN_LIMIT:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"
+  cur_syn="${SYN_RATE:-$(grep -oE 'SYN_RATE:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"
+  cur_conn="${cur_conn:-2048}"; cur_syn="${cur_syn:-200}"
+  while true; do
+    ask nc "Макс. одновременных соединений с одного IP (сейчас ${cur_conn})" "$(( cur_conn * 4 ))"
+    ask ns "Новых соединений в секунду с одного IP (сейчас ${cur_syn})" "$(( cur_syn * 2 ))"
+    if is_uint "$nc" && is_uint "$ns" && [ "$nc" -ge 64 ] && [ "$ns" -ge 10 ]; then break; fi
+    warn "Нужны числа: соединений ≥ 64, в секунду ≥ 10."
+  done
+  fw_set CONN_LIMIT "$nc"
+  fw_set SYN_RATE "$ns"
+  fw_set SYN_BURST "$(( ns * 2 ))"
+  apply_firewall
+}
+
+# IP клиентов попали в бан: снять, внести в allowlist CrowdSec; автобан за скан — по желанию.
+_fix_unban_clients() {
+  local ip left=""
+  for ip in ${1//,/ }; do
+    nft delete element inet na_filter autoban_v4 "{ ${ip} }" 2>/dev/null || true
+    nft delete element inet na_filter suspect_v4 "{ ${ip} }" 2>/dev/null || true
+    if command -v cscli >/dev/null 2>&1; then
+      cscli decisions delete --ip "$ip" >/dev/null 2>&1 || true
+      if cscli allowlists list >/dev/null 2>&1; then
+        cscli allowlists inspect nodeforge-clients >/dev/null 2>&1 \
+          || cscli allowlists create nodeforge-clients -d "nodeforge: IP клиентов VPN" >/dev/null
+        cscli allowlists add nodeforge-clients "$ip" >/dev/null 2>&1 || true
+      else
+        left="${left:+${left},}${ip}"
+      fi
+    fi
+  done
+  ok "Баны сняты: ${1}."
+  if [ -n "$left" ]; then warn "CrowdSec без allowlists: ${left} может вернуться при синхронизации общего списка."; fi
+  fw_load
+  if [ "${ENABLE_PORTSCAN_BAN:-1}" != 0 ] \
+     && confirm "Выключить автобан за скан портов? Он банит весь общий IP оператора из-за одного абонента"; then
+    fw_set ENABLE_PORTSCAN_BAN 0
+    apply_firewall
+  fi
+}
+
 _fix_reboot() {
   warn "Перезагрузка оборвёт всех пользователей этой ноды примерно на минуту."
   if ! confirm "Нода снята с балансировки — перезагрузить сейчас?"; then warn "Перезагрузку отложил."; return 0; fi
@@ -2271,13 +2424,27 @@ _fix_reboot() {
   systemctl reboot
 }
 
-# Список исправлений → выбор → выполнение: без простоя, потом с обрывом, перезагрузка последней.
-_audit_offer_fixes() {
-  local i n c cost choice label rc
-  local -a sel=()
-  n="${#AUD_FIX_FN[@]}"
-  if [ "$n" -eq 0 ]; then return 0; fi
+# Выполнить исправления по порядку простоя: без простоя → обрыв → перезагрузка.
+_audit_fix_many() {
+  local cost i rc
+  for cost in 0 1 2; do
+    for i in "$@"; do
+      if [ "${AUD_FIX_COST[$i]}" != "$cost" ]; then continue; fi
+      echo
+      step "${AUD_FIX_DESC[$i]}"
+      # Код возврата — отдельной строкой: под if/! bash молча выключает set -e в подоболочке.
+      ( set -eo pipefail; "${AUD_FIX_FN[$i]}" ${AUD_FIX_ARG[$i]:+"${AUD_FIX_ARG[$i]}"} )
+      rc=$?
+      if [ "$rc" -eq 0 ]; then AUD_FIX_STATE[i]=ok
+      else AUD_FIX_STATE[i]=fail; err "Не получилось: ${AUD_FIX_DESC[$i]} (код ${rc}, см. вывод выше)."; fi
+    done
+  done
+}
+
+_audit_fix_list() {
+  local i label mark
   echo
+  if [ "${#AUD_FIX_FN[@]}" -eq 0 ]; then ok "Чинить скриптом нечего."; return 0; fi
   step "Можно починить скриптом"
   for i in "${!AUD_FIX_FN[@]}"; do
     case "${AUD_FIX_COST[$i]}" in
@@ -2285,39 +2452,69 @@ _audit_offer_fixes() {
       1) label="${YLW}короткий обрыв${RST}" ;;
       *) label="${RED}перезагрузка — сними ноду с балансировки${RST}" ;;
     esac
-    printf '   %s%2d)%s %s  — %s\n' "$BOLD" "$(( i + 1 ))" "$RST" "${AUD_FIX_DESC[$i]}" "$label"
+    case "${AUD_FIX_STATE[$i]}" in
+      ok)   mark="${GRN}✓ сделано${RST}  " ;;
+      fail) mark="${RED}✗ не вышло${RST}  " ;;
+      *)    mark="" ;;
+    esac
+    printf '   %s%2d)%s %s%s  — %s\n' "$BOLD" "$(( i + 1 ))" "$RST" "$mark" "${AUD_FIX_DESC[$i]}" "$label"
   done
-  if [ ! -t 0 ]; then info "Нет терминала — только список."; return 0; fi
-  read -rp "Номера через пробел, «s» — всё без простоя, Enter — ничего: " choice
-  case "$choice" in
-    ""|0) return 0 ;;
-    s|S) for i in "${!AUD_FIX_FN[@]}"; do if [ "${AUD_FIX_COST[$i]}" = 0 ]; then sel+=("$i"); fi; done ;;
-    *)
-      for c in $choice; do
-        if is_uint "$c" && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then sel+=("$(( c - 1 ))")
-        else warn "Нет пункта ${c} — пропускаю."; fi
-      done ;;
-  esac
-  for cost in 0 1 2; do
-    for i in "${sel[@]}"; do
-      if [ "${AUD_FIX_COST[$i]}" != "$cost" ]; then continue; fi
-      echo
-      step "${AUD_FIX_DESC[$i]}"
-      # Код возврата — отдельной строкой: под if/! bash молча выключает set -e в подоболочке.
-      ( set -eo pipefail; "${AUD_FIX_FN[$i]}" ${AUD_FIX_ARG[$i]:+"${AUD_FIX_ARG[$i]}"} )
-      rc=$?
-      if [ "$rc" -ne 0 ]; then err "Не получилось: ${AUD_FIX_DESC[$i]} (код ${rc}, см. вывод выше)."; fi
-    done
+}
+
+# Меню починки: после каждого исправления — обратно к списку, а не в главное меню.
+_audit_fix_menu() {
+  local i n c choice brief reboot
+  local -a sel
+  while true; do
+    _audit_fix_list
+    n="${#AUD_FIX_FN[@]}"
+    if [ ! -t 0 ]; then return 0; fi
+    echo
+    if [ "$n" -gt 0 ]; then
+      echo "   ${BOLD}${GRN} a)${RST} Починить всё, что ещё не сделано"
+      echo "   ${BOLD}${GRN} s)${RST} Только то, что без простоя"
+    fi
+    echo "   ${BOLD}${CYN} r)${RST} Провести аудит ещё раз"
+    echo "   ${BOLD}${RED} 0)${RST} Выйти в главное меню"
+    read -rp "Номера через пробел или буква: " choice
+    sel=()
+    case "$choice" in
+      ""|0) return 0 ;;
+      r|R|к|К) _audit_run; continue ;;
+      a|A|ф|Ф)
+        brief=0; reboot=0
+        for i in "${!AUD_FIX_FN[@]}"; do
+          if [ -n "${AUD_FIX_STATE[$i]}" ]; then continue; fi
+          sel+=("$i")
+          if [ "${AUD_FIX_COST[$i]}" = 1 ]; then brief=$(( brief + 1 )); fi
+          if [ "${AUD_FIX_COST[$i]}" = 2 ]; then reboot=1; fi
+        done
+        if [ $(( brief + reboot )) -gt 0 ] \
+           && ! confirm "В списке ${brief} исправл. с коротким обрывом$( [ "$reboot" = 1 ] && printf ' и перезагрузка' ) — выполнить всё?"; then
+          continue
+        fi ;;
+      s|S|ы|Ы)
+        for i in "${!AUD_FIX_FN[@]}"; do
+          if [ -z "${AUD_FIX_STATE[$i]}" ] && [ "${AUD_FIX_COST[$i]}" = 0 ]; then sel+=("$i"); fi
+        done ;;
+      *)
+        for c in $choice; do
+          if is_uint "$c" && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then sel+=("$(( c - 1 ))")
+          else warn "Нет пункта ${c} — пропускаю."; fi
+        done ;;
+    esac
+    if [ "${#sel[@]}" -eq 0 ]; then warn "Нечего выполнять."; continue; fi
+    _audit_fix_many "${sel[@]}"
+    echo
+    read -rp "Enter — вернуться к списку исправлений..." _
   done
-  echo
-  info "Готово. Запусти аудит ещё раз (a), чтобы убедиться."
 }
 
 # Признаки того, что ВМ стояла: ядро не получало CPU или сетевая карта не отвечала.
 AUD_FREEZE_RE='soft lockup|rcu_(preempt|sched) (self-)?detected stall|rcu.*kthread starved|NETDEV WATCHDOG|TX timeout|Long readout interval|blocked for more than'
 
 _audit_system() {
-  local s1 s2 i total steal pct frz span n used ntp failed pkgs
+  local s1 s2 i total steal pct frz span n used ntp failed pkgs mt ma si so l1 l5
   step "Система"
   info "$(. /etc/os-release && echo "$PRETTY_NAME") · ядро $(uname -r) · vCPU $(nproc) · RAM $(free -m | awk '/^Mem:/ {print $2}') МБ · $(uptime -p)"
 
@@ -2353,6 +2550,23 @@ _audit_system() {
   if [ -n "$failed" ]; then _a_fail "Упавшие сервисы: ${failed}"; _a_hint "systemctl status <имя>"
   else _a_ok "Упавших сервисов нет"; fi
 
+  # Память, swap и нагрузка: при 1 vCPU и 1–2 ГБ это первое, что даёт задержки в пик.
+  read -r mt ma < <(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {print t, a}' /proc/meminfo)
+  pct=$(( mt > 0 ? ma * 100 / mt : 100 ))
+  if [ "$pct" -lt 10 ]; then _a_fail "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ) — на грани OOM"
+  elif [ "$pct" -lt 20 ]; then _a_warn "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ)"
+  else _a_ok "Свободно памяти ${pct}% ($(( ma / 1024 )) МБ)"; fi
+  read -r si so < <(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $7, $8}')
+  if [ $(( ${si:-0} + ${so:-0} )) -gt 0 ]; then
+    _a_warn "Идёт обмен со swap (in ${si}, out ${so} стр./с) — отсюда задержки"; _a_hint "памяти не хватает: меньше сервисов на ноде или больше RAM"
+  fi
+  read -r l1 l5 _ < /proc/loadavg
+  if awk -v l="$l5" -v n="$(nproc)" 'BEGIN { exit !(l > n) }'; then
+    _a_warn "Нагрузка ${l5} при $(nproc) vCPU — процессор не успевает"; _a_hint "смотри top: xray, сжатие логов, соседи (CPU steal)"
+  else
+    _a_ok "Нагрузка ${l1} / ${l5} (1 и 5 мин) при $(nproc) vCPU"
+  fi
+
   used="$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9)"
   if [ "${used:-0}" -ge 90 ]; then _a_fail "Диск / заполнен на ${used}%"
   elif [ "${used:-0}" -ge 80 ]; then _a_warn "Диск / заполнен на ${used}%"
@@ -2381,7 +2595,7 @@ _audit_system() {
 }
 
 _audit_network() {
-  local cc qd probing ct ctmax pct retr outs rp drops d
+  local cc qd probing ct ctmax pct retr outs rp drops d ctt uin urb dns_srv dns_sum dns_n dns_bad ms
   step "Сеть и MTU"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
@@ -2423,6 +2637,59 @@ _audit_network() {
   while read -r _ d _; do drops=$(( drops + 16#$d )); done < /proc/net/softnet_stat
   if [ "$drops" -gt 0 ]; then _a_warn "Ядро отбросило ${drops} входящих пакетов (очередь softnet)"; _a_hint "netdev_max_backlog / RPS — пункт 2) optimize"
   else _a_ok "Очередь softnet без потерь"; fi
+
+  # conntrack «забывает» TCP, молчавший дольше таймаута; следующий пакет такого
+  # соединения na_filter считает invalid и молча дропает — мессенджер висит.
+  ctt="$(cat /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null)"
+  if [ -n "$ctt" ]; then
+    if [ "$ctt" -lt 3600 ]; then
+      _a_fail "conntrack забывает простаивающие TCP через $(( ctt / 60 )) мин — молчащие мессенджеры отваливаются"
+      _a_fix "Держать простаивающие TCP в conntrack 2 ч (sysctl)" 0 _fix_ct_timeout
+    else
+      _a_ok "conntrack держит простаивающие TCP $(( ctt / 3600 )) ч"
+    fi
+  fi
+
+  # UDP: звонки, видео и игры через VPN. Переполнение приёмного буфера = потери голоса.
+  read -r uin urb < <(awk '/^Udp:/ { if (!h) { for (i = 1; i <= NF; i++) c[$i] = i; h = 1 } else print $c["InDatagrams"], $c["RcvbufErrors"] }' /proc/net/snmp)
+  if [ "${uin:-0}" -gt 0 ]; then
+    if [ $(( urb * 1000 / uin )) -ge 1 ]; then
+      _a_warn "UDP теряется на приёме: ${urb} пакетов ($(awk -v a="$urb" -v b="$uin" 'BEGIN { printf "%.2f", a * 100 / b }')%) — рвутся звонки и видео"
+      _a_hint "буферы сокетов (rmem_default/rmem_max) — пункт 2) optimize"
+    else
+      _a_ok "UDP без потерь на приёме"
+    fi
+  fi
+
+  # IPv6: адрес есть, а маршрута нет — соединения на IPv6-адреса сайтов висят.
+  if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+    if curl -6 -fsS -m 5 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+      _a_ok "IPv6 работает"
+    else
+      _a_fail "IPv6-адрес есть, а в интернет по IPv6 не выйти — соединения на IPv6-адреса сайтов висят"
+      _a_fix "Выключить IPv6 на ноде (sysctl, сайты пойдут по IPv4)" 0 _fix_disable_ipv6
+    fi
+  else
+    _a_ok "IPv6 не настроен — задержек от него нет"
+  fi
+
+  # DNS: Xray резолвит сайты системным резолвером — медленный DNS = каждый сайт открывается с паузой.
+  if command -v resolvectl >/dev/null 2>&1; then
+    dns_srv="$(resolvectl status 2>/dev/null | awk -F': ' '/Current DNS Server/ {print $2}' | sort -u | paste -sd' ')"
+    dns_sum=0 dns_n=0 dns_bad=""
+    for d in $AUD_DNS_NAMES; do
+      if ms="$(_dns_ms "$d")"; then dns_sum=$(( dns_sum + ms )); dns_n=$(( dns_n + 1 )); else dns_bad="${dns_bad:+${dns_bad} }${d}"; fi
+    done
+    if [ -n "$dns_bad" ]; then
+      _a_fail "DNS ноды (${dns_srv:-?}) не резолвит: ${dns_bad}"
+      _a_fix "Резолвер ноды → 1.1.1.1 и 8.8.8.8" 0 _fix_dns
+    elif [ "$dns_n" -gt 0 ] && [ $(( dns_sum / dns_n )) -ge 150 ]; then
+      _a_warn "DNS ноды (${dns_srv:-?}) медленный: в среднем $(( dns_sum / dns_n )) мс на запрос — каждый новый сайт ждёт"
+      _a_fix "Резолвер ноды → 1.1.1.1 и 8.8.8.8" 0 _fix_dns
+    elif [ "$dns_n" -gt 0 ]; then
+      _a_ok "DNS ноды (${dns_srv:-?}): в среднем $(( dns_sum / dns_n )) мс без кэша"
+    fi
+  fi
 }
 
 # Задержка, джиттер и потери до опорных точек. До Cloudflare (anycast) из дата-центра
@@ -2537,6 +2804,11 @@ _audit_firewall() {
     _a_fix "Порты ${ports} — только для IP панели (подскажет, кто сейчас подключён)" 0 block_panel_only
   fi
 
+  if nft list table inet na_filter >/dev/null 2>&1; then
+    _audit_cgnat_limits
+    _audit_banned_clients
+  fi
+
   # Без na_filter наружу открыто всё, что слушает; показываем то, чего нет в реестре.
   if ! nft list table inet na_filter >/dev/null 2>&1; then
     open=""
@@ -2548,6 +2820,54 @@ _audit_firewall() {
       open="${open:+${open},}${p}"
     done
     if [ -n "$open" ]; then _a_warn "Без na_filter из интернета доступны TCP-порты вне реестра: ${open}"; fi
+  fi
+}
+
+# За CGNAT мобильного оператора с одного IP сидят сотни абонентов. na_filter режет
+# всё сверх CONN_LIMIT одновременных и SYN_RATE новых соединений в секунду с одного IP —
+# и у всех абонентов оператора разом начинаются обрывы.
+_audit_cgnat_limits() {
+  local conf=/etc/node-accelerator/protect.conf limit syn peak peak_ip syn_src
+  limit="${CONN_LIMIT:-$(grep -oE 'CONN_LIMIT:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"; limit="${limit:-2048}"
+  syn="${SYN_RATE:-$(grep -oE 'SYN_RATE:=[0-9]+' "$conf" 2>/dev/null | cut -d= -f2)}"; syn="${syn:-200}"
+  read -r peak peak_ip < <(ss -Htn state established '( sport = :443 )' 2>/dev/null \
+    | awk '{print $4}' | sed -E 's/^\[?(::ffff:)?//; s/\]?:[0-9]+$//' | sort | uniq -c | sort -rn | head -1)
+  syn_src="$(journalctl -k --since '-24 hours' --no-pager 2>/dev/null | grep -F '[na synflood]' | grep -oE 'SRC=[0-9.]+' | sort -u | wc -l)"
+  if [ "${peak:-0}" -ge $(( limit * 8 / 10 )) ]; then
+    _a_fail "С одного IP (${peak_ip}) ${peak} соединений при лимите ${limit} — абоненты этого оператора упираются в лимит"
+    _a_fix "Поднять лимиты na_filter на один IP (соединения и SYN/с)" 0 _fix_na_limits
+  elif [ "${peak:-0}" -ge $(( limit / 2 )) ]; then
+    _a_warn "С одного IP (${peak_ip}) ${peak} соединений — половина лимита ${limit}"
+    _a_fix "Поднять лимиты na_filter на один IP (соединения и SYN/с)" 0 _fix_na_limits
+  else
+    _a_ok "Пик соединений с одного IP: ${peak:-0} из лимита ${limit}"
+  fi
+  if [ "${syn_src:-0}" -ge 3 ]; then
+    _a_warn "SYN-лимит (${syn}/с на IP) сработал за сутки для ${syn_src} адресов — это могут быть CGNAT операторов"
+    _a_fix "Поднять лимиты na_filter на один IP (соединения и SYN/с)" 0 _fix_na_limits
+  fi
+}
+
+# Баны, под которые попали IP, с которых сегодня реально ходили клиенты: автобан
+# na_filter (скан портов одним абонентом банит весь общий IP) и CrowdSec.
+_audit_banned_clients() {
+  local L=/var/log/remnanode/access.log clients banned hit
+  [ -f "$L" ] || return 0
+  clients="$(mktemp)"; banned="$(mktemp)"
+  tail -n 300000 "$L" | grep ' accepted ' | grep -oE 'from (tcp:|udp:)?([0-9]{1,3}\.){3}[0-9]{1,3}:' \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$clients"
+  { nft list set inet na_filter autoban_v4 2>/dev/null
+    nft list set inet na_filter suspect_v4 2>/dev/null
+    nft list table ip crowdsec 2>/dev/null
+  } | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$banned"
+  hit="$(comm -12 "$clients" "$banned" | head -20 | paste -sd,)"
+  rm -f "$clients" "$banned"
+  if [ -n "$hit" ]; then
+    _a_fail "В бане IP, с которых сегодня ходили клиенты: ${hit}"
+    _a_hint "за общим IP оператора — много абонентов; бан одного = обрыв у всех"
+    _a_fix "Снять баны с IP клиентов (и внести в allowlist CrowdSec)" 0 _fix_unban_clients "$hit"
+  else
+    _a_ok "Среди забаненных нет IP сегодняшних клиентов"
   fi
 }
 
@@ -2566,15 +2886,23 @@ _audit_logs() {
     _a_ok "Конфиг logrotate без ошибок"
   fi
 
-  # 2) сама ротация: падает и при чистом конфиге (нет zstd, архив уже есть…)
+  # 2) параметры сжатия в кавычках: logrotate отдаёт их zstd буквально → «Incorrect parameters»
+  if grep -qE '^[[:space:]]*compressoptions[[:space:]]+"' /etc/logrotate.d/remnanode 2>/dev/null; then
+    _a_fail "compressoptions в станзе ноды в кавычках — zstd их не понимает, логи не сжимаются и копятся"
+    _a_fix "Исправить compressoptions и дожать несжатые логи (в фоне, низкий приоритет)" 0 _fix_logrotate_opts
+  fi
+
+  # 3) сама ротация: падает и при чистом конфиге (нет zstd, архив уже есть…)
   if systemctl is-failed --quiet logrotate.service || systemctl is-failed --quiet na-logrotate.service; then
     lerr="$(_logrotate_last_errors)"
     _a_fail "Ротация логов падает${lerr:+:}"
     if [ -n "$lerr" ]; then printf '%s\n' "$lerr" | sed 's/^/      /' >&2; fi
-    _a_fix "Прогнать ротацию заново (доставит zstd, если его нет) и показать ошибку" 0 _fix_logrotate_run
+    if ! grep -qE '^[[:space:]]*compressoptions[[:space:]]+"' /etc/logrotate.d/remnanode 2>/dev/null; then
+      _a_fix "Прогнать ротацию заново (доставит zstd, если его нет) и показать ошибку" 0 _fix_logrotate_run
+    fi
   fi
 
-  # 3) размер: гигантский текущий лог = ротация не срабатывает; много архивов = хранятся вечно
+  # 4) размер: гигантский текущий лог = ротация не срабатывает; много архивов = хранятся вечно
   if [ -d /var/log/remnanode ]; then
     dir_mb="$(du -sm /var/log/remnanode 2>/dev/null | cut -f1)"
     big="$(find /var/log/remnanode -maxdepth 1 -name '*.log' -size +500M 2>/dev/null | head -1)"
@@ -2590,6 +2918,96 @@ _audit_logs() {
     fi
   fi
   info "journald: $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1)"
+}
+
+# Панель держит соединение с портом ноды: без него новые ключи и продления на ноду
+# не доходят (старые ключи работают — поэтому поломку долго не видно).
+_audit_panel_link() {
+  local np peers
+  np="${NODE_PORT:-$(grep -oE 'NODE_PORT=[0-9]+' "${NODE_DIR}/docker-compose.yml" 2>/dev/null | head -1 | cut -d= -f2)}"
+  np="${np:-2222}"
+  if command -v netbird >/dev/null 2>&1; then
+    if netbird status 2>/dev/null | grep -q 'Management: Connected'; then _a_ok "netbird на связи"
+    else
+      _a_fail "netbird не подключён к управлению — панель по netbird ноду не видит"
+      _a_fix "Перезапустить netbird (панель на пару секунд потеряет ноду; клиенты — нет)" 0 _fix_netbird_restart
+    fi
+  fi
+  peers="$(_panel_peers "$np")"
+  if [ -n "$peers" ]; then _a_ok "Панель на связи с нодой (${peers} → порт ${np})"
+  else
+    _a_fail "К порту ноды ${np} никто не подключён — панель не видит ноду: новые ключи и продления сюда не доходят"
+    _a_hint "проверь статус ноды в панели и docker logs ${NODE_CONTAINER}"
+  fi
+}
+
+# Маскировка Reality: чужой клиент (и зонд DPI) на 443 с нашим SNI должен увидеть
+# настоящий сайт — валидный сертификат и страницу. Иначе IP быстро вычисляют.
+_audit_camouflage() {
+  local f="$1" sni code
+  sni="$(awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$f")"
+  [ -n "$sni" ] || return 0
+  code="$(curl -sS -m 8 -o /dev/null -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)"
+  case "$code" in
+    2??|3??) _a_ok "Маскировка: https://${sni} на этой ноде отвечает ${code}, сертификат валиден" ;;
+    000|"")
+      _a_fail "Маскировка: на 443 с SNI ${sni} нет TLS с валидным сертификатом — снаружи нода не похожа на сайт"
+      _a_fix "Перезапустить nginx маскировки (~2 с)" 1 _fix_nginx_restart ;;
+    *) _a_warn "Маскировка: https://${sni} отвечает ${code} — живой сайт отдаёт 200"
+       _a_hint "положи страницу в /var/www/html (index.html)" ;;
+  esac
+}
+
+# Свежесть образа ноды: сравниваем digest запущенного образа с тегом на Docker Hub.
+_audit_node_image() {
+  local c="$1" ref repo tag img local_d remote remote_d remote_date created
+  ref="$(docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null)"
+  img="$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)"
+  [ -n "$ref" ] && [ -n "$img" ] || return 0
+  repo="${ref%%:*}"; tag="${ref#*:}"; [ "$tag" = "$ref" ] && tag=latest
+  created="$(docker image inspect -f '{{.Created}}' "$img" 2>/dev/null | cut -c1-10)"
+  local_d="$(docker image inspect -f '{{join .RepoDigests " "}}' "$img" 2>/dev/null | grep -oE 'sha256:[0-9a-f]+' | head -1)"
+  remote="$(curl -fsS -m 8 "https://hub.docker.com/v2/repositories/${repo}/tags/${tag}" 2>/dev/null)"
+  remote_d="$(printf '%s' "$remote" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("digest") or "")' 2>/dev/null)"
+  remote_date="$(printf '%s' "$remote" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("last_updated") or "")[:10])' 2>/dev/null)"
+  if [ -z "$remote_d" ] || [ -z "$local_d" ]; then
+    info "Образ ноды ${ref} от ${created:-?} (сверить с Docker Hub не удалось)"
+  elif [ "$remote_d" != "$local_d" ]; then
+    _a_warn "Есть новая версия ноды: ${ref} от ${remote_date}, у тебя сборка от ${created}"
+    _a_fix "Обновить ноду до свежего ${ref} (pull + пересоздание, обрыв ~10 с)" 1 _fix_node_update
+  else
+    _a_ok "Образ ноды актуален: ${ref} от ${created}"
+  fi
+}
+
+# Xray за последний час: доля отказов и частые ошибки — где именно рвётся.
+_audit_xray_log() {
+  local L=/var/log/remnanode/access.log E=/var/log/remnanode/error.log since tmp acc rej top
+  [ -f "$L" ] || return 0
+  since="$(date -u -d '-1 hour' '+%Y/%m/%d %H:%M')"   # Xray пишет время в UTC
+  tmp="$(mktemp)"
+  tail -n 400000 "$L" | awk -v t="$since" '($1 " " substr($2, 1, 5)) >= t' > "$tmp"
+  acc="$(grep -c ' accepted ' "$tmp")"; rej="$(grep -c ' rejected ' "$tmp")"
+  top="$(grep ' rejected ' "$tmp" | sed -E 's/.* rejected +//; s/([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?/IP/g; s/[0-9a-f-]{36}/UUID/g' \
+    | cut -c1-70 | sort | uniq -c | sort -rn | head -3 | sed -E 's/^ *//')"
+  rm -f "$tmp"
+  if [ $(( acc + rej )) -eq 0 ]; then info "Xray за час: соединений нет"
+  elif [ $(( rej * 100 / (acc + rej) )) -ge 5 ]; then
+    _a_warn "Xray за час: принято ${acc}, отклонено ${rej} ($(( rej * 100 / (acc + rej) ))%)"
+    printf '%s\n' "$top" | sed 's/^/      /' >&2
+    _a_hint "invalid request user id — удалённые/просроченные ключи или сканеры; остальное — смотри текст"
+  else
+    _a_ok "Xray за час: принято ${acc}, отклонено ${rej}"
+  fi
+  if [ -s "$E" ]; then
+    rej="$(awk -v t="$since" '($1 " " substr($2, 1, 5)) >= t' "$E" | wc -l)"
+    if [ "$rej" -ge 50 ]; then
+      _a_warn "error.log Xray за час: ${rej} записей, чаще всего:"
+      awk -v t="$since" '($1 " " substr($2, 1, 5)) >= t' "$E" | cut -d' ' -f3- \
+        | sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?/IP/g; s/[0-9]+/N/g' | cut -c1-90 \
+        | sort | uniq -c | sort -rn | head -3 | sed -E 's/^ */      /' >&2
+    fi
+  fi
 }
 
 _audit_node() {
@@ -2611,9 +3029,13 @@ _audit_node() {
     else _a_ok "Контейнер ${c} работает с $(date -d "$started" '+%F %H:%M' 2>/dev/null) (перезапусков: ${rc})"; fi
   done
 
+  _audit_panel_link
+  _audit_node_image "${ctr:-$NODE_CONTAINER}"
+
   if pgrep -x rw-core >/dev/null; then
     age="$(ps -o etimes= -p "$(pgrep -xo rw-core)" | tr -d ' ')"
     info "Xray (rw-core) работает $(( age / 3600 )) ч — перезапускается и при смене профиля в панели"
+    _audit_xray_log
   else
     _a_fail "Xray (rw-core) не запущен — нода не обслуживает клиентов"
     _a_fix "Поднять стек ноды по compose (docker compose up -d)" 1 _fix_node_recreate
@@ -2624,6 +3046,7 @@ _audit_node() {
     if grep -q 'nginx.sock' "$f"; then
       if [ -S /dev/shm/nginx.sock ]; then _a_ok "Фолбэк Reality → nginx.sock на месте"
       else _a_fail "Reality отдаёт фолбэк в /dev/shm/nginx.sock, а сокета нет — маскировка сломана"; fi
+      _audit_camouflage "$f"
     fi
     while read -r sock; do
       if [ -S "$sock" ]; then _a_ok "nginx → ${sock}: инбаунд слушает"
@@ -2661,12 +3084,12 @@ _audit_node() {
   esac
 }
 
-block_audit() {
-  # Только чтение: одна упавшая проверка не должна обрывать весь отчёт.
-  set +e
-  local AUD_WARN=0 AUD_FAIL=0
-  local -a AUD_FIX_DESC=() AUD_FIX_COST=() AUD_FIX_FN=() AUD_FIX_ARG=()
-  info "Аудит ноды: проверка только читает, около минуты (замеры MTU и маршрутов). Починка — в конце, по выбору."
+# Все проверки заново: счётчики и список исправлений собираются с нуля.
+_audit_run() {
+  AUD_WARN=0 AUD_FAIL=0
+  AUD_FIX_DESC=() AUD_FIX_COST=() AUD_FIX_FN=() AUD_FIX_ARG=() AUD_FIX_STATE=()
+  echo
+  info "Аудит ноды: проверка только читает, 1–2 минуты (замеры MTU, маршрутов, DNS). Починка — в конце, по выбору."
   _audit_system
   _audit_network
   _audit_routes
@@ -2679,7 +3102,15 @@ block_audit() {
   if [ "$AUD_FAIL" -gt 0 ]; then err "Итог: проблем ${AUD_FAIL}, предупреждений ${AUD_WARN}."
   elif [ "$AUD_WARN" -gt 0 ]; then warn "Итог: проблем нет, предупреждений ${AUD_WARN}."
   else ok "Итог: всё в порядке."; fi
-  _audit_offer_fixes
+}
+
+block_audit() {
+  # Только чтение: одна упавшая проверка не должна обрывать весь отчёт.
+  set +e
+  local AUD_WARN AUD_FAIL
+  local -a AUD_FIX_DESC AUD_FIX_COST AUD_FIX_FN AUD_FIX_ARG AUD_FIX_STATE
+  _audit_run
+  _audit_fix_menu
   return 0
 }
 
