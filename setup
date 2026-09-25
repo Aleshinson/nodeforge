@@ -2307,7 +2307,75 @@ _fix_ct_max() {
   ok "Потолок conntrack: ${v} (${NF_SYSCTL})."
 }
 
+# Файлы ifupdown с живой секцией «iface <имя> inet6». Если IPv6 выключен, ifup при загрузке
+# падает на ней («IPv6 is disabled on this device»): IPv4 к этому моменту уже поднят, но
+# ifup@<имя> помечается упавшим, а networking.service — следом («Address already assigned»).
+_ifupdown_inet6_files() {
+  if ! command -v ifquery >/dev/null 2>&1; then return 0; fi
+  grep -lE '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6([[:space:]]|$)' \
+    /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true
+}
+
+# Интерфейсы, на которые ifupdown поднимает IPv6, хотя IPv6 на них выключен.
+_ifupdown_inet6_blocked() {
+  local ifc
+  local -a files
+  mapfile -t files < <(_ifupdown_inet6_files)
+  if [ "${#files[@]}" -eq 0 ]; then return 0; fi
+  awk '$1 == "iface" && $3 == "inet6" { print $2 }' "${files[@]}" | sort -u | while read -r ifc; do
+    if [ ! -d /proc/sys/net/ipv6 ] || [ "$(cat "/proc/sys/net/ipv6/conf/${ifc}/disable_ipv6" 2>/dev/null)" = 1 ]; then
+      printf '%s\n' "$ifc"
+    fi
+  done
+}
+
+# Закомментировать секции inet6 с меткой; IPv4-секции и строки auto не трогаются, сеть не
+# перезапускается — правка действует со следующей загрузки. Копии кладём в /root/nodeforge-bak,
+# а не рядом: `source /etc/network/interfaces.d/*` подхватил бы копию как настройки.
+NF_IN6_MARK='#nodeforge-ipv6-off# '
+
+_ifupdown_inet6_off() {
+  local bak=/root/nodeforge-bak tmp i ifc good=1
+  local -a files ifcs saved
+  mapfile -t files < <(_ifupdown_inet6_files)
+  if [ "${#files[@]}" -eq 0 ]; then return 0; fi
+  mapfile -t ifcs < <(awk '$1 == "iface" && $3 == "inet6" { print $2 }' "${files[@]}" | sort -u)
+  mkdir -p "$bak"
+  for i in "${!files[@]}"; do
+    saved[i]="${bak}/$(basename "${files[i]}").$(date +%F-%H%M%S)"
+    cp -a "${files[i]}" "${saved[i]}"
+    tmp="$(mktemp)"
+    awk -v mark="$NF_IN6_MARK" '
+      $1 ~ /^(iface|auto|allow-.+|mapping|source|source-directory|rename|no-auto-down|no-scripts)$/ {
+        off = ($1 == "iface" && $3 == "inet6")
+      }
+      off && !/^[[:space:]]*(#|$)/ { print mark $0; next }
+      { print }' "${files[i]}" > "$tmp"
+    cat "$tmp" > "${files[i]}"
+    rm -f "$tmp"
+  done
+  # Правка не должна ломать разбор и оставлять интерфейс без IPv4-секции.
+  ifquery --list >/dev/null 2>&1 || good=0
+  for ifc in "${ifcs[@]}"; do ifquery "$ifc" >/dev/null 2>&1 || good=0; done
+  if [ "$good" -eq 0 ]; then
+    for i in "${!files[@]}"; do cat "${saved[i]}" > "${files[i]}"; done
+    err "Без IPv6-секций ifupdown не видит настроек ${ifcs[*]} — вернул как было (копии в ${bak})."
+    return 1
+  fi
+  ok "IPv6 в настройках сети ${ifcs[*]} закомментирован (метка «${NF_IN6_MARK% }», ${files[*]}); копии — в ${bak}."
+}
+
+_fix_ifupdown_inet6() {
+  _ifupdown_inet6_off
+  # Отметку об ошибке этой загрузки снимаем: причина устранена, IPv4 работает. Запускать
+  # networking заново нельзя — ifup споткнётся об уже назначенный IPv4 и уронит его снова.
+  systemctl reset-failed networking.service 'ifup@*.service' 2>/dev/null || true
+  ok "Со следующей загрузки сеть поднимается без ошибок; перезагружать сейчас не нужно."
+}
+
 _fix_disable_ipv6() {
+  # Сначала настройки ifupdown: иначе на следующей загрузке ifup упадёт на IPv6-адресе.
+  _ifupdown_inet6_off
   _sysctl_persist net.ipv6.conf.all.disable_ipv6 1
   _sysctl_persist net.ipv6.conf.default.disable_ipv6 1
   ok "IPv6 выключен (${NF_SYSCTL}): сайты открываются по IPv4 без ожидания IPv6."
@@ -2765,7 +2833,8 @@ _audit_system() {
     _a_fail "Упавшие сервисы: ${failed}"
     for u in $failed; do
       _a_hint "${u}: $(journalctl -u "$u" -b -n 30 --no-pager -o cat 2>/dev/null \
-        | grep -vE '^(Starting|Stopping|Stopped|Finished|Failed to start|.*\.service: )' | tail -1 | cut -c1-110)"
+        | grep -vE '^(Starting|Stopping|Stopped|Finished|Failed to start|.*\.service: )' \
+        | awk '/[Ee]rror/ { e = $0 } { l = $0 } END { print (e != "" ? e : l) }' | cut -c1-110)"
     done
   else _a_ok "Упавших сервисов нет"; fi
 
@@ -2817,7 +2886,7 @@ _audit_system() {
 }
 
 _audit_network() {
-  local cc qd probing ct ctmax pct retr outs rp drops d ctt uin urb dns_srv dns_sum dns_n dns_bad ms
+  local cc qd probing ct ctmax pct retr outs rp drops d ctt uin urb in6 dns_srv dns_sum dns_n dns_bad ms
   step "Сеть и MTU"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
@@ -2899,6 +2968,12 @@ _audit_network() {
     fi
   else
     _a_ok "IPv6 не настроен — задержек от него нет"
+  fi
+  in6="$(_ifupdown_inet6_blocked | paste -sd' ' || true)"
+  if [ -n "$in6" ]; then
+    _a_fail "IPv6 выключен, а настройки сети (ifupdown) поднимают IPv6 на ${in6} — при загрузке networking.service падает"
+    _a_hint "IPv4 поднимается раньше, поэтому нода работает; но сеть стартует с ошибкой, и то, что после неё, не применяется"
+    _a_fix "Убрать IPv6 из настроек сети ${in6} (IPv4 не трогается, сеть не перезапускается)" 0 _fix_ifupdown_inet6
   fi
 
   # DNS: Xray резолвит сайты системным резолвером — медленный DNS = каждый сайт открывается с паузой.

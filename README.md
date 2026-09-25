@@ -164,7 +164,9 @@ NO_COLOR=1 bash <(curl -Ls https://raw.githubusercontent.com/Aleshinson/nodeforg
 - **Сеть и MTU** — `bbr`/`fq`; путь MTU до четырёх точек против MTU интерфейса;
   `tcp_mtu_probing`; conntrack (заполнение и таймаут простаивающих TCP — короткий
   рвёт молчащие мессенджеры); повторные отправки TCP; потери в softnet; потери
-  UDP на приёме (звонки); сломанный IPv6; скорость системного DNS (им резолвит Xray).
+  UDP на приёме (звонки); сломанный IPv6; IPv6 выключен, а ifupdown всё ещё
+  поднимает IPv6-адрес (тогда `networking.service` падает при каждой загрузке);
+  скорость системного DNS (им резолвит Xray).
 - **Маршруты** — задержка, джиттер и потери до Cloudflare, Google и Яндекса
   (Москва). До Cloudflare из дата-центра обычно <10 мс: больше 30 — маршрут
   кружной.
@@ -232,7 +234,10 @@ GeoIP (хостер), кривые маршруты (хостер), сертиф
  
 Свои sysctl (таймаут conntrack, выключение IPv6) аудит пишет в
 `/etc/sysctl.d/99-zz-nodeforge.conf`, резолвер — в
-`/etc/systemd/resolved.conf.d/nodeforge-dns.conf`.
+`/etc/systemd/resolved.conf.d/nodeforge-dns.conf`. Выключая IPv6, аудит
+комментирует и секции `iface … inet6` в `/etc/network/interfaces(.d)` меткой
+`#nodeforge-ipv6-off#` (копии — в `/root/nodeforge-bak`); вернуть IPv6:
+`sed -i 's/^#nodeforge-ipv6-off# //' <файл>` и убрать `disable_ipv6` из sysctl-файла.
  
 ---
  
