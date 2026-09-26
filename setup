@@ -3551,17 +3551,25 @@ _probe_rules_clear() {
   done
 }
 
-_probe_rules_open() {
-  local p
+_probe_rules_open() {   # аргументы: udp:443 tcp:443 …
+  local pp
   if ! nft list chain inet na_filter input >/dev/null 2>&1; then return 0; fi
-  for p in "$@"; do
-    nft insert rule inet na_filter input udp dport "$p" accept comment '"nodeforge-probe"'
+  for pp in "$@"; do
+    nft insert rule inet na_filter input "${pp%%:*}" dport "${pp#*:}" accept comment '"nodeforge-probe"'
   done
 }
 
+# Первый свободный UDP-порт начиная с $1. Занятый высокий порт — обычно Hysteria;
+# соседний покажет то же, что нужно про неё: пропускает ли РФ UDP на высокие порты IP.
+_udp_free_port() {
+  local p="$1"
+  while [ -n "$(ss -H -lnu "sport = :${p}" 2>/dev/null)" ] && [ "$p" -lt $(( $1 + 50 )) ]; do p=$(( p + 1 )); done
+  echo "$p"
+}
+
 _audit_ru() {
-  local ip py kind text
-  local -a logs
+  local ip py kind text high owner
+  local -a logs rules
   step "Доступность из РФ"
   if ! command -v python3 >/dev/null 2>&1; then _a_warn "Нет python3 — доступность из РФ не проверить"; return 0; fi
   ip="$(curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true)"
@@ -3571,11 +3579,20 @@ _audit_ru() {
   fi
   mapfile -t logs < <(ls -1 /var/log/remnanode/access.log.1 /var/log/remnanode/access.log.1.* \
     /var/log/remnanode/access.log 2>/dev/null || true)
-  info "Зонды стучатся на ${ip}: TCP 443, UDP 443 и UDP ${NF_UDP_PROBE_PORT}. На ~1 мин открываю эти UDP-порты и отвечаю на них сам."
+  high="$(_udp_free_port "$NF_UDP_PROBE_PORT")"
+  if [ "$high" != "$NF_UDP_PROBE_PORT" ]; then
+    owner="$(ss -H -lnpu "sport = :${NF_UDP_PROBE_PORT}" 2>/dev/null | grep -oE '\(\("[^"]+"' | head -1 | cut -d'"' -f2 || true)"
+    info "UDP ${NF_UDP_PROBE_PORT} занят (${owner:-неизвестно чем}; обычно это Hysteria) — высокие UDP-порты проверяю на соседнем ${high}"
+  fi
+  rules=(udp:443 "udp:${high}")
+  # На TCP 443 никто не слушает (нода только на UDP) — на время замера его слушает скрипт:
+  # иначе зонд получит отказ, и бан не отличить от закрытого порта.
+  if [ -z "$(ss -H -ltn 'sport = :443' 2>/dev/null)" ]; then rules+=(tcp:443); fi
+  info "Зонды стучатся на ${ip}: TCP 443, UDP 443 и UDP ${high}. На ~1 мин открываю эти порты и отвечаю на них сам."
   py="$(mktemp --suffix=.py)"
   _ru_py_src > "$py"
   _probe_rules_clear
-  _probe_rules_open 443 "$NF_UDP_PROBE_PORT"
+  _probe_rules_open "${rules[@]}"
   while IFS=$'\t' read -r kind text; do
     case "$kind" in
       OK)   _a_ok "$text" ;;
@@ -3588,7 +3605,7 @@ _audit_ru() {
       RAW)  printf '      %s\n' "$text" ;;
       *)    printf '      %s %s\n' "$kind" "$text" ;;   # трассировка Python и прочее — как есть
     esac
-  done < <(python3 "$py" "$ip" "$NF_UDP_PROBE_PORT" "$NF_RU_ASN" "${logs[@]}" 2>&1)
+  done < <(python3 "$py" "$ip" "$high" "$NF_RU_ASN" "${logs[@]}" 2>&1)
   _probe_rules_clear
   rm -f "$py"
 }
@@ -3700,6 +3717,33 @@ class UdpAnswer(threading.Thread):
                 s.sendto(d[:2] + b"\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + d[12:i + 5], addr)
 
 
+class TcpAccept(threading.Thread):
+    """Если на TCP 443 никто не слушает (нода только на UDP), принимает соединения сам:
+    иначе зонд получит отказ, и бан не отличить от закрытого порта."""
+
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.stop, self.own = False, True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.bind(("0.0.0.0", port))
+            self.sock.listen(64)
+            self.sock.settimeout(0.5)
+        except OSError:
+            self.sock.close()
+            self.own = False
+
+    def run(self):
+        while self.own and not self.stop:
+            try:
+                conn, _ = self.sock.accept()
+                conn.close()
+            except OSError:
+                pass
+        if self.own:
+            self.sock.close()
+
+
 def gp_pick(meas, i, probe):
     res = (meas or {}).get("results") or []
     same = lambda r: (r["probe"].get("asn"), r["probe"].get("city")) == (probe.get("asn"), probe.get("city"))
@@ -3729,21 +3773,25 @@ def probes(sni):
            {"country": "DE", "limit": 1}, {"country": "NL", "limit": 1}]
     tcp = lambda where: {"type": "ping", "target": NODE_IP, "locations": where,
                          "measurementOptions": {"protocol": "TCP", "port": 443, "packets": 3}}
+    listener, answer = TcpAccept(443), UdpAnswer([443, HIGH])
+    listener.start()
+    answer.start()
+    if listener.own:
+        lines.append(("INFO", "На TCP 443 никто не слушает — на время замера соединения принимает скрипт"))
     first, err = gp_create(tcp(loc))
     if not first and err and err.startswith("HTTP 422"):   # зондов с такими метками сейчас нет
         first, err = gp_create(tcp([{"country": "RU", "limit": 8}, {"country": "DE", "limit": 1}]))
     if not first:
+        listener.stop = answer.stop = True
         lines.append(("WARN", f"Globalping не принял замер ({err}) — снаружи не проверено"))
         if err and "429" in err:
             lines.append(("HINT", "лимит — 250 замеров в час с IP ноды; повтори позже"))
         return lines, {}
 
     ids, tests = {"tcp": first}, [("tcp", "TCP 443")]
-    answer = UdpAnswer([443, HIGH])
-    answer.start()
     for port in (443, HIGH):
         if port in answer.busy:
-            lines.append(("INFO", f"UDP {port} занят другой программой — его не проверяю"))
+            lines.append(("INFO", f"UDP {port} занят другой программой (часто Hysteria) — его не проверяю"))
             continue
         mid, _ = gp_create({"type": "dns", "target": "example.com", "locations": first,
                             "measurementOptions": {"query": {"type": "A"}, "resolver": NODE_IP,
@@ -3759,7 +3807,7 @@ def probes(sni):
             ids["tls"] = mid
             tests.append(("tls", "TLS (SNI)"))
     res = gp_wait(dict(ids))
-    answer.stop = True
+    listener.stop = answer.stop = True
 
     rows = []
     for i, r in enumerate((res.get("tcp") or {}).get("results") or []):
