@@ -784,20 +784,27 @@ EOJSON
 # две станзы на один файл = logrotate падает на каждом прогоне и одну пропускает.
 # При повторном optimize na сам уступает маску, занятую чужой станзой.
 _logrotate_release_dir() {
-  local dir="$1" own="$2" f bak
+  local dir="$1" own="$2" f
   for f in /etc/logrotate.d/*; do
     [ -f "$f" ] && [ "$f" != "$own" ] || continue
     grep -qF "$dir" "$f" || continue
-    bak="/root/logrotate.$(basename "$f").bak-$(date +%F-%H%M)"
-    cp -a "$f" "$bak"
-    sed -i -E "/\{/ s#[[:space:]]*${dir}[^[:space:]{]*##g" "$f"
-    if grep -qE '^[[:space:]]*\{' "$f"; then
-      rm -f "$f"
-      log "Станза ${f} ротировала только ${dir} — убрал (бэкап: ${bak})."
-    else
-      log "Забрал ${dir} у ${f} (бэкап: ${bak})."
-    fi
+    _logrotate_drop_dir "$f" "$dir"
   done
+}
+
+# Убрать из станз файла $1 пути внутри папки $2; станза без путей уходит вместе с файлом.
+# Бэкап — в /root: копия в /etc/logrotate.d читалась бы logrotate как ещё один конфиг.
+_logrotate_drop_dir() {
+  local f="$1" dir="$2" bak
+  bak="/root/logrotate.$(basename "$f").bak-$(date +%F-%H%M)"
+  cp -a "$f" "$bak"
+  sed -i -E "/\{/ s#[[:space:]]*${dir}[^[:space:]{]*##g" "$f"
+  if grep -qE '^[[:space:]]*\{' "$f"; then
+    rm -f "$f"
+    log "Станза ${f} ротировала только ${dir} — убрал (бэкап: ${bak})."
+  else
+    log "Забрал ${dir} у ${f} (бэкап: ${bak})."
+  fi
 }
 
 # ----- 8) Логи ноды (logrotate + zstd) -----
@@ -2261,6 +2268,20 @@ _fix_logrotate_dup() {
   _fix_logrotate_run
 }
 
+# Аргумент «файл|папка»: папку уже ротирует станза, прочитанная раньше (logrotate берёт
+# /etc/logrotate.d по алфавиту), а файл с дублем пропускает целиком. Отдаём папку первой.
+_fix_logrotate_dup_path() {
+  local f="/etc/logrotate.d/${1%%|*}" dir="${1#*|}"
+  if [ ! -f "$f" ]; then err "Нет ${f} — дубль уже убран?"; return 1; fi
+  _logrotate_drop_dir "$f" "$dir"
+  if logrotate -d /etc/logrotate.conf 2>&1 | grep -q '^error'; then
+    err "В конфиге logrotate остались ошибки:"
+    logrotate -d /etc/logrotate.conf 2>&1 | grep '^error' | sort -u | head -5 | sed 's/^/   /' >&2
+    return 1
+  fi
+  _fix_logrotate_run
+}
+
 # Логи ноды хранятся бессрочно (rotate 9999) — ограничить числом дней.
 _fix_log_retention() {
   local days f=/etc/logrotate.d/remnanode
@@ -3297,7 +3318,7 @@ _audit_banned_clients() {
 }
 
 _audit_logs() {
-  local errs lerr big dir_mb keep
+  local errs lerr big dir_mb keep lf ld
   step "Логи"
   # 1) конфиг: dry-run ловит дубли станз и синтаксис
   errs="$(logrotate -d /etc/logrotate.conf 2>&1 | grep -E '^error' | sort -u)"
@@ -3307,6 +3328,17 @@ _audit_logs() {
     if printf '%s\n' "$errs" | grep -q 'duplicate log entry.*/var/log/remnanode/' && [ -f /etc/logrotate.d/remnanode ]; then
       _a_fix "Забрать /var/log/remnanode у чужой станзы logrotate и прогнать ротацию" 0 _fix_logrotate_dup
     fi
+    # Прочие дубли: путь уже ротирует станза, прочитанная раньше, а файл с дублем
+    # logrotate пропускает целиком — из этого файла путь и убираем.
+    while read -r lf ld; do
+      [ -f "/etc/logrotate.d/${lf}" ] || continue
+      _a_fix "Убрать ${ld} из /etc/logrotate.d/${lf}: эти логи уже ротирует другая станза" 0 _fix_logrotate_dup_path "${lf}|${ld}"
+      if [ "$lf" = nginx ] && systemctl is-active --quiet nginx 2>/dev/null; then
+        _a_hint "на хосте ещё и работает nginx из пакета (systemctl status nginx) — если nginx ноды в docker, этот лишний"
+      fi
+    done < <(printf '%s\n' "$errs" \
+      | sed -nE 's#^error: ([^:/]+):[0-9]+ duplicate log entry for (/.+)/[^/]+$#\1 \2/#p' \
+      | grep -v ' /var/log/remnanode/$' | sort -u)
   else
     _a_ok "Конфиг logrotate без ошибок"
   fi
