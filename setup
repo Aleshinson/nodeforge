@@ -243,24 +243,74 @@ wait_for_apt() {
   return 0
 }
  
-# Проверяем, что нода remnanode запущена и есть её docker-compose.
-require_node() {
-  if [ -f /opt/remnanode/docker-compose.yml ]; then
-    NODE_DIR="/opt/remnanode"
-    NODE_CONTAINER="remnanode"
-    NODE_SERVICE="remnanode"
-  elif [ -f /opt/remnawave/docker-compose.yml ]; then
-    NODE_DIR="/opt/remnawave"
-    NODE_CONTAINER="remnawave"
-    NODE_SERVICE="remnawave"
-  else
-    err "Не найден docker-compose.yml ни в /opt/remnanode, ни в /opt/remnawave."
-    return 1
-  fi
-
-  return 0
+# Сервис compose-файла $1, в котором образ remnawave/node.
+_compose_node_service() {
+  awk '
+    /^[^[:space:]#]/ { top = $0; svc = "" }
+    top ~ /^services:/ && /^  [^[:space:]#][^:]*:[[:space:]]*$/ { svc = $1; sub(/:$/, "", svc) }
+    svc != "" && /^    image:/ && /remnawave\/node/ { print svc; exit }' "$1" 2>/dev/null
 }
- 
+
+# Значение ключа $3 сервиса $2 compose-файла $1 (без кавычек).
+_compose_service_key() {
+  awk -v s="$2" -v k="$3" '
+    /^[^[:space:]#]/ { top = $0; in_s = 0 }
+    top ~ /^services:/ && /^  [^[:space:]#]/ { name = $1; sub(/:$/, "", name); in_s = (name == s) }
+    in_s && $1 == k ":" { v = $2; gsub(/["\047]/, "", v); print v; exit }' "$1" 2>/dev/null
+}
+
+# Нода Remnawave: папка стека, сервис и имя контейнера — из compose, а не по имени папки.
+# Новые ноды стоят в /opt/remnanode, старые — в /opt/remnawave, но сервис и контейнер
+# там тоже remnanode. Первой пробуем папку, из которой compose поднял живой контейнер ноды.
+require_node() {
+  local wd d f svc name
+  wd="$(docker ps -a --format '{{.Image}}\t{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+    | awk -F'\t' '$1 ~ /remnawave\/node/ && $2 != "" { print $2; exit }' || true)"
+  for d in ${wd:+"$wd"} /opt/remnanode /opt/remnawave; do
+    f="${d}/docker-compose.yml"
+    svc="$(_compose_node_service "$f")"
+    if [ -z "$svc" ]; then continue; fi
+    name="$(_compose_service_key "$f" "$svc" container_name)"
+    if [ -z "$name" ]; then
+      name="$(docker ps -a --filter "label=com.docker.compose.project.working_dir=${d}" \
+        --filter "label=com.docker.compose.service=${svc}" --format '{{.Names}}' 2>/dev/null | head -1 || true)"
+    fi
+    NODE_DIR="$d"
+    NODE_SERVICE="$svc"
+    NODE_CONTAINER="${name:-$svc}"
+    return 0
+  done
+  err "Не найден docker-compose.yml ноды (образ remnawave/node) ни в /opt/remnanode, ни в /opt/remnawave."
+  return 1
+}
+
+# Путь на хосте у тома, смонтированного в контейнер по пути $1 (регэксп); ./ — от NODE_DIR.
+_compose_mount_src() {
+  local src
+  src="$(sed -E "s/[\"']//g" "${NODE_DIR}/docker-compose.yml" 2>/dev/null \
+    | grep -E "^[[:space:]]*-[[:space:]]*[^[:space:]:]+:${1}(:[a-z]+)?[[:space:]]*\$" | head -1 \
+    | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/:.*//' || true)"
+  case "$src" in
+    ./*) echo "${NODE_DIR}/${src#./}" ;;
+    *)   echo "$src" ;;
+  esac
+}
+
+# nginx.conf маскировки — тот, что смонтирован в nginx-контейнер стека ноды.
+_node_nginx_conf() {
+  local f
+  f="$(_compose_mount_src '/etc/nginx/(conf\.d/[^:]+|nginx\.conf)')"
+  echo "${f:-${NODE_DIR}/nginx.conf}"
+}
+
+# geo-ассеты Xray: папка, уже смонтированная в ноду (ранние установки клали её в
+# /opt/remnanode и на нодах из /opt/remnawave), иначе — рядом с compose.
+_node_assets_dir() {
+  local d
+  d="$(_compose_mount_src '/usr/local/share/xray')"
+  echo "${d:-${NODE_DIR}/xray-assets}"
+}
+
 # compose_add_volume "host:container" — добавляет том именно в сервис remnanode
 # (и убирает этот же том из других сервисов, если он туда попал ошибочно). С бэкапом.
 compose_add_volume() {
@@ -632,54 +682,53 @@ block_remnanode() {
   fi
  
   mkdir -p /var/log/remnanode
-  if [ ! -f /opt/remnanode/docker-compose.yml ]; then
-    warn "/opt/remnanode/docker-compose.yml не найден — пропускаю правку volumes."
+  if ! require_node >/dev/null 2>&1; then
+    warn "docker-compose.yml ноды не найден ни в /opt/remnanode, ни в /opt/remnawave — пропускаю правку volumes."
     return
   fi
   compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  if confirm "Перезапустить remnanode (docker compose down && up -d)?"; then
-    ( cd /opt/remnanode && docker compose down && docker compose up -d )
+  if confirm "Перезапустить ${NODE_CONTAINER} (docker compose down && up -d в ${NODE_DIR})?"; then
+    ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
   fi
 }
  
 # ----- 7) RU-блокировка (RU geoip/geosite + bind-mount + cron) -----
 block_rublock() {
+  local assets geo cnt
   require_node || return 1
- 
-  log "Готовлю папку ассетов и копирую штатные geoip/geosite из контейнера."
-  mkdir -p /opt/remnanode/xray-assets
-  docker cp remnanode:/usr/local/share/xray/. /opt/remnanode/xray-assets/
- 
+  assets="$(_node_assets_dir)"
+  geo="$(dirname "$assets")/update-geo.sh"
+
+  log "Готовлю папку ассетов (${assets}) и копирую штатные geoip/geosite из контейнера."
+  mkdir -p "$assets"
+  docker cp "${NODE_CONTAINER}:/usr/local/share/xray/." "${assets}/"
+
   log "Скачиваю RU-списки (runetfreedom)."
-  wget -qO /opt/remnanode/xray-assets/geosite-ru.dat \
+  wget -qO "${assets}/geosite-ru.dat" \
     https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
-  wget -qO /opt/remnanode/xray-assets/geoip-ru.dat \
+  wget -qO "${assets}/geoip-ru.dat" \
     https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
-  if [ "$(stat -c%s /opt/remnanode/xray-assets/geosite-ru.dat 2>/dev/null || echo 0)" -lt 1000000 ] \
-     || [ "$(stat -c%s /opt/remnanode/xray-assets/geoip-ru.dat 2>/dev/null || echo 0)" -lt 1000000 ]; then
+  if [ "$(stat -c%s "${assets}/geosite-ru.dat" 2>/dev/null || echo 0)" -lt 1000000 ] \
+     || [ "$(stat -c%s "${assets}/geoip-ru.dat" 2>/dev/null || echo 0)" -lt 1000000 ]; then
     err "RU-списки скачались подозрительно маленькими — прерываю."
     return 1
   fi
-  chmod 644 /opt/remnanode/xray-assets/*.dat
- 
+  chmod 644 "$assets"/*.dat
+
   log "Прописываю bind-mount ассетов в docker-compose."
-  compose_add_volume "/opt/remnanode/xray-assets:/usr/local/share/xray"
- 
+  compose_add_volume "${assets}:/usr/local/share/xray"
+
   log "Пересоздаю контейнер."
-  ( cd /opt/remnanode && docker compose up -d )
+  ( cd "$NODE_DIR" && docker compose up -d )
   sleep 3
-  local cnt
-  cnt="$(docker exec remnanode sh -c 'ls /usr/local/share/xray/*.dat 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  log "В контейнере .dat-файлов: ${cnt} (ожидаем 4)."
+  cnt="$(docker exec "$NODE_CONTAINER" sh -c 'ls /usr/local/share/xray/*.dat 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
+log "В контейнере .dat-файлов: ${cnt} (ожидаем 4)."
   if [ "${cnt:-0}" -lt 4 ]; then
     warn "Похоже, bind-mount не применился — проверь отступы в docker-compose.yml."
   fi
  
   log "Ставлю авто-обновление списков (cron, воскресенье 04:00)."
-  cat > /opt/remnanode/update-geo.sh <<'EOS'
-#!/bin/bash
-set -e
-ASSETS=/opt/remnanode/xray-assets
+  { printf '#!/bin/bash\nset -e\nASSETS=%q\nNODE=%q\n' "$assets" "$NODE_CONTAINER"; cat <<'EOS'
 TMP=$(mktemp -d)
 wget -q -O "$TMP/geosite-ru.dat" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
 wget -q -O "$TMP/geoip-ru.dat"   https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
@@ -689,17 +738,18 @@ mv "$TMP/geosite-ru.dat" "$ASSETS/geosite-ru.dat"
 mv "$TMP/geoip-ru.dat"   "$ASSETS/geoip-ru.dat"
 chmod 644 "$ASSETS"/*.dat
 rmdir "$TMP"
-docker restart remnanode >/dev/null
+docker restart "$NODE" >/dev/null
 echo "geo update done: $(date)"
 EOS
-  chmod +x /opt/remnanode/update-geo.sh
-  if crontab -l 2>/dev/null | grep -qF '/opt/remnanode/update-geo.sh'; then
+  } > "$geo"
+  chmod +x "$geo"
+  if crontab -l 2>/dev/null | grep -qF "$geo"; then
     log "Cron уже настроен."
   else
-    ( crontab -l 2>/dev/null || true; echo '0 4 * * 0 /opt/remnanode/update-geo.sh >> /var/log/geo-update.log 2>&1' ) | crontab -
+    ( crontab -l 2>/dev/null || true; echo "0 4 * * 0 ${geo} >> /var/log/geo-update.log 2>&1" ) | crontab -
     log "Cron добавлен."
   fi
- 
+
   echo
   warn "ОСТАЛОСЬ СДЕЛАТЬ В ПАНЕЛИ Remnawave (один раз на все ноды):"
   warn "Xray Config → заменить блоки outbounds и routing на это и сохранить:"
@@ -839,10 +889,12 @@ _nginx_container() {
 # server { } (валидация nginx -t + рестарт nginx/remnanode, откат при ошибке).
 nginx_upsert_location() {
   local path="$1" block="$2"
-  local f=/opt/remnanode/nginx.conf ngx tmp existed=0 rc=0
- 
+  local f ngx tmp existed=0 rc=0
+
+  require_node || return 1
+  f="$(_node_nginx_conf)"
   if [ ! -f "$f" ]; then
-    warn "${f} не найден. Вставь этот блок в server { } нужного nginx.conf вручную:"
+warn "${f} не найден. Вставь этот блок в server { } нужного nginx.conf вручную:"
     printf '%s\n' "$block"
     return 1
   fi
@@ -889,9 +941,9 @@ nginx_upsert_location() {
   log "Проверяю конфиг в контейнере ${ngx}."
   if docker exec "$ngx" nginx -t; then
     docker restart "$ngx" >/dev/null
-    docker restart remnanode >/dev/null
-    log "nginx (${ngx}) и remnanode перезапущены."
-  else
+    docker restart "$NODE_CONTAINER" >/dev/null
+    log "nginx (${ngx}) и ${NODE_CONTAINER} перезапущены."
+else
     err "nginx -t не прошёл — откатываю ${f}."
     if [ -f "${f}.bak" ]; then cp -a "${f}.bak" "$f"; fi
     return 1
@@ -1745,20 +1797,22 @@ EOS
 # ============================================================================
 block_backup() {
   local stamp dst nft_dump cron_dump
-  stamp="$(date +%F-%H%M)"
+  local -a node_files=()
+stamp="$(date +%F-%H%M)"
   dst="/root/nodeforge-backup-${stamp}.tar.gz"
   nft_dump="/root/nft-ruleset-${stamp}.conf"
   cron_dump="/root/crontab-${stamp}.txt"
 
   command -v nft >/dev/null 2>&1 && nft list ruleset > "$nft_dump" 2>/dev/null || true
   ( crontab -l 2>/dev/null || true ) > "$cron_dump"
+  if require_node >/dev/null 2>&1; then node_files=("${NODE_DIR}/docker-compose.yml" "$(_node_nginx_conf)"); fi
 
   tar -czf "$dst" 2>/dev/null \
     /etc/ssh/sshd_config /etc/ssh/sshd_config.d \
     /etc/nodeforge \
     /etc/pam.d/sshd \
-    /opt/remnanode/docker-compose.yml /opt/remnanode/nginx.conf \
-    /etc/logrotate.d/remnanode \
+    "${node_files[@]}" \
+/etc/logrotate.d/remnanode \
     /etc/network/interfaces /etc/netplan \
     "$nft_dump" "$cron_dump" || true
 
@@ -1803,14 +1857,15 @@ block_fleet() {
 
 
 block_update_lists() {
-  local did=0
+  local did=0 geo=""
   echo
   step "Обновление всех списков сетей"
+  if require_node >/dev/null 2>&1; then geo="$(dirname "$(_node_assets_dir)")/update-geo.sh"; fi
 
   # 1) RU geoip/geosite для Xray (если настроена RU-блокировка)
-  if [ -x /opt/remnanode/update-geo.sh ]; then
+  if [ -n "$geo" ] && [ -x "$geo" ]; then
     log "RU geoip/geosite (Xray)…"
-    if /opt/remnanode/update-geo.sh; then ok "RU-списки обновлены."; else warn "RU-списки: ошибка (см. вывод)."; fi
+    if "$geo"; then ok "RU-списки обновлены."; else warn "RU-списки: ошибка (см. вывод)."; fi
     did=1
   fi
 
@@ -1831,9 +1886,9 @@ block_update_lists() {
   [ "$did" -eq 0 ] && warn "Обновляемых списков не найдено (ничего списочного пока не настроено)."
 
   # --- самолечение cron: если скрипт есть, а задание пропало — вернуть ---
-  if [ -x /opt/remnanode/update-geo.sh ] && ! { crontab -l 2>/dev/null | grep -qF 'update-geo.sh'; }; then
-    ( crontab -l 2>/dev/null || true; echo '0 4 * * 0 /opt/remnanode/update-geo.sh >> /var/log/geo-update.log 2>&1' ) | crontab -
-    log "Восстановил cron для RU-geo (Вс 04:00)."
+  if [ -n "$geo" ] && [ -x "$geo" ] && ! { crontab -l 2>/dev/null | grep -qF 'update-geo.sh'; }; then
+    ( crontab -l 2>/dev/null || true; echo "0 4 * * 0 ${geo} >> /var/log/geo-update.log 2>&1" ) | crontab -
+log "Восстановил cron для RU-geo (Вс 04:00)."
   fi
   if [ -x /usr/local/sbin/nodeforge-govblock-update ] && ! { crontab -l 2>/dev/null | grep -qF 'nodeforge-govblock-update'; }; then
     ( crontab -l 2>/dev/null || true; echo '17 5 * * * /usr/local/sbin/nodeforge-govblock-update >> /var/log/nodeforge-govblock.log 2>&1' ) | crontab -
@@ -2250,8 +2305,8 @@ _fix_node_recreate() {
 _fix_dead_location() {
   local sock="$1" f path ngx tmp
   require_node
-  f="${NODE_DIR}/nginx.conf"
-  path="$(awk -v sock="unix:${sock};" '
+  f="$(_node_nginx_conf)"
+path="$(awk -v sock="unix:${sock};" '
     match($0, /location[[:space:]]+\/[^\/[:space:]]+\//) {
       p = substr($0, RSTART, RLENGTH); sub(/^location[[:space:]]+\//, "", p); sub(/\/$/, "", p)
     }
@@ -2595,7 +2650,9 @@ cert_maintain() {
 block_cert() {
   local cert name
   local -a names
-  cert="$(grep -ohE '/etc/letsencrypt/live/[^:]+/fullchain\.pem' /opt/remnanode/docker-compose.yml /opt/remnawave/docker-compose.yml 2>/dev/null | head -1 || true)"
+  if require_node >/dev/null 2>&1; then
+    cert="$(grep -ohE '/etc/letsencrypt/live/[^:]+/fullchain\.pem' "${NODE_DIR}/docker-compose.yml" 2>/dev/null | head -1 || true)"
+  fi
   if [ -z "$cert" ]; then
     mapfile -t names < <(find /etc/letsencrypt/renewal -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//')
     if [ "${#names[@]}" -eq 0 ]; then err "Сертификатов certbot на этой ноде нет."; return 1; fi
@@ -3446,7 +3503,8 @@ _audit_xray_log() {
 _audit_node() {
   local ctr c st s rc started age f sock cert img sni want
   step "Нода"
-  if ! require_node >/dev/null 2>&1; then info "Нода (remnanode) не установлена — пропускаю."; return 0; fi
+  if ! require_node >/dev/null 2>&1; then info "Нода (remnawave/node) не установлена — пропускаю."; return 0; fi
+  info "Стек ноды: ${NODE_DIR}, сервис ${NODE_SERVICE}, контейнер ${NODE_CONTAINER}"
 
   ctr="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "(^|_)${NODE_CONTAINER}\$" | head -1)"
   if [ -n "$ctr" ] && [ "$ctr" != "$NODE_CONTAINER" ]; then
@@ -3474,8 +3532,8 @@ _audit_node() {
     _a_fix "Поднять стек ноды по compose (docker compose up -d)" 1 _fix_node_recreate
   fi
 
-  f="${NODE_DIR}/nginx.conf"
-  if [ -f "$f" ]; then
+  f="$(_node_nginx_conf)"
+if [ -f "$f" ]; then
     if grep -q 'nginx.sock' "$f"; then
       if [ -S /dev/shm/nginx.sock ]; then _a_ok "Фолбэк Reality → nginx.sock на месте"
       else _a_fail "Reality отдаёт фолбэк в /dev/shm/nginx.sock, а сокета нет — маскировка сломана"; fi

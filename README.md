@@ -49,8 +49,10 @@
 - Ubuntu 22.04 / 24.04 (или другой Debian-подобный дистрибутив с `apt`).
 - Доступ **root** (или `sudo`).
 - `bash`, `curl`/`wget` (есть по умолчанию).
-- Для пунктов настройки ноды — уже установленный `remnanode`
-  (`docker compose` в `/opt/remnanode`).
+- Для пунктов настройки ноды — уже установленная нода Remnawave: `docker compose`
+  в `/opt/remnanode` или, на старых нодах, в `/opt/remnawave`. Сервис и имя
+  контейнера скрипт берёт из compose (сервис с образом `remnawave/node`), пути к
+  `nginx.conf` и geo-ассетам — из томов compose, а не по имени папки.
 ---
  
 ## Запуск
