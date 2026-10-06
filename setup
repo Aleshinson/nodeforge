@@ -1090,7 +1090,7 @@ body.palette { --bg:#f6eee5; --panel:#fff7ef; --ink:#362b27; --muted:#725d51; --
 .calendar-strip { display:grid; grid-template-columns:repeat(7,1fr); border:1px solid var(--line); background:var(--panel); }
 .calendar-strip div { padding:18px; border-right:1px solid var(--line); } .calendar-strip div:last-child { border:0; }
 .calendar-strip span { display:block; font-size:12px; color:var(--muted); } .calendar-strip strong { display:block; font:2rem Georgia,serif; margin-top:12px; }
-@media(max-width:760px) { header,main,footer { padding:22px; } .docs,.reference .hero,.palette .endpoint-list { grid-template-columns:1fr; gap:24px; } .hero { padding-top:15px; } .hero-art { margin-top:15px; } .calendar-strip div { padding:10px 5px; text-align:center; } .calendar-strip strong { font-size:1.4rem; } .swatches { height:120px; } .swatches span { left:3px; bottom:6px; padding:2px; font-size:9px; } header { flex-wrap:wrap; gap:8px; } }
+@media(max-width:760px) { header,main,footer { padding:22px; } .docs,.reference .hero,.palette .endpoint-list { grid-template-columns:minmax(0,1fr); gap:24px; } .hero { padding-top:15px; } .hero-art { margin-top:15px; } .calendar-strip div { padding:10px 5px; text-align:center; } .calendar-strip strong { font-size:1.4rem; } .swatches { height:120px; } .swatches span { left:3px; bottom:6px; padding:2px; font-size:9px; } header { flex-wrap:wrap; gap:8px; } }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 </style></head>
 <body class="__VARIANT__"><header><a class="brand" href="/">__DOMAIN__</a><span class="header-note">JSON / READ ONLY / V1</span></header>
