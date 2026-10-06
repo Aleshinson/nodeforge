@@ -100,26 +100,32 @@ RESPONSE="$4" HTTP_CODE="$5" CURL_RC="$6"
 _site_install "$1" "$2" example.org "$3"
 ''', self.source, self.site, self.backups, response, code, curl_rc)
 
-    def auto_fix(self, http_code="200", nginx_rc=0):
+    def auto_fix(self, http_code="200", nginx_rc=0, variant="reference", selected="0", bad_api=""):
         return self.bash('''
 ask() { echo UNEXPECTED_PROMPT >&2; return 99; }
 confirm() { echo UNEXPECTED_PROMPT >&2; return 99; }
 flock() { return 0; }
 docker() { echo NGINX_CHECK >&2; return "$NGINX_RC"; }
 curl() {
-  local output
+  local output url request_path
   while [ "$#" -gt 0 ]; do
-    case "$1" in -o) output="$2"; shift;; esac
+    case "$1" in -o) output="$2"; shift;; https://*) url="$1";; esac
     shift
   done
-  cp "$TARGET/index.html" "$output"
+  request_path="${url#https://example.org}"
+  [ "$request_path" = / ] && request_path=/index.html
+  if [ "$request_path" = "$BAD_API" ]; then
+    printf 'broken endpoint' > "$output"
+  else
+    cp "$TARGET$request_path" "$output"
+  fi
   echo HTTPS_PROBED >&2
   printf '%s' "$HTTP_CODE"
 }
-TARGET="$1" HTTP_CODE="$3" NGINX_RC="$4"
+TARGET="$1" HTTP_CODE="$3" NGINX_RC="$4" BAD_API="$7"
 set -e
-_site_auto_fix "$1" example.org "$2" nginx-id
-''', self.site, self.backups, http_code, nginx_rc)
+_site_auto_fix "$1" example.org "$2" nginx-id "$5" "$6"
+''', self.site, self.backups, http_code, nginx_rc, variant, selected, bad_api)
 
     def test_automatic_fix_needs_no_input_and_is_idempotent(self):
         result = self.auto_fix()
@@ -128,7 +134,7 @@ _site_auto_fix "$1" example.org "$2" nginx-id
         page = (self.site / "index.html").read_text(encoding="utf-8")
         self.assertNotEqual(page, SUSPECT)
         self.assertIn("example.org", page)
-        self.assertIn("Intl.DateTimeFormat", page)
+        self.assertIn("/v1/status-codes.json", page)
         self.assertEqual(self.bash('_site_tool scan "$1"', self.site).returncode, 1)
         self.assertFalse((self.site / "old.css").exists())
         self.assertEqual((self.site / ".well-known" / "token").read_text(), "acme")
@@ -174,35 +180,112 @@ _site_auto_fix "$1" example.org "$2" nginx-id
         result = self.bash('_site_tool detect "$1"', self.site / "index.html")
         self.assert_ok(result)
 
-    @unittest.skipUnless(shutil.which("node"), "Node.js is optional for testing the generated page")
-    def test_generated_clock_updates_all_cities_and_timezone_selection(self):
-        output = self.base / "generated"
-        self.assert_ok(self.bash('_site_tool generate "$1" example.org', output))
+    def test_three_api_sites_have_distinct_pages_and_real_json_routes(self):
+        pages = []
+        routes = {"reference": "status-codes", "palette": "palettes", "calendar": "months"}
+        for variant, route in routes.items():
+            with self.subTest(variant=variant):
+                output = self.base / variant
+                self.assert_ok(self.bash('_site_tool generate "$1" example.org "$2"', output, variant))
+                page = (output / "index.html").read_text(encoding="utf-8")
+                pages.append(page)
+                self.assertNotRegex(page, r'(?:src|href)="https?://')
+                self.assertIn(f"/v1/{route}.json", page)
+                self.assertIn("fetch(", page)
+                self.assertIn("curl", page)
+                self.assertEqual(self.bash('_site_tool scan "$1"', output).returncode, 1)
+                data = json.loads((output / "v1" / f"{route}.json").read_text(encoding="utf-8"))
+                self.assertGreater(len(data["items"]), 2)
+                # Every advertised same-origin API route is an actual JSON file.
+                paths = set(re.findall(r'/v1/[a-z-]+\.json', page))
+                self.assertGreaterEqual(len(paths), 2)
+                for path in paths:
+                    json.loads((output / path.lstrip("/")).read_text(encoding="utf-8"))
+        self.assertEqual(len(set(pages)), 3)
+
+    def test_explicit_variant_replaces_clock_or_custom_site_without_egames(self):
+        (self.site / "index.html").write_text(CLEAN)
+        for variant in ("palette", "calendar"):
+            result = self.auto_fix(variant=variant, selected="1")
+            self.assert_ok(result)
+            self.assertNotIn("UNEXPECTED_PROMPT", result.stderr)
+            page = (self.site / "index.html").read_text(encoding="utf-8")
+            self.assertIn("/v1/", page)
+        self.assertFalse((self.site / "v1" / "palettes.json").exists())
+        self.assertTrue((self.site / "v1" / "months.json").exists())
+        self.assertEqual(len(list(self.backups.glob("site-*/old/index.html"))), 2)
+
+    def test_bad_api_response_restores_entire_previous_site(self):
+        result = self.auto_fix(bad_api="/v1/status-codes.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.site / "index.html").read_text(), SUSPECT)
+        self.assertTrue((self.site / "old.css").exists())
+        self.assertFalse((self.site / "v1").exists())
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is optional for testing API page interactions")
+    def test_request_buttons_fetch_real_routes_and_report_failures(self):
+        output = self.base / "api-ui"
+        self.assert_ok(self.bash('_site_tool generate "$1" example.org palette', output))
         page = (output / "index.html").read_text(encoding="utf-8")
-        self.assertNotRegex(page, r'(?:src|href)="https?://')
         payload = {
             "script": re.search(r"<script>(.*?)</script>", page, re.S)[1],
-            "cities": re.findall(r'data-zone="([^"]+)"', page),
+            "routes": {"/v1/" + f.name: json.loads(f.read_text(encoding="utf-8")) for f in (output / "v1").glob("*.json")},
         }
         result = subprocess.run([shutil.which("node"), "-e", '''
-const {script, cities} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const {script, routes} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const assert = require('assert/strict');
-const elements = {zone: {value: 'UTC', addEventListener: (_, fn) => { change = fn; }}, clock: {}, date: {}};
-const rows = cities.map(zone => ({dataset: {zone}}));
-let change;
-class FixedDate extends Date { constructor() { super('2026-01-15T12:34:56Z'); } }
-require('vm').runInNewContext(script, {
-  Date: FixedDate, Intl, Map, Array, setInterval: () => {},
-  document: {getElementById: id => elements[id], querySelectorAll: () => rows}
+const buttons = Object.keys(routes).map(endpoint => {
+  const output = {}, status = {};
+  return {dataset: {endpoint}, output, status,
+    closest: () => ({querySelector: key => key === '.response code' ? output : status}),
+    addEventListener(_, fn) { this.click = fn; }};
 });
-assert.equal(elements.clock.textContent, '12:34:56');
-assert.equal(rows.length, 8);
-assert(rows.every(row => /^\\d{2}:\\d{2}$/.test(row.textContent)));
-elements.zone.value = 'Asia/Tokyo'; change();
-assert.equal(elements.clock.textContent, '21:34:56');
-assert(elements.date.textContent.includes('Asia/Tokyo'));
+let fail = false;
+require('vm').runInNewContext(script, {
+  document: {querySelectorAll: () => buttons},
+  fetch: async (path, options) => {
+    assert(routes[path]); assert.equal(options.headers.Accept, 'application/json');
+    return {ok: !fail, status: fail ? 503 : 200, json: async () => routes[path]};
+  }
+});
+(async () => {
+  for (const button of buttons) {
+    await button.click();
+    assert.deepEqual(JSON.parse(button.output.textContent), routes[button.dataset.endpoint]);
+    assert(button.status.textContent.includes('200'));
+    assert.equal(button.disabled, false);
+  }
+  fail = true; await buttons[0].click();
+  assert(buttons[0].status.textContent.includes('Request failed: HTTP 503'));
+  assert.equal(buttons[0].disabled, false);
+})().catch(error => { console.error(error); process.exitCode = 1; });
 '''], input=json.dumps(payload), capture_output=True, text=True)
         self.assert_ok(result)
+
+    def test_menu_selects_variant_without_path_or_confirmation_questions(self):
+        for choice, variant in (("1", "reference"), ("2", "palette"), ("3", "calendar")):
+            with self.subTest(choice=choice):
+                result = self.bash('''
+_site_auto_fix() { printf 'DEPLOY:%s:%s\\n' "$5" "$6"; }
+ask() { echo UNEXPECTED_PROMPT >&2; return 99; }
+confirm() { echo UNEXPECTED_PROMPT >&2; return 99; }
+_site_choose "$1" example.org "$2" nginx-id <<< "$3"
+''', self.site, self.backups, choice)
+                self.assert_ok(result)
+                self.assertIn(f"DEPLOY:{variant}:1", result.stdout)
+                self.assertNotIn("UNEXPECTED_PROMPT", result.stderr)
+        result = self.bash('''
+_site_auto_fix() { echo UNEXPECTED_DEPLOY; }
+_site_choose "$1" example.org "$2" nginx-id <<< 0
+''', self.site, self.backups)
+        self.assert_ok(result)
+        self.assertNotIn("UNEXPECTED_DEPLOY", result.stdout)
+        result = self.bash('''
+_site_auto_fix() { echo UNEXPECTED_DEPLOY; }
+_site_choose "$1" example.org "$2" nginx-id </dev/null
+''', self.site, self.backups)
+        self.assert_ok(result)
+        self.assertNotIn("UNEXPECTED_DEPLOY", result.stdout)
 
     def test_audit_detects_template_even_with_valid_https(self):
         conf = self.base / "nginx.conf"
@@ -352,10 +435,9 @@ docker() {
     *) return 99;;
   esac
 }
-ask() { printf -v "$1" '%s' 0; }
 INSPECT="$1"
 set -e
-block_camouflage
+block_camouflage <<< 0
 echo SCAN_COMPLETED
 ''', inspect)
         self.assert_ok(result)

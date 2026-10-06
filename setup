@@ -970,109 +970,161 @@ def scan(path, identify=False):
     return sorted(found)
 
 
-def generate(destination, domain):
+def generate(destination, domain, variant="reference"):
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain):
         raise ValueError("Некорректный домен сайта.")
+    if variant == "reference":
+        title, headline = "HTTP Reference API", "Small responses. Clear meaning."
+        intro = "A compact HTTP reference for developers. Status codes and request methods, available as simple JSON datasets."
+        endpoints = {
+            "status-codes": ("HTTP status codes", [{"code": code, "name": name} for code, name in (
+                (200, "OK"), (201, "Created"), (204, "No Content"), (301, "Moved Permanently"),
+                (302, "Found"), (304, "Not Modified"), (400, "Bad Request"), (401, "Unauthorized"),
+                (403, "Forbidden"), (404, "Not Found"), (409, "Conflict"), (429, "Too Many Requests"),
+                (500, "Internal Server Error"), (502, "Bad Gateway"), (503, "Service Unavailable"))]),
+            "methods": ("Request methods", [{"method": method, "purpose": purpose} for method, purpose in (
+                ("GET", "Retrieve a representation"), ("HEAD", "Retrieve response headers"),
+                ("POST", "Submit data for processing"), ("PUT", "Replace a representation"),
+                ("PATCH", "Apply a partial modification"), ("DELETE", "Remove a resource"))]),
+        }
+        visual = '<div class="hero-art terminal" aria-label="HTTP response example"><span>HTTP/1.1</span><strong>200</strong><span>OK — request understood.</span></div>'
+    elif variant == "palette":
+        title, headline = "Palette API", "A little color. A better starting point."
+        intro = "Color combinations for interfaces, sketches and small experiments. Browse a palette, then bring the same values into your project."
+        palettes = [
+            {"id": "terracotta", "name": "Terracotta", "colors": ["#F5EEE6", "#DABBA3", "#B85B3E", "#6B7560", "#282C28"]},
+            {"id": "coast", "name": "Coast", "colors": ["#F2F4EE", "#B8D5D1", "#4F8795", "#30566B", "#1D303B"]},
+            {"id": "orchard", "name": "Orchard", "colors": ["#F3F0D9", "#C8D49B", "#748E59", "#D69B50", "#343E30"]},
+            {"id": "graphite", "name": "Graphite", "colors": ["#F1F0ED", "#D0CECA", "#A09D98", "#666661", "#252624"]},
+        ]
+        endpoints = {
+            "palettes": ("Color palettes", palettes),
+            "colors": ("Individual colors", [{"palette": p["id"], "hex": color} for p in palettes for color in p["colors"]]),
+        }
+        visual = '<div class="hero-art swatches">' + ''.join(
+            f'<div style="background:{color}"><span>{color}</span></div>' for color in palettes[0]["colors"]) + '</div>'
+    elif variant == "calendar":
+        title, headline = "Calendar API", "Give your dates a common language."
+        intro = "Month and weekday names for calendar interfaces. Small bilingual datasets with predictable numeric keys and no account to create."
+        months_en = "January February March April May June July August September October November December".split()
+        months_ru = "Январь Февраль Март Апрель Май Июнь Июль Август Сентябрь Октябрь Ноябрь Декабрь".split()
+        days_en = "Monday Tuesday Wednesday Thursday Friday Saturday Sunday".split()
+        days_ru = "Понедельник Вторник Среда Четверг Пятница Суббота Воскресенье".split()
+        endpoints = {
+            "months": ("Month names", [{"number": n, "en": en, "ru": ru} for n, (en, ru) in enumerate(zip(months_en, months_ru), 1)]),
+            "weekdays": ("Weekday names", [{"number": n, "en": en, "ru": ru} for n, (en, ru) in enumerate(zip(days_en, days_ru), 1)]),
+        }
+        visual = '<div class="hero-art calendar-strip" aria-label="Monday through Sunday">' + ''.join(
+            f'<div><span>{name[:3]}</span><strong>{n:02}</strong></div>' for n, name in enumerate(days_en, 1)) + '</div>'
+    else:
+        raise ValueError("Неизвестный вариант API-сайта: " + variant)
+
     destination = Path(destination)
-    destination.mkdir()  # Never overwrite an existing source directory.
+    destination.mkdir()
+    (destination / "v1").mkdir()
+    sections = []
+    navigation = []
+    for slug, (label, items) in endpoints.items():
+        path = f"/v1/{slug}.json"
+        data = {"version": 1, "count": len(items), "items": items}
+        (destination / path.lstrip("/")).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        preview = json.dumps({"version": 1, "count": len(items), "items": items[:2]}, ensure_ascii=False, indent=2)
+        navigation.append(f'<a href="#{slug}">{label}<span>↗</span></a>')
+        sections.append(f'''<section class="endpoint" id="{slug}" aria-labelledby="heading-{slug}">
+<div class="endpoint-heading"><span class="method">GET</span><h2 id="heading-{slug}">{label}</h2><span class="count">{len(items)} entries</span></div>
+<a class="route" href="{path}">{path}</a>
+<div class="request-label">REQUEST</div><pre class="request"><code>curl -fsS https://{escape(domain)}{path}</code></pre>
+<div class="response-heading"><span>RESPONSE · first 2 entries</span><button type="button" data-endpoint="{path}" aria-controls="result-{slug}">Run request <span aria-hidden="true">↗</span></button></div>
+<pre id="result-{slug}" class="response" tabindex="0"><code>{escape(preview)}</code></pre>
+<p class="request-status" role="status" aria-live="polite"></p></section>''')
     page = '''<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Точное время в разных городах мира. Сравните часовые пояса перед звонком или поездкой.">
-<title>Мировое время — __DOMAIN__</title>
+<meta name="description" content="__DESCRIPTION__"><title>__TITLE__ · __DOMAIN__</title>
 <style>
-:root { color-scheme: light; --paper: #f3f0e8; --ink: #242922; --muted: #5d665b; --line: #c7cbbe; --accent: #974024; }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.65 Verdana, sans-serif; }
-a { color: inherit; text-underline-offset: .25em; }
-a:hover { color: var(--accent); }
-a:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 5px; }
-header, main, footer { max-width: 1060px; margin: auto; padding: 28px 32px; }
-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
-header a { font-size: .85rem; }
-.wordmark { font: 600 1.2rem Georgia, serif; overflow-wrap: anywhere; }
-.intro { margin: 38px 0 8px; color: var(--accent); font-size: .75rem; letter-spacing: .14em; text-transform: uppercase; }
-h1 { max-width: 740px; margin: 0 0 30px; font: 400 clamp(2.3rem, 5vw, 4rem)/1.12 Georgia, serif; letter-spacing: -.03em; }
-.clock { padding: 28px 0 34px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-label { display: block; margin-bottom: 10px; font-size: .8rem; color: var(--muted); }
-select { max-width: 100%; min-height: 44px; padding: 8px 35px 8px 12px; border: 1px solid var(--muted); border-radius: 0; background: transparent; color: var(--ink); font: inherit; }
-.digits { display: block; font: 400 clamp(3rem, 10vw, 7rem)/1.4 Georgia, serif; font-variant-numeric: tabular-nums; letter-spacing: -.04em; }
-.date { margin: 0; color: var(--muted); }
-h2 { margin: 38px 0 18px; font: 400 1.8rem Georgia, serif; }
-dl { display: grid; grid-template-columns: 1fr 1fr; gap: 0 48px; margin: 0; }
-dl > div { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); }
-dt { font-size: .9rem; }
-dd { margin: 0; font: 1.5rem Georgia, serif; font-variant-numeric: tabular-nums; }
-.note { max-width: 700px; color: var(--muted); font-size: .9rem; }
-footer { margin-top: 25px; border-top: 1px solid var(--line); font-size: .75rem; color: var(--muted); }
-@media (max-width: 600px) { header, main, footer { padding: 22px; } dl { grid-template-columns: 1fr; } header { flex-wrap: wrap; } .intro { margin-top: 20px; } }
-</style>
-</head>
-<body>
-<header><span class="wordmark">__DOMAIN__</span><a href="#cities">Время в городах ↓</a></header>
-<main>
-<p class="intro">Часовые пояса</p><h1>Один момент.<br>Разное время.</h1>
-<section class="clock" aria-label="Часы">
-<label for="zone">Выберите часовой пояс</label>
-<select id="zone">
-<option value="local">Мой часовой пояс</option><option value="UTC">UTC</option>
-<option value="Europe/London">Лондон</option><option value="Europe/Berlin">Берлин</option>
-<option value="Europe/Moscow">Москва</option><option value="Europe/Istanbul">Стамбул</option>
-<option value="Asia/Dubai">Дубай</option><option value="Asia/Tokyo">Токио</option>
-<option value="America/New_York">Нью-Йорк</option><option value="America/Los_Angeles">Лос-Анджелес</option>
-</select>
-<time id="clock" class="digits">—:—:—</time><p id="date" class="date">Текущее время на вашем устройстве</p>
-<noscript><p>Для отображения часов включите JavaScript в браузере.</p></noscript>
-</section>
-<section id="cities" aria-labelledby="cities-heading"><h2 id="cities-heading">Сейчас в мире</h2><dl>
-<div><dt>Лондон</dt><dd><time data-zone="Europe/London">—:—</time></dd></div>
-<div><dt>Берлин</dt><dd><time data-zone="Europe/Berlin">—:—</time></dd></div>
-<div><dt>Москва</dt><dd><time data-zone="Europe/Moscow">—:—</time></dd></div>
-<div><dt>Стамбул</dt><dd><time data-zone="Europe/Istanbul">—:—</time></dd></div>
-<div><dt>Дубай</dt><dd><time data-zone="Asia/Dubai">—:—</time></dd></div>
-<div><dt>Токио</dt><dd><time data-zone="Asia/Tokyo">—:—</time></dd></div>
-<div><dt>Нью-Йорк</dt><dd><time data-zone="America/New_York">—:—</time></dd></div>
-<div><dt>Лос-Анджелес</dt><dd><time data-zone="America/Los_Angeles">—:—</time></dd></div>
-</dl></section>
-<section aria-labelledby="about"><h2 id="about">Планируйте без путаницы</h2>
-<p class="note">Перед звонком коллегам или поездкой сравните время в нужных городах.
-Переход на летнее время учитывается по данным вашего браузера. Точность часов зависит
-от времени, установленного на вашем устройстве.</p></section>
-</main><footer>Время рассчитывается в браузере. Страница работает без внешних сервисов.</footer>
+:root { color-scheme: light; --bg:#f6f3ed; --panel:#fffdf8; --ink:#272b27; --muted:#5c655d; --line:#d0d4cb; --accent:#3b654b; --code:#ecf0e8; }
+* { box-sizing:border-box; } html { scroll-behavior:smooth; }
+body { margin:0; color:var(--ink); background:var(--bg); font:15px/1.6 Verdana,sans-serif; }
+a { color:inherit; text-underline-offset:.25em; } a:hover { color:var(--accent); }
+a:focus-visible,button:focus-visible,pre:focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
+header,main,footer { max-width:1180px; margin:auto; padding:24px 40px; }
+header { display:flex; justify-content:space-between; gap:24px; border-bottom:1px solid var(--line); }
+.brand { overflow-wrap:anywhere; font-weight:bold; } .header-note { color:var(--muted); font:12px/1.6 Consolas,monospace; }
+.eyebrow { margin:25px 0 18px; color:var(--accent); font:12px/1.4 Consolas,monospace; text-transform:uppercase; letter-spacing:.12em; }
+h1 { max-width:800px; font:400 clamp(2.5rem,5.7vw,4.8rem)/1.06 Georgia,serif; letter-spacing:-.035em; margin:0 0 25px; }
+.lead { max-width:670px; color:var(--muted); margin:0; }
+.hero { padding:36px 0 40px; } .hero-art { margin-top:36px; }
+.docs { display:grid; grid-template-columns:220px minmax(0,1fr); gap:50px; padding-top:36px; border-top:1px solid var(--line); }
+aside h2 { margin:0 0 20px; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em; }
+aside a { display:flex; justify-content:space-between; gap:15px; padding:14px 0; border-bottom:1px solid var(--line); text-decoration:none; font-size:13px; }
+.aside-note { margin-top:28px; color:var(--muted); font-size:12px; }
+.endpoint { min-width:0; margin-bottom:44px; scroll-margin-top:25px; }
+.endpoint-heading { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+.endpoint h2 { font:400 1.65rem/1.2 Georgia,serif; margin:0; }
+.method { border:1px solid var(--accent); padding:3px 7px; color:var(--accent); font:12px Consolas,monospace; }
+.count { color:var(--muted); margin-left:auto; font-size:11px; }
+.route { display:inline-block; margin:18px 0 12px; font:14px Consolas,monospace; }
+.request-label,.response-heading { color:var(--muted); font:11px/1.5 Consolas,monospace; letter-spacing:.04em; }
+.request-label { margin-top:12px; }
+pre { max-width:100%; overflow:auto; white-space:pre; padding:20px; border:1px solid var(--line); background:var(--code); border-radius:2px; font:13px/1.7 Consolas,monospace; tab-size:2; }
+.request { margin:8px 0 22px; } .response { max-height:390px; margin:10px 0 0; }
+.response-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+button { min-height:44px; padding:8px 14px; border:1px solid var(--accent); color:var(--accent); background:transparent; cursor:pointer; font:12px Verdana,sans-serif; }
+button:hover { color:var(--bg); background:var(--accent); } button:disabled { opacity:.6; cursor:wait; }
+.request-status { min-height:1.5em; margin:6px 0; font-size:12px; color:var(--muted); }
+.about { border-top:1px solid var(--line); padding:26px 0; } .about h2 { font:1.6rem Georgia,serif; }
+.about p { max-width:720px; color:var(--muted); font-size:13px; }
+footer { border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+body.reference { color-scheme:dark; --bg:#151a20; --panel:#1b232c; --ink:#e8edf0; --muted:#a8b6c0; --line:#36434c; --accent:#8ed7ba; --code:#1b232c; }
+.reference h1,.reference .endpoint h2 { font-family:Consolas,monospace; letter-spacing:-.04em; }
+.reference .hero { display:grid; grid-template-columns:1.5fr 1fr; align-items:center; gap:45px; }
+.reference h1 { font-size:clamp(2.4rem,4.8vw,3.8rem); }
+.terminal { padding:25px; border:1px solid var(--line); font:14px Consolas,monospace; }
+.terminal span { display:block; color:var(--muted); } .terminal strong { display:block; color:var(--accent); font-size:clamp(4rem,10vw,7rem); font-weight:400; line-height:1.4; }
+body.palette { --bg:#f6eee5; --panel:#fff7ef; --ink:#362b27; --muted:#725d51; --line:#cdb9a8; --accent:#984c35; --code:#eee2d6; }
+.palette .docs { grid-template-columns:1fr; gap:28px; } .palette aside { display:flex; gap:25px; flex-wrap:wrap; align-items:center; }
+.palette aside h2 { margin:0; } .palette aside a { border:0; } .palette .aside-note { margin:0; }
+.palette .endpoint-list { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:30px; }
+.swatches { display:flex; height:170px; } .swatches > div { flex:1; position:relative; }
+.swatches span { position:absolute; left:12px; bottom:12px; background:#fffdf8; color:#272b27; padding:4px 7px; font:11px Consolas,monospace; }
+.calendar-strip { display:grid; grid-template-columns:repeat(7,1fr); border:1px solid var(--line); background:var(--panel); }
+.calendar-strip div { padding:18px; border-right:1px solid var(--line); } .calendar-strip div:last-child { border:0; }
+.calendar-strip span { display:block; font-size:12px; color:var(--muted); } .calendar-strip strong { display:block; font:2rem Georgia,serif; margin-top:12px; }
+@media(max-width:760px) { header,main,footer { padding:22px; } .docs,.reference .hero,.palette .endpoint-list { grid-template-columns:1fr; gap:24px; } .hero { padding-top:15px; } .hero-art { margin-top:15px; } .calendar-strip div { padding:10px 5px; text-align:center; } .calendar-strip strong { font-size:1.4rem; } .swatches { height:120px; } .swatches span { left:3px; bottom:6px; padding:2px; font-size:9px; } header { flex-wrap:wrap; gap:8px; } }
+@media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
+</style></head>
+<body class="__VARIANT__"><header><a class="brand" href="/">__DOMAIN__</a><span class="header-note">JSON / READ ONLY / V1</span></header>
+<main><section class="hero"><div><p class="eyebrow">__TITLE__</p><h1>__HEADLINE__</h1><p class="lead">__INTRO__</p></div>__VISUAL__</section>
+<div class="docs"><aside aria-label="API navigation"><h2>Endpoints</h2>__NAV__<p class="aside-note">GET requests. No API key.<br>UTF-8 encoded JSON.</p></aside><div class="endpoint-list">__SECTIONS__</div></div>
+<section class="about"><h2>Simple by design.</h2><p>These endpoints return versioned reference datasets. They do not accept writes or query parameters. Open a JSON link directly, use curl, or run a request above to see the complete response.</p><noscript><p>Request examples and JSON links work without JavaScript. Enable it to use the request buttons.</p></noscript></section>
+</main><footer>__DOMAIN__ · Public reference data. No account required.</footer>
 <script>
-const zone = document.getElementById('zone');
-const clock = document.getElementById('clock');
-const date = document.getElementById('date');
-const formatters = new Map();
-function formatter(timeZone, fullDate = false) {
-  const key = timeZone + (fullDate ? ':date' : ':time');
-  if (!formatters.has(key)) formatters.set(key, new Intl.DateTimeFormat('ru-RU', {
-    timeZone, ...(fullDate ? {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'} :
-      {hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'})
-  }));
-  return formatters.get(key);
+for (const button of document.querySelectorAll('button[data-endpoint]')) {
+  button.addEventListener('click', async () => {
+    const section = button.closest('.endpoint');
+    const output = section.querySelector('.response code');
+    const status = section.querySelector('.request-status');
+    button.disabled = true; status.textContent = 'Requesting…';
+    try {
+      const response = await fetch(button.dataset.endpoint, {headers: {Accept: 'application/json'}, cache: 'no-store'});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const data = await response.json();
+      output.textContent = JSON.stringify(data, null, 2);
+      status.textContent = 'HTTP ' + response.status + ' · Complete response';
+    } catch (error) {
+      status.textContent = 'Request failed: ' + error.message;
+    } finally { button.disabled = false; }
+  });
 }
-const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-const cities = Array.from(document.querySelectorAll('time[data-zone]'));
-function update() {
-  const now = new Date();
-  const selected = zone.value === 'local' ? localZone : zone.value;
-  clock.textContent = formatter(selected).format(now);
-  clock.dateTime = now.toISOString();
-  date.textContent = formatter(selected, true).format(now) + ' · ' + selected;
-  for (const city of cities) {
-    city.textContent = formatter(city.dataset.zone).format(now).slice(0, 5);
-    city.dateTime = now.toISOString();
-  }
-}
-zone.addEventListener('change', update);
-update(); setInterval(update, 1000);
-</script>
-</body></html>
+</script></body></html>
 '''
-    (destination / "index.html").write_text(page.replace("__DOMAIN__", escape(domain)), encoding="utf-8")
+    values = {"TITLE": escape(title), "DOMAIN": escape(domain), "DESCRIPTION": escape(intro, quote=True),
+              "HEADLINE": escape(headline), "INTRO": escape(intro), "VARIANT": variant,
+              "VISUAL": visual, "NAV": ''.join(navigation), "SECTIONS": ''.join(sections)}
+    for key, value in values.items():
+        page = page.replace("__" + key + "__", value)
+    (destination / "index.html").write_text(page, encoding="utf-8")
+
 
 
 def safe_root(value):
@@ -1235,6 +1287,7 @@ PY
 # Подоболочка: EXIT/INT/TERM откатывают неудачную замену. Бэкап вне web root.
 _site_install() (
   local source="$1" target="$2" sni="$3" backup_base="$4" work code changed=0 committed=0
+  local variant="${5:-reference}" generated=0 endpoint relative
   mkdir -p -- "$backup_base" || return 1
   work="$(mktemp -d "${backup_base}/site-XXXXXXXX")" || return 1
   chmod 700 "$work" || return 1
@@ -1255,8 +1308,9 @@ _site_install() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
   if [ -z "$source" ]; then
+    generated=1
     source="$work/input"
-    _site_tool generate "$source" "$sni" || return 1
+    _site_tool generate "$source" "$sni" "$variant" || return 1
   fi
   _site_tool prepare "$source" "$target" "$work" || return 1
   info "Резервная копия: ${work}/old"
@@ -1271,6 +1325,20 @@ _site_install() (
     err "На 443 не получен новый index.html с HTTP 200 (ответ ${code})."
     return 1
   fi
+  if [ "$generated" -eq 1 ]; then
+    # A landing page is not enough: verify every advertised API dataset through
+    # the real TLS entry point too. Custom nginx locations may shadow /v1/.
+    for endpoint in "$work/new/v1/"*.json; do
+      relative="v1/${endpoint##*/}"
+      code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+        --resolve "${sni}:443:127.0.0.1" -H 'Accept-Encoding: identity' \
+        -o "$work/api-response.json" -w '%{http_code}' "https://${sni}/${relative}")" || return 1
+      if [ "$code" != 200 ] || ! cmp -s "$endpoint" "$work/api-response.json"; then
+        err "API /${relative} не отдаёт ожидаемый JSON с HTTP 200 — возвращаю прежний сайт."
+        return 1
+      fi
+    done
+  fi
   committed=1
   ok "Свой сайт установлен; HTTPS на 443 отдаёт новый index.html с валидным сертификатом."
   info "Бэкап: ${work}/old. Конфиги и контейнеры VPN не менялись."
@@ -1278,25 +1346,59 @@ _site_install() (
 
 _site_auto_fix() (
   local target="$1" sni="$2" backup_base="$3" ngx="$4" markers rc=0
-  # No prompts: selecting h authorizes replacement of a recognized template.
-  # Only the current index can authorize replacement, not forgotten old assets.
-  markers="$(_site_tool detect "$target/index.html")" || rc=$?
-  case "$rc" in
-    1) ok "Шаблон eGames на главной странице не обнаружен — сайт оставлен без изменений."; return 0 ;;
-    0) info "Обнаружен шаблон eGames: ${markers}" ;;
-    *) err "Проверка сайта не удалась — замена отменена."; return 1 ;;
-  esac
+  local variant="${5:-reference}" selected="${6:-0}"
+  case "$variant" in reference|palette|calendar) ;; *) err "Неизвестный вариант сайта."; return 1 ;; esac
+  # An explicit variant selection authorizes full replacement, including the
+  # previous clock page. Unattended calls still require the eGames fingerprint.
+  if [ "$selected" != 1 ]; then
+    markers="$(_site_tool detect "$target/index.html")" || rc=$?
+    case "$rc" in
+      1) ok "Шаблон eGames на главной странице не обнаружен — сайт оставлен без изменений."; return 0 ;;
+      0) info "Обнаружен шаблон eGames: ${markers}" ;;
+      *) err "Проверка сайта не удалась — замена отменена."; return 1 ;;
+    esac
+  fi
   command -v flock >/dev/null 2>&1 || { err "Нужен flock (пакет util-linux)."; return 1; }
   mkdir -p -- "$backup_base" || return 1
   exec 9>"$backup_base/.site.lock" || return 1
   flock -n 9 || { err "Замена сайта уже выполняется в другой сессии."; return 1; }
   # Recheck inside the lock: another session may have replaced the template.
-  rc=0; _site_tool detect "$target/index.html" >/dev/null || rc=$?
-  case "$rc" in 1) return 0 ;; 0) ;; *) return 1 ;; esac
+  if [ "$selected" != 1 ]; then
+    rc=0; _site_tool detect "$target/index.html" >/dev/null || rc=$?
+    case "$rc" in 1) return 0 ;; 0) ;; *) return 1 ;; esac
+  fi
   docker exec "$ngx" nginx -t || return 1
-  info "Устанавливаю страницу мирового времени. Старый сайт сохраню; при ошибке HTTPS выполню откат."
-  _site_install "" "$target" "$sni" "$backup_base"
+  info "Устанавливаю API-сайт (${variant}). Старый сайт сохраню; проверю главную страницу и JSON-ответы."
+  _site_install "" "$target" "$sni" "$backup_base" "$variant"
 )
+
+_site_choose() {
+  local target="$1" sni="$2" backup_base="$3" ngx="$4" markers rc=0 choice variant
+  markers="$(_site_tool detect "$target/index.html")" || rc=$?
+  case "$rc" in
+    0) warn "Обнаружен шаблон eGames: ${markers}" ;;
+    1) info "Маркеры eGames не обнаружены. Можно заменить текущий сайт выбранным вариантом API." ;;
+    *) err "Не удалось проверить текущий сайт — замена отменена."; return 1 ;;
+  esac
+  info "Выбор 1–3 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
+  cat <<'EOF'
+  1) HTTP Reference API — HTTP-коды и методы, тёмная документация
+  2) Palette API        — палитры и цвета, светлая галерея
+  3) Calendar API       — месяцы и дни недели, календарный справочник
+  0) Назад без изменений
+EOF
+  while true; do
+    read -rp "Вариант сайта [0]: " choice || return 0
+    case "$choice" in
+      1) variant=reference; break ;;
+      2) variant=palette; break ;;
+      3) variant=calendar; break ;;
+      0|"") return 0 ;;
+      *) warn "Выберите 1, 2, 3 или 0." ;;
+    esac
+  done
+  _site_auto_fix "$target" "$sni" "$backup_base" "$ngx" "$variant" 1
+}
 
 block_camouflage() {
   require_node || return 1
@@ -1317,7 +1419,7 @@ block_camouflage() {
   [ "$rc" -eq 0 ] || return 1
   sni="${context%%$'\n'*}"; target="${context#*$'\n'}"
   info "Сайт: https://${sni}; каталог на хосте: ${target}; nginx: ${ngx}"
-  _site_auto_fix "$target" "$sni" /root/nodeforge-bak "$ngx"
+  _site_choose "$target" "$sni" /root/nodeforge-bak "$ngx"
 }
 
 # ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
@@ -3849,7 +3951,7 @@ _audit_camouflage() {
         case "$rc" in
           0)
             _a_warn "Сайт содержит признаки публичной заглушки: ${markers}"
-            _a_fix "Автоматически заменить распознанный шаблон eGames (бэкап и HTTPS-проверка)" 0 block_camouflage ;;
+            _a_fix "Полностью заменить сайт eGames (3 варианта API, бэкап и HTTPS-проверка)" 0 block_camouflage ;;
           1) info "Известные HTML-маркеры в ответе не найдены; это не гарантия нераспознаваемости VPN." ;;
           *) _a_warn "Не удалось проверить HTML сайта на признаки шаблона" ;;
         esac
@@ -4902,7 +5004,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
    ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
-   ${BOLD}${GRN} h)${RST} Исправить сайт  ${GRY}— найти шаблон eGames и автоматически заменить с бэкапом${RST}
+   ${BOLD}${GRN} h)${RST} Свой API-сайт   ${GRY}— 3 варианта на выбор, полная замена сайта с бэкапом${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -4976,7 +5078,7 @@ menu() {
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
-        h|H) run_block "Автоматическая замена шаблона сайта" block_camouflage ;;
+        h|H) run_block "Свой API-сайт вместо заглушки" block_camouflage ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
