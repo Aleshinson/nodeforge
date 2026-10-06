@@ -891,6 +891,310 @@ _nginx_container() {
   printf '%s' "$ngx"
 }
 
+# Свой статический сайт: этот помощник остаётся внутри скачиваемого одного файла.
+# scan: 0 — есть признаки, 1 — нет известных признаков, 2 — ошибка проверки.
+_site_tool() {
+  python3 - "$@" <<'PY'
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import sys
+from html.parser import HTMLParser
+
+
+class Markers(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.found = set()
+        self.in_title = False
+        self.title = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "title":
+            self.in_title = True
+            self.title = ""
+        if (tag == "meta" and (attrs.get("name") or "").lower().endswith("-id")
+                and re.fullmatch(r"[0-9a-f]{32}", attrs.get("content") or "", re.I)):
+            self.found.add("meta " + attrs["name"] + " (32 hex)")
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            if re.fullmatch(r"\s*Page_[0-9a-f]{8}\s*", self.title, re.I):
+                self.found.add("title Page_<8 hex>")
+            self.in_title = False
+
+    def handle_comment(self, data):
+        if re.fullmatch(r"\s*[0-9a-f]{16}\s*", data, re.I):
+            self.found.add("HTML hex-comment (16 hex)")
+
+
+def scan(path):
+    found = set()
+    files = path.rglob("*") if path.is_dir() else [path]
+    for file in files:
+        if file.is_symlink():
+            raise ValueError("Символическая ссылка: " + str(file))
+        if not file.is_file() or (path.is_dir() and file.suffix.lower() not in (".html", ".htm", ".css", ".js")):
+            continue
+        if file.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("Файл слишком велик для проверки: " + str(file))
+        text = file.read_text(encoding="utf-8", errors="replace")
+        parser = Markers()
+        parser.feed(text)
+        found.update(parser.found)
+        if re.search(r"RandomSite_[0-9a-f]{8}", text, re.I):
+            found.add("footer RandomSite_<8 hex>")
+        if re.search(r"\.(?:style|data|ui|layout|theme|view)-[0-9a-f]{8}\s*\{\s*display:\s*block;?\s*\}", text, re.I):
+            found.add("CSS random class + display:block")
+    return sorted(found)
+
+
+def safe_root(value):
+    path = Path(value)
+    if path.is_symlink() or not path.is_dir() or path.resolve() != path.absolute():
+        raise ValueError("Нужен реальный каталог сайта без симлинков: " + str(path))
+    path = path.resolve()
+    if str(path) in ("/", "/var", "/var/www", "/opt", "/root", "/home", "/usr", "/srv", "/tmp"):
+        raise ValueError("Системный каталог нельзя заменять: " + str(path))
+    if any(path == Path(p) or Path(p) in path.parents for p in ("/etc", "/proc", "/sys", "/dev", "/run", "/boot")):
+        raise ValueError("Системный каталог нельзя заменять: " + str(path))
+    reject_nested_mounts(path)
+    return path
+
+
+def reject_nested_mounts(target, mountinfo=None):
+    # ismount() misses same-device bind mounts; Docker inspect only knows the
+    # container's mounts. Check the host namespace before copying/deleting.
+    if mountinfo is None:
+        if not sys.platform.startswith("linux"):
+            return
+        mountinfo = Path("/proc/self/mountinfo")
+    for line in mountinfo.read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            raise ValueError("Не удалось разобрать таблицу монтирования.")
+        mountpoint = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]))
+        if target in mountpoint.parents:
+            raise ValueError("Вложенная точка монтирования: " + str(mountpoint))
+
+
+def preserve_owner(source, dest):
+    if hasattr(os, "chown"):
+        st = source.lstat()
+        os.chown(dest, st.st_uid, st.st_gid, follow_symlinks=False)
+        # chown may clear setgid bits; reapply the original mode/ACL afterwards.
+        shutil.copystat(source, dest, follow_symlinks=False)
+
+
+def copy_tree(source, dest):
+    shutil.copytree(source, dest, symlinks=True)
+    preserve_owner(source, dest)
+    for file in source.rglob("*"):
+        preserve_owner(file, dest / file.relative_to(source))
+
+
+def overlaps(a, b):
+    return a == b or a in b.parents or b in a.parents
+
+
+def context(filename):
+    mounts = json.loads(Path(filename).read_text())[0]["Mounts"]
+    configs = [m for m in mounts if m["Type"] == "bind" and
+               (m["Destination"] == "/etc/nginx/nginx.conf" or
+                (m["Destination"].startswith("/etc/nginx/conf.d/") and m["Destination"].endswith(".conf")))]
+    if len(configs) != 1:
+        raise ValueError("Нужен один nginx.conf, смонтированный файлом в nginx ноды.")
+    lexer = shlex.shlex(Path(configs[0]["Source"]).read_text(), posix=True, punctuation_chars="{};")
+    lexer.whitespace_split = True
+    directives, words = [], []
+    for token in lexer:
+        if token and all(c in "{};" for c in token):
+            for char in token:
+                if char == ";" and words:
+                    directives.append(words)
+                words = []
+        else:
+            words.append(token)
+    roots = [d[1] for d in directives if d[0] == "root" and len(d) == 2]
+    names = {name for d in directives if d[0] == "server_name" for name in d[1:] if name != "_"}
+    indexes = [d[1:] for d in directives if d[0] == "index"]
+    if (len(roots) != 1 or len(names) != 1 or not indexes or any(d != ["index.html"] for d in indexes)
+            or any(d[0] in ("include", "alias", "proxy_pass") for d in directives)):
+        raise ValueError("Поддерживается один статический сайт: один root, один домен, index index.html; без include/alias/proxy_pass.")
+    domain = names.pop()
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain):
+        raise ValueError("Нужен конкретный домен server_name, без масок и переменных.")
+    root = roots[0]
+    if not root.startswith("/") or "$" in root or ".." in PurePosixPath(root).parts:
+        raise ValueError("Нужен абсолютный статический root.")
+    root = root.rstrip("/")
+    matching = [m for m in mounts if m["Destination"].rstrip("/") == root and m["Type"] == "bind"]
+    if len(matching) != 1 or any(m["Destination"].startswith(root + "/") for m in mounts):
+        raise ValueError("root должен быть отдельным bind-mount без вложенных томов.")
+    target = safe_root(matching[0]["Source"])
+    print(domain)
+    print(target)
+
+
+def prepare(source, target, work):
+    source, target, work = Path(source).resolve(), safe_root(target), Path(work).resolve()
+    if overlaps(source, target) or overlaps(work, target) or overlaps(work, source):
+        raise ValueError("Исходник, сайт и резервная копия должны быть отдельными каталогами.")
+    if not (source / "index.html").is_file() or not (source / "index.html").stat().st_size:
+        raise ValueError("В исходном каталоге нужен непустой index.html.")
+    for file in source.rglob("*"):
+        if file.is_symlink() or not (file.is_file() or file.is_dir()):
+            raise ValueError("В статическом сайте недопустимы ссылки и специальные файлы: " + str(file))
+        if any(part.startswith(".") for part in file.relative_to(source).parts):
+            raise ValueError("Не публикуйте скрытые файлы; .well-known сохраняется с текущего сайта: " + str(file))
+        if file.suffix.lower() in (".pem", ".key", ".p12", ".php", ".py", ".sh"):
+            raise ValueError("В каталоге должны быть только публичные статические файлы: " + str(file))
+    markers = scan(source)
+    if markers:
+        raise ValueError("В новом сайте есть признаки шаблона: " + "; ".join(markers))
+    # Do not rename the Docker bind-mount root: the container keeps its inode.
+    # Back up every old asset, but leave ACME challenges in place during install.
+    shutil.copytree(source, work / "new")
+    for file in (work / "new").rglob("*"):
+        file.chmod(0o755 if file.is_dir() else 0o644)
+    copy_tree(target, work / "old")
+
+
+def replace(source, target):
+    source, target = Path(source).resolve(), safe_root(target)
+    if not source.is_dir() or overlaps(source, target):
+        raise ValueError("Неверный каталог для замены/восстановления.")
+    for file in target.iterdir():
+        if file.name == ".well-known":
+            continue
+        if file.is_dir() and not file.is_symlink():
+            shutil.rmtree(file)
+        else:
+            file.unlink()
+    for file in source.iterdir():
+        if file.name == ".well-known":
+            continue
+        if file.is_dir() and not file.is_symlink():
+            copy_tree(file, target / file.name)
+        elif file.is_symlink():
+            (target / file.name).symlink_to(os.readlink(file))
+            preserve_owner(file, target / file.name)
+        else:
+            shutil.copy2(file, target / file.name)
+            preserve_owner(file, target / file.name)
+
+
+try:
+    action, *args = sys.argv[1:]
+    if action == "scan":
+        markers = scan(Path(args[0]))
+        print("; ".join(markers)) if markers else None
+        sys.exit(0 if markers else 1)
+    elif action == "context":
+        context(*args)
+    elif action == "prepare":
+        prepare(*args)
+    elif action == "replace":
+        replace(*args)
+    else:
+        raise ValueError("Неизвестное действие: " + action)
+except (OSError, ValueError, KeyError, IndexError) as exc:
+    print("Сайт: " + str(exc), file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+# Подоболочка: EXIT/INT/TERM откатывают неудачную замену. Бэкап вне web root.
+_site_install() (
+  local source="$1" target="$2" sni="$3" backup_base="$4" work code changed=0 committed=0
+  mkdir -p -- "$backup_base" || return 1
+  work="$(mktemp -d "${backup_base}/site-XXXXXXXX")" || return 1
+  chmod 700 "$work" || return 1
+  _site_finish() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if [ "$changed" -eq 1 ] && [ "$committed" -eq 0 ]; then
+      if _site_tool replace "$work/old" "$target"; then
+        warn "Проверка не прошла — прежний сайт восстановлен. Бэкап: ${work}/old"
+      else
+        err "Не удалось восстановить сайт! Копия всех прежних файлов: ${work}/old"
+      fi
+      rc=1
+    fi
+    exit "$rc"
+  }
+  trap _site_finish EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _site_tool prepare "$source" "$target" "$work" || return 1
+  info "Резервная копия: ${work}/old"
+  changed=1
+  _site_tool replace "$work/new" "$target" || return 1
+  # Use the real 443 entry point with SNI and certificate validation; no -k,
+  # redirects or proxy environment. Compare bytes to catch a wrong vhost/cache.
+  code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+    --resolve "${sni}:443:127.0.0.1" -H 'Accept-Encoding: identity' \
+    -o "$work/response.html" -w '%{http_code}' "https://${sni}/")" || return 1
+  if [ "$code" != 200 ] || ! cmp -s "$work/new/index.html" "$work/response.html"; then
+    err "На 443 не получен новый index.html с HTTP 200 (ответ ${code})."
+    return 1
+  fi
+  committed=1
+  ok "Свой сайт установлен; HTTPS на 443 отдаёт новый index.html с валидным сертификатом."
+  info "Бэкап: ${work}/old. Конфиги и контейнеры VPN не менялись."
+)
+
+block_camouflage() {
+  require_node || return 1
+  command -v python3 >/dev/null 2>&1 || { err "Для проверки сайта нужен python3 (apt install python3)."; return 1; }
+  local ngx inspect context sni target markers rc source action
+  local -a containers
+  mapfile -t containers < <(docker ps --filter "label=com.docker.compose.project.working_dir=${NODE_DIR}" \
+    --format '{{.ID}} {{.Image}}' | awk '$2 ~ /(^|\/)nginx(:|@|$)/ {print $1}')
+  if [ "${#containers[@]}" -ne 1 ]; then
+    err "Нужен ровно один работающий nginx в compose-проекте ноды ${NODE_DIR}."
+    return 1
+  fi
+  ngx="${containers[0]}"
+  inspect="$(mktemp)" || return 1
+  if ! docker inspect "$ngx" > "$inspect"; then rm -f "$inspect"; return 1; fi
+  rc=0; context="$(_site_tool context "$inspect")" || rc=$?
+  rm -f "$inspect"
+  [ "$rc" -eq 0 ] || return 1
+  sni="${context%%$'\n'*}"; target="${context#*$'\n'}"
+  info "Сайт: https://${sni}; каталог на хосте: ${target}; nginx: ${ngx}"
+  rc=0; markers="$(_site_tool scan "$target")" || rc=$?
+  case "$rc" in
+    0) warn "Найдены признаки публичной заглушки: ${markers}" ;;
+    1) info "Известные HTML/CSS-маркеры не найдены. Это не проверка всех способов обнаружения VPN." ;;
+    *) err "Не удалось проверить файлы сайта."; return 1 ;;
+  esac
+  info "Для замены подготовьте каталог своего статического сайта: index.html, CSS, изображения и другие страницы."
+  info "Нужен сайт со своим содержанием. Рандомизация старого шаблона оставляет узнаваемые файлы."
+  info "Сохраняется .well-known; остальные старые файлы заменяются с бэкапом. Возможна краткая недоступность сайта."
+  ask action "1 — установить свой сайт; 0 — выйти после проверки" "0"
+  [ "$action" = 1 ] || return 0
+  ask source "Абсолютный путь к подготовленному каталогу сайта (пусто — отмена)"
+  [ -n "$source" ] || return 0
+  [[ "$source" = /* ]] || { err "Укажите абсолютный путь."; return 1; }
+  docker exec "$ngx" nginx -t || return 1
+  confirm "Заменить содержимое ${target} сайтом из ${source}?" || return 0
+  # flock prevents two menu sessions from replacing the same files concurrently.
+  command -v flock >/dev/null 2>&1 || { err "Нужен flock (пакет util-linux)."; return 1; }
+  (
+    flock -n 9 || { err "Замена сайта уже выполняется в другой сессии."; exit 1; }
+    _site_install "$source" "$target" "$sni" /root/nodeforge-bak
+  ) 9>/run/lock/nodeforge-site.lock
+}
+
 # ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
 # Удаляет старый location /<path>/ и вставляет свежий блок в первый
 # server { } (валидация nginx -t + рестарт nginx/remnanode, откат при ошибке).
@@ -3401,15 +3705,35 @@ _audit_panel_link() {
 # Маскировка Reality: чужой клиент (и зонд DPI) на 443 с нашим SNI должен увидеть
 # настоящий сайт — валидный сертификат и страницу. Иначе IP быстро вычисляют.
 _audit_camouflage() {
-  local f="$1" sni code
+  local f="$1" sni code body markers rc
   sni="$(awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$f")"
   [ -n "$sni" ] || return 0
-  code="$(curl -sS -m 8 -o /dev/null -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)"
+  body="$(mktemp)" || return 1
+  rc=0
+  code="$(curl --noproxy '*' -sS -m 8 --max-filesize 16777216 -o "$body" -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "$code" ] && [ "$code" != 000 ]; then
+    _a_warn "HTTPS ответил ${code}, но страница получена не полностью (curl ${rc}) — HTML не проверен"
+    rm -f "$body"
+    return 0
+  fi
   case "$code" in
-    2??|3??) _a_ok "Маскировка: https://${sni} на этой ноде отвечает ${code}, сертификат валиден" ;;
+    2??|3??)
+      _a_ok "HTTPS: https://${sni} на этой ноде отвечает ${code}, сертификат валиден"
+      if command -v python3 >/dev/null 2>&1; then
+        rc=0; markers="$(_site_tool scan "$body")" || rc=$?
+        case "$rc" in
+          0)
+            _a_warn "Сайт содержит признаки публичной заглушки: ${markers}"
+            _a_fix "Заменить шаблон своим статическим сайтом (спросит каталог, бэкап и HTTPS-проверка)" 0 block_camouflage ;;
+          1) info "Известные HTML-маркеры в ответе не найдены; это не гарантия нераспознаваемости VPN." ;;
+          *) _a_warn "Не удалось проверить HTML сайта на признаки шаблона" ;;
+        esac
+      else
+        _a_warn "Нет python3 — HTML сайта на признаки шаблона не проверен"
+      fi ;;
     000|"")
       # TLS отвечает, но сертификат не проходит проверку — лечится сертификатом (ниже), не рестартом.
-      code="$(curl -ksS -m 8 -o /dev/null -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)"
+      code="$(curl --noproxy '*' -ksS -m 8 -o /dev/null -w '%{http_code}' --resolve "${sni}:443:127.0.0.1" "https://${sni}/" 2>/dev/null)"
       case "$code" in
         2??|3??)
           _a_fail "Маскировка: https://${sni} отдаёт сертификат, который не проходит проверку (просрочен или не тот домен)"
@@ -3421,6 +3745,7 @@ _audit_camouflage() {
     *) _a_warn "Маскировка: https://${sni} отвечает ${code} — живой сайт отдаёт 200"
        _a_hint "положи страницу в /var/www/html (index.html)" ;;
   esac
+  rm -f "$body"
 }
 
 # Сертификат маскировки и XHTTP/gRPC: срок, что именно отдаёт nginx, и живо ли
@@ -4452,6 +4777,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
    ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
+   ${BOLD}${GRN} h)${RST} Свой сайт       ${GRY}— проверить заглушку и заменить своим сайтом с бэкапом${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -4488,7 +4814,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → m → a.  Можно несколько номеров через пробел.${RST}
+ ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → h → m → a.  Можно несколько номеров через пробел.${RST}
 EOF
 }
  
@@ -4525,6 +4851,7 @@ menu() {
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
+        h|H) run_block "Свой сайт вместо шаблона" block_camouflage ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
