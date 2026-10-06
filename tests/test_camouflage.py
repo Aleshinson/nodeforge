@@ -3,6 +3,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -98,6 +99,110 @@ curl() {
 RESPONSE="$4" HTTP_CODE="$5" CURL_RC="$6"
 _site_install "$1" "$2" example.org "$3"
 ''', self.source, self.site, self.backups, response, code, curl_rc)
+
+    def auto_fix(self, http_code="200", nginx_rc=0):
+        return self.bash('''
+ask() { echo UNEXPECTED_PROMPT >&2; return 99; }
+confirm() { echo UNEXPECTED_PROMPT >&2; return 99; }
+flock() { return 0; }
+docker() { echo NGINX_CHECK >&2; return "$NGINX_RC"; }
+curl() {
+  local output
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -o) output="$2"; shift;; esac
+    shift
+  done
+  cp "$TARGET/index.html" "$output"
+  echo HTTPS_PROBED >&2
+  printf '%s' "$HTTP_CODE"
+}
+TARGET="$1" HTTP_CODE="$3" NGINX_RC="$4"
+set -e
+_site_auto_fix "$1" example.org "$2" nginx-id
+''', self.site, self.backups, http_code, nginx_rc)
+
+    def test_automatic_fix_needs_no_input_and_is_idempotent(self):
+        result = self.auto_fix()
+        self.assert_ok(result)
+        self.assertNotIn("UNEXPECTED_PROMPT", result.stderr)
+        page = (self.site / "index.html").read_text(encoding="utf-8")
+        self.assertNotEqual(page, SUSPECT)
+        self.assertIn("example.org", page)
+        self.assertIn("Intl.DateTimeFormat", page)
+        self.assertEqual(self.bash('_site_tool scan "$1"', self.site).returncode, 1)
+        self.assertFalse((self.site / "old.css").exists())
+        self.assertEqual((self.site / ".well-known" / "token").read_text(), "acme")
+        backups = list(self.backups.glob("site-*/old/index.html"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), SUSPECT)
+        second = self.auto_fix()
+        self.assert_ok(second)
+        self.assertNotIn("HTTPS_PROBED", second.stderr)
+        self.assertEqual((self.site / "index.html").read_text(encoding="utf-8"), page)
+        self.assertEqual(list(self.backups.glob("site-*/old/index.html")), backups)
+
+    def test_automatic_fix_leaves_custom_site_and_weak_matches_untouched(self):
+        for page in (CLEAN, CLEAN + '<!-- 0123456789abcdef -->',
+                     '<title>Page_a1b2c3d4</title>',
+                     SUSPECT.replace("session-id", "my-app-id")):
+            with self.subTest(page=page):
+                (self.site / "index.html").write_text(page)
+                # Old subordinate pages alone must not replace a custom homepage.
+                (self.site / "archived.html").write_text(SUSPECT)
+                result = self.auto_fix()
+                self.assert_ok(result)
+                self.assertNotIn("UNEXPECTED_PROMPT", result.stderr)
+                self.assertNotIn("HTTPS_PROBED", result.stderr)
+                self.assertEqual((self.site / "index.html").read_text(), page)
+                self.assertTrue((self.site / "old.css").exists())
+                self.assertEqual(list(self.backups.glob("site-*")), [])
+
+    def test_automatic_fix_rolls_back_http_failure_and_aborts_bad_nginx(self):
+        result = self.auto_fix("503")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTPS_PROBED", result.stderr)
+        self.assertEqual((self.site / "index.html").read_text(), SUSPECT)
+        self.assertTrue((self.site / "old.css").exists())
+        result = self.auto_fix(nginx_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("NGINX_CHECK", result.stderr)
+        self.assertNotIn("HTTPS_PROBED", result.stderr)
+        self.assertEqual((self.site / "index.html").read_text(), SUSPECT)
+
+    def test_detection_survives_title_edit_but_requires_matching_recipe(self):
+        (self.site / "index.html").write_text(SUSPECT.replace("Page_a1b2c3d4", "My site"))
+        result = self.bash('_site_tool detect "$1"', self.site / "index.html")
+        self.assert_ok(result)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is optional for testing the generated page")
+    def test_generated_clock_updates_all_cities_and_timezone_selection(self):
+        output = self.base / "generated"
+        self.assert_ok(self.bash('_site_tool generate "$1" example.org', output))
+        page = (output / "index.html").read_text(encoding="utf-8")
+        self.assertNotRegex(page, r'(?:src|href)="https?://')
+        payload = {
+            "script": re.search(r"<script>(.*?)</script>", page, re.S)[1],
+            "cities": re.findall(r'data-zone="([^"]+)"', page),
+        }
+        result = subprocess.run([shutil.which("node"), "-e", '''
+const {script, cities} = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const assert = require('assert/strict');
+const elements = {zone: {value: 'UTC', addEventListener: (_, fn) => { change = fn; }}, clock: {}, date: {}};
+const rows = cities.map(zone => ({dataset: {zone}}));
+let change;
+class FixedDate extends Date { constructor() { super('2026-01-15T12:34:56Z'); } }
+require('vm').runInNewContext(script, {
+  Date: FixedDate, Intl, Map, Array, setInterval: () => {},
+  document: {getElementById: id => elements[id], querySelectorAll: () => rows}
+});
+assert.equal(elements.clock.textContent, '12:34:56');
+assert.equal(rows.length, 8);
+assert(rows.every(row => /^\\d{2}:\\d{2}$/.test(row.textContent)));
+elements.zone.value = 'Asia/Tokyo'; change();
+assert.equal(elements.clock.textContent, '21:34:56');
+assert(elements.date.textContent.includes('Asia/Tokyo'));
+'''], input=json.dumps(payload), capture_output=True, text=True)
+        self.assert_ok(result)
 
     def test_audit_detects_template_even_with_valid_https(self):
         conf = self.base / "nginx.conf"

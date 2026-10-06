@@ -903,6 +903,7 @@ import shlex
 import shutil
 import sys
 from html.parser import HTMLParser
+from html import escape
 
 
 class Markers(HTMLParser):
@@ -911,6 +912,8 @@ class Markers(HTMLParser):
         self.found = set()
         self.in_title = False
         self.title = ""
+        self.known_meta = False
+        self.random_body = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -920,6 +923,11 @@ class Markers(HTMLParser):
         if (tag == "meta" and (attrs.get("name") or "").lower().endswith("-id")
                 and re.fullmatch(r"[0-9a-f]{32}", attrs.get("content") or "", re.I)):
             self.found.add("meta " + attrs["name"] + " (32 hex)")
+            if attrs["name"].lower() in ("viewport-id", "session-id", "track-id", "render-id", "page-id", "config-id"):
+                self.known_meta = True
+        if tag == "body":
+            self.random_body = any(re.fullmatch(r"(?:style|data|ui|layout|theme|view)-[0-9a-f]{8}", value, re.I)
+                                   for value in (attrs.get("class") or "").split())
 
     def handle_data(self, data):
         if self.in_title:
@@ -936,7 +944,7 @@ class Markers(HTMLParser):
             self.found.add("HTML hex-comment (16 hex)")
 
 
-def scan(path):
+def scan(path, identify=False):
     found = set()
     files = path.rglob("*") if path.is_dir() else [path]
     for file in files:
@@ -949,12 +957,122 @@ def scan(path):
         text = file.read_text(encoding="utf-8", errors="replace")
         parser = Markers()
         parser.feed(text)
+        # Auto-replacement requires several matching parts of the eGames
+        # recipe in the SAME document; a generic hex comment is insufficient.
+        if identify and not (parser.known_meta and "HTML hex-comment (16 hex)" in parser.found
+                             and ("title Page_<8 hex>" in parser.found or parser.random_body)):
+            continue
         found.update(parser.found)
         if re.search(r"RandomSite_[0-9a-f]{8}", text, re.I):
             found.add("footer RandomSite_<8 hex>")
         if re.search(r"\.(?:style|data|ui|layout|theme|view)-[0-9a-f]{8}\s*\{\s*display:\s*block;?\s*\}", text, re.I):
             found.add("CSS random class + display:block")
     return sorted(found)
+
+
+def generate(destination, domain):
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain):
+        raise ValueError("Некорректный домен сайта.")
+    destination = Path(destination)
+    destination.mkdir()  # Never overwrite an existing source directory.
+    page = '''<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Точное время в разных городах мира. Сравните часовые пояса перед звонком или поездкой.">
+<title>Мировое время — __DOMAIN__</title>
+<style>
+:root { color-scheme: light; --paper: #f3f0e8; --ink: #242922; --muted: #5d665b; --line: #c7cbbe; --accent: #974024; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.65 Verdana, sans-serif; }
+a { color: inherit; text-underline-offset: .25em; }
+a:hover { color: var(--accent); }
+a:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 5px; }
+header, main, footer { max-width: 1060px; margin: auto; padding: 28px 32px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
+header a { font-size: .85rem; }
+.wordmark { font: 600 1.2rem Georgia, serif; overflow-wrap: anywhere; }
+.intro { margin: 38px 0 8px; color: var(--accent); font-size: .75rem; letter-spacing: .14em; text-transform: uppercase; }
+h1 { max-width: 740px; margin: 0 0 30px; font: 400 clamp(2.3rem, 5vw, 4rem)/1.12 Georgia, serif; letter-spacing: -.03em; }
+.clock { padding: 28px 0 34px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+label { display: block; margin-bottom: 10px; font-size: .8rem; color: var(--muted); }
+select { max-width: 100%; min-height: 44px; padding: 8px 35px 8px 12px; border: 1px solid var(--muted); border-radius: 0; background: transparent; color: var(--ink); font: inherit; }
+.digits { display: block; font: 400 clamp(3rem, 10vw, 7rem)/1.4 Georgia, serif; font-variant-numeric: tabular-nums; letter-spacing: -.04em; }
+.date { margin: 0; color: var(--muted); }
+h2 { margin: 38px 0 18px; font: 400 1.8rem Georgia, serif; }
+dl { display: grid; grid-template-columns: 1fr 1fr; gap: 0 48px; margin: 0; }
+dl > div { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+dt { font-size: .9rem; }
+dd { margin: 0; font: 1.5rem Georgia, serif; font-variant-numeric: tabular-nums; }
+.note { max-width: 700px; color: var(--muted); font-size: .9rem; }
+footer { margin-top: 25px; border-top: 1px solid var(--line); font-size: .75rem; color: var(--muted); }
+@media (max-width: 600px) { header, main, footer { padding: 22px; } dl { grid-template-columns: 1fr; } header { flex-wrap: wrap; } .intro { margin-top: 20px; } }
+</style>
+</head>
+<body>
+<header><span class="wordmark">__DOMAIN__</span><a href="#cities">Время в городах ↓</a></header>
+<main>
+<p class="intro">Часовые пояса</p><h1>Один момент.<br>Разное время.</h1>
+<section class="clock" aria-label="Часы">
+<label for="zone">Выберите часовой пояс</label>
+<select id="zone">
+<option value="local">Мой часовой пояс</option><option value="UTC">UTC</option>
+<option value="Europe/London">Лондон</option><option value="Europe/Berlin">Берлин</option>
+<option value="Europe/Moscow">Москва</option><option value="Europe/Istanbul">Стамбул</option>
+<option value="Asia/Dubai">Дубай</option><option value="Asia/Tokyo">Токио</option>
+<option value="America/New_York">Нью-Йорк</option><option value="America/Los_Angeles">Лос-Анджелес</option>
+</select>
+<time id="clock" class="digits">—:—:—</time><p id="date" class="date">Текущее время на вашем устройстве</p>
+<noscript><p>Для отображения часов включите JavaScript в браузере.</p></noscript>
+</section>
+<section id="cities" aria-labelledby="cities-heading"><h2 id="cities-heading">Сейчас в мире</h2><dl>
+<div><dt>Лондон</dt><dd><time data-zone="Europe/London">—:—</time></dd></div>
+<div><dt>Берлин</dt><dd><time data-zone="Europe/Berlin">—:—</time></dd></div>
+<div><dt>Москва</dt><dd><time data-zone="Europe/Moscow">—:—</time></dd></div>
+<div><dt>Стамбул</dt><dd><time data-zone="Europe/Istanbul">—:—</time></dd></div>
+<div><dt>Дубай</dt><dd><time data-zone="Asia/Dubai">—:—</time></dd></div>
+<div><dt>Токио</dt><dd><time data-zone="Asia/Tokyo">—:—</time></dd></div>
+<div><dt>Нью-Йорк</dt><dd><time data-zone="America/New_York">—:—</time></dd></div>
+<div><dt>Лос-Анджелес</dt><dd><time data-zone="America/Los_Angeles">—:—</time></dd></div>
+</dl></section>
+<section aria-labelledby="about"><h2 id="about">Планируйте без путаницы</h2>
+<p class="note">Перед звонком коллегам или поездкой сравните время в нужных городах.
+Переход на летнее время учитывается по данным вашего браузера. Точность часов зависит
+от времени, установленного на вашем устройстве.</p></section>
+</main><footer>Время рассчитывается в браузере. Страница работает без внешних сервисов.</footer>
+<script>
+const zone = document.getElementById('zone');
+const clock = document.getElementById('clock');
+const date = document.getElementById('date');
+const formatters = new Map();
+function formatter(timeZone, fullDate = false) {
+  const key = timeZone + (fullDate ? ':date' : ':time');
+  if (!formatters.has(key)) formatters.set(key, new Intl.DateTimeFormat('ru-RU', {
+    timeZone, ...(fullDate ? {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'} :
+      {hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'})
+  }));
+  return formatters.get(key);
+}
+const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+const cities = Array.from(document.querySelectorAll('time[data-zone]'));
+function update() {
+  const now = new Date();
+  const selected = zone.value === 'local' ? localZone : zone.value;
+  clock.textContent = formatter(selected).format(now);
+  clock.dateTime = now.toISOString();
+  date.textContent = formatter(selected, true).format(now) + ' · ' + selected;
+  for (const city of cities) {
+    city.textContent = formatter(city.dataset.zone).format(now).slice(0, 5);
+    city.dateTime = now.toISOString();
+  }
+}
+zone.addEventListener('change', update);
+update(); setInterval(update, 1000);
+</script>
+</body></html>
+'''
+    (destination / "index.html").write_text(page.replace("__DOMAIN__", escape(domain)), encoding="utf-8")
 
 
 def safe_root(value):
@@ -1046,7 +1164,7 @@ def context(filename):
 
 def prepare(source, target, work):
     source, target, work = Path(source).resolve(), safe_root(target), Path(work).resolve()
-    if overlaps(source, target) or overlaps(work, target) or overlaps(work, source):
+    if overlaps(source, target) or overlaps(work, target) or source == work or source in work.parents:
         raise ValueError("Исходник, сайт и резервная копия должны быть отдельными каталогами.")
     if not (source / "index.html").is_file() or not (source / "index.html").stat().st_size:
         raise ValueError("В исходном каталоге нужен непустой index.html.")
@@ -1094,12 +1212,14 @@ def replace(source, target):
 
 try:
     action, *args = sys.argv[1:]
-    if action == "scan":
-        markers = scan(Path(args[0]))
+    if action in ("scan", "detect"):
+        markers = scan(Path(args[0]), identify=action == "detect")
         print("; ".join(markers)) if markers else None
         sys.exit(0 if markers else 1)
     elif action == "context":
         context(*args)
+    elif action == "generate":
+        generate(*args)
     elif action == "prepare":
         prepare(*args)
     elif action == "replace":
@@ -1134,6 +1254,10 @@ _site_install() (
   trap _site_finish EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  if [ -z "$source" ]; then
+    source="$work/input"
+    _site_tool generate "$source" "$sni" || return 1
+  fi
   _site_tool prepare "$source" "$target" "$work" || return 1
   info "Резервная копия: ${work}/old"
   changed=1
@@ -1152,10 +1276,32 @@ _site_install() (
   info "Бэкап: ${work}/old. Конфиги и контейнеры VPN не менялись."
 )
 
+_site_auto_fix() (
+  local target="$1" sni="$2" backup_base="$3" ngx="$4" markers rc=0
+  # No prompts: selecting h authorizes replacement of a recognized template.
+  # Only the current index can authorize replacement, not forgotten old assets.
+  markers="$(_site_tool detect "$target/index.html")" || rc=$?
+  case "$rc" in
+    1) ok "Шаблон eGames на главной странице не обнаружен — сайт оставлен без изменений."; return 0 ;;
+    0) info "Обнаружен шаблон eGames: ${markers}" ;;
+    *) err "Проверка сайта не удалась — замена отменена."; return 1 ;;
+  esac
+  command -v flock >/dev/null 2>&1 || { err "Нужен flock (пакет util-linux)."; return 1; }
+  mkdir -p -- "$backup_base" || return 1
+  exec 9>"$backup_base/.site.lock" || return 1
+  flock -n 9 || { err "Замена сайта уже выполняется в другой сессии."; return 1; }
+  # Recheck inside the lock: another session may have replaced the template.
+  rc=0; _site_tool detect "$target/index.html" >/dev/null || rc=$?
+  case "$rc" in 1) return 0 ;; 0) ;; *) return 1 ;; esac
+  docker exec "$ngx" nginx -t || return 1
+  info "Устанавливаю страницу мирового времени. Старый сайт сохраню; при ошибке HTTPS выполню откат."
+  _site_install "" "$target" "$sni" "$backup_base"
+)
+
 block_camouflage() {
   require_node || return 1
   command -v python3 >/dev/null 2>&1 || { err "Для проверки сайта нужен python3 (apt install python3)."; return 1; }
-  local ngx inspect context sni target markers rc source action
+  local ngx inspect context sni target rc
   local -a containers
   mapfile -t containers < <(docker ps --filter "label=com.docker.compose.project.working_dir=${NODE_DIR}" \
     --format '{{.ID}} {{.Image}}' | awk '$2 ~ /(^|\/)nginx(:|@|$)/ {print $1}')
@@ -1171,28 +1317,7 @@ block_camouflage() {
   [ "$rc" -eq 0 ] || return 1
   sni="${context%%$'\n'*}"; target="${context#*$'\n'}"
   info "Сайт: https://${sni}; каталог на хосте: ${target}; nginx: ${ngx}"
-  rc=0; markers="$(_site_tool scan "$target")" || rc=$?
-  case "$rc" in
-    0) warn "Найдены признаки публичной заглушки: ${markers}" ;;
-    1) info "Известные HTML/CSS-маркеры не найдены. Это не проверка всех способов обнаружения VPN." ;;
-    *) err "Не удалось проверить файлы сайта."; return 1 ;;
-  esac
-  info "Для замены подготовьте каталог своего статического сайта: index.html, CSS, изображения и другие страницы."
-  info "Нужен сайт со своим содержанием. Рандомизация старого шаблона оставляет узнаваемые файлы."
-  info "Сохраняется .well-known; остальные старые файлы заменяются с бэкапом. Возможна краткая недоступность сайта."
-  ask action "1 — установить свой сайт; 0 — выйти после проверки" "0"
-  [ "$action" = 1 ] || return 0
-  ask source "Абсолютный путь к подготовленному каталогу сайта (пусто — отмена)"
-  [ -n "$source" ] || return 0
-  [[ "$source" = /* ]] || { err "Укажите абсолютный путь."; return 1; }
-  docker exec "$ngx" nginx -t || return 1
-  confirm "Заменить содержимое ${target} сайтом из ${source}?" || return 0
-  # flock prevents two menu sessions from replacing the same files concurrently.
-  command -v flock >/dev/null 2>&1 || { err "Нужен flock (пакет util-linux)."; return 1; }
-  (
-    flock -n 9 || { err "Замена сайта уже выполняется в другой сессии."; exit 1; }
-    _site_install "$source" "$target" "$sni" /root/nodeforge-bak
-  ) 9>/run/lock/nodeforge-site.lock
+  _site_auto_fix "$target" "$sni" /root/nodeforge-bak "$ngx"
 }
 
 # ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
@@ -3724,7 +3849,7 @@ _audit_camouflage() {
         case "$rc" in
           0)
             _a_warn "Сайт содержит признаки публичной заглушки: ${markers}"
-            _a_fix "Заменить шаблон своим статическим сайтом (спросит каталог, бэкап и HTTPS-проверка)" 0 block_camouflage ;;
+            _a_fix "Автоматически заменить распознанный шаблон eGames (бэкап и HTTPS-проверка)" 0 block_camouflage ;;
           1) info "Известные HTML-маркеры в ответе не найдены; это не гарантия нераспознаваемости VPN." ;;
           *) _a_warn "Не удалось проверить HTML сайта на признаки шаблона" ;;
         esac
@@ -4777,7 +4902,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
    ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
-   ${BOLD}${GRN} h)${RST} Свой сайт       ${GRY}— проверить заглушку и заменить своим сайтом с бэкапом${RST}
+   ${BOLD}${GRN} h)${RST} Исправить сайт  ${GRY}— найти шаблон eGames и автоматически заменить с бэкапом${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -4851,7 +4976,7 @@ menu() {
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
-        h|H) run_block "Свой сайт вместо шаблона" block_camouflage ;;
+        h|H) run_block "Автоматическая замена шаблона сайта" block_camouflage ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
