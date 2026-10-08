@@ -3216,15 +3216,15 @@ block_cert() {
 }
 
 # ============================================================================
-#  o)  ДОМЕНЫ XHTTP-НОДЫ ЗА CDN — сменить origin и CDN-имя без переустановки
+#  o)  ДОМЕНЫ VK-НОДЫ — сменить origin и CDN-имя XHTTP за VK CDN без переустановки
 # ----------------------------------------------------------------------------
-#  Нода, поставленная установщиком GHOST OS (XHTTP за CDN VK/Яндекса): nginx
+#  Нода, поставленная установщиком GHOST OS (XHTTP за VK CDN): nginx
 #  принимает оба имени (origin — для edge CDN и ACME, CDN-имя — Host клиента),
 #  сертификат origin лежит в /etc/nginx/ssl/<origin>/. Xray имён не проверяет,
 #  поэтому меняются только nginx и сертификат; CDN-ресурс и хост в панели —
 #  руками, скрипт подскажет и проверит.
 # ============================================================================
-NF_CDN_NGINX="${NF_CDN_NGINX:-/etc/nginx/sites-available/cdn-xhttp.conf}"
+NF_VK_NGINX="${NF_VK_NGINX:-/etc/nginx/sites-available/cdn-xhttp.conf}"
 
 _cdn_valid_name() {
   [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
@@ -3242,7 +3242,7 @@ _cdn_nginx_apply() {
     return 0
   fi
   nginx -t || true
-  cat "$1" > "$NF_CDN_NGINX"
+  cat "$1" > "$NF_VK_NGINX"
   systemctl reload nginx || true
   err "nginx -t не прошёл — вернул конфиг как был."
   return 1
@@ -3305,16 +3305,16 @@ _cdn_origin_cert() {
   warn "Самоподписанный сертификат для ${d} на месте. Выпустить настоящий — повтори пункт, когда DNS и порт 80 будут в порядке."
 }
 
-block_cdn_domain() {
-  local f="$NF_CDN_NGINX" old_origin old_cdn origin cdn ip addrs bak code rc
+block_vk_domain() {
+  local f="$NF_VK_NGINX" old_origin old_cdn origin cdn ip addrs bak code rc
   if [ ! -f "$f" ]; then
-    err "Не нашёл ${f} — пункт для нод, поставленных установщиком GHOST OS (XHTTP за CDN)."
+    err "Не нашёл ${f} — пункт для нод, поставленных установщиком GHOST OS (XHTTP за VK CDN)."
     return 1
   fi
   read -r old_origin old_cdn < <(awk '$1 == "server_name" { $1 = ""; gsub(/;/, ""); print; exit }' "$f")
   info "Сейчас: origin ${old_origin:-?}, CDN-имя ${old_cdn:-?}"
   ask origin "Новый origin (A-запись на этот сервер)" "$old_origin"
-  ask cdn "Новое CDN-имя (CNAME на ресурс CDN)" "$old_cdn"
+  ask cdn "Новое CDN-имя (CNAME на ресурс VK CDN)" "$old_cdn"
   origin="${origin,,}" cdn="${cdn,,}"
   if ! _cdn_valid_name "$origin" || ! _cdn_valid_name "$cdn"; then err "Это не похоже на доменные имена: ${origin} / ${cdn}"; return 1; fi
   if [ "$origin" = "$cdn" ]; then err "origin и CDN-имя должны различаться."; return 1; fi
@@ -3329,7 +3329,7 @@ block_cdn_domain() {
   fi
   addrs="$(_cdn_resolve "$cdn")"
   if [ -z "$addrs" ]; then
-    warn "${cdn} пока не резолвится — нет CNAME на ресурс CDN."
+    warn "${cdn} пока не резолвится — нет CNAME на ресурс VK CDN."
   elif [[ " ${addrs} " == *" ${ip} "* ]]; then
     warn "${cdn} смотрит прямо на этот сервер — клиенты пойдут мимо CDN."
   else
@@ -3365,18 +3365,18 @@ block_cdn_domain() {
     0:200) ok "Через CDN https://${cdn}/health → 200: CDN ходит в origin." ;;
     35:*|60:*|51:*)
       warn "CDN на ${cdn} обрывает TLS: у ресурса нет действующего сертификата для этого имени."
-      _a_hint "консоль CDN → ресурс → личный домен ${cdn} → SSL: выпустить Let's Encrypt (или загрузить свой) и дождаться выпуска" ;;
-    6:*) warn "${cdn} не резолвится — заведи CNAME на ресурс CDN." ;;
+      _a_hint "VK Cloud → CDN → ресурс → личный домен ${cdn} → SSL: выпустить Let's Encrypt (или загрузить свой) и дождаться выпуска" ;;
+    6:*) warn "${cdn} не резолвится — заведи CNAME на ресурс VK CDN." ;;
     0:5??)
       warn "CDN отвечает ${code}: не достучался до origin."
-      _a_hint "в ресурсе CDN origin = ${origin}, протокол HTTPS, порт 443" ;;
-    *) warn "Через CDN https://${cdn}/health → ${code:-нет ответа} (curl ${rc}) — проверь настройки ресурса CDN." ;;
+      _a_hint "в ресурсе VK CDN origin = ${origin}, протокол HTTPS, порт 443" ;;
+    *) warn "Через CDN https://${cdn}/health → ${code:-нет ответа} (curl ${rc}) — проверь настройки ресурса VK CDN." ;;
   esac
 
   echo
   info "Осталось в панели Remnawave → Hosts (хост этой ноды): адрес, SNI и Host — ${cdn}; путь тот же."
   info "Профиль ноды не трогать, если в его xhttpSettings нет поля host (у GHOST OS его нет)."
-  info "В ресурсе CDN: origin — ${origin} (HTTPS, 443), личный домен — ${cdn} с SSL."
+  info "В ресурсе VK CDN: origin — ${origin} (HTTPS, 443), личный домен — ${cdn} с SSL."
 }
 
 # Подтянуть свежий образ ноды и пересоздать контейнер (обрыв ~10 с).
@@ -5189,7 +5189,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} k)${RST} Порты для панели   ${GRY}— порт ноды и beszel только с IP панели${RST}
    ${BOLD}${GRN} m)${RST} MTU                ${GRY}— замерить путь и выставить MTU интерфейса${RST}
    ${BOLD}${GRN} c)${RST} Сертификат ноды    ${GRY}— продлить, сменить токен Cloudflare, наладить автопродление${RST}
-   ${BOLD}${GRN} o)${RST} Домены CDN-ноды    ${GRY}— XHTTP за CDN (GHOST OS): сменить origin и CDN-имя без переустановки${RST}
+   ${BOLD}${GRN} o)${RST} Домены VK-ноды     ${GRY}— XHTTP за VK CDN (GHOST OS): сменить origin и CDN-имя без переустановки${RST}
    ${BOLD}${GRN} s)${RST} Шейпер скорости    ${GRY}— лимиты на уровне ноды${RST}
    ${BOLD}${GRN} g)${RST} Блок РФ-госсетей   ${GRY}— прятать ноду от зондов госсетей${RST}
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
@@ -5240,7 +5240,7 @@ menu() {
         k|K) run_block "Порты для панели" block_panel_only ;;
         m|M) run_block "MTU" block_mtu ;;
         c|C) run_block "Сертификат ноды" block_cert ;;
-        o|O) run_block "Домены CDN-ноды" block_cdn_domain ;;
+        o|O) run_block "Домены VK-ноды" block_vk_domain ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
