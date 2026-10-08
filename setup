@@ -3215,6 +3215,170 @@ block_cert() {
   cert_maintain "$cert"
 }
 
+# ============================================================================
+#  o)  ДОМЕНЫ XHTTP-НОДЫ ЗА CDN — сменить origin и CDN-имя без переустановки
+# ----------------------------------------------------------------------------
+#  Нода, поставленная установщиком GHOST OS (XHTTP за CDN VK/Яндекса): nginx
+#  принимает оба имени (origin — для edge CDN и ACME, CDN-имя — Host клиента),
+#  сертификат origin лежит в /etc/nginx/ssl/<origin>/. Xray имён не проверяет,
+#  поэтому меняются только nginx и сертификат; CDN-ресурс и хост в панели —
+#  руками, скрипт подскажет и проверит.
+# ============================================================================
+NF_CDN_NGINX="${NF_CDN_NGINX:-/etc/nginx/sites-available/cdn-xhttp.conf}"
+
+_cdn_valid_name() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
+}
+
+# Адреса IPv4, в которые резолвится имя $1, через пробел.
+_cdn_resolve() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{ print $1 }' | sort -u | paste -sd' ' || true
+}
+
+# Применить правку конфига nginx: nginx -t и reload, иначе вернуть копию $1.
+_cdn_nginx_apply() {
+  if nginx -t 2>/dev/null; then
+    systemctl reload nginx
+    return 0
+  fi
+  nginx -t || true
+  cat "$1" > "$NF_CDN_NGINX"
+  systemctl reload nginx || true
+  err "nginx -t не прошёл — вернул конфиг как был."
+  return 1
+}
+
+# na_filter пускает только порты из реестра (на CDN-ноде — 443), а HTTP-проверка
+# Let's Encrypt стучится на 80. Хук открывает 80 на время выпуска и продления и
+# сразу закрывает: acme.sh запоминает хуки и зовёт их при каждом продлении.
+NF_ACME_PORT80=/usr/local/sbin/nodeforge-acme-port80
+
+_acme_port80_hook_install() {
+  install -d -m 755 /usr/local/sbin
+  cat > "$NF_ACME_PORT80" <<'EOS'
+#!/bin/sh
+# nodeforge: open — пустить HTTP-проверку Let's Encrypt (tcp 80) сквозь na_filter,
+# close — убрать это правило. Вызывается acme.sh до и после выпуска/продления.
+case "$1" in
+  open)
+    nft list chain inet na_filter input >/dev/null 2>&1 || exit 0
+    nft insert rule inet na_filter input tcp dport 80 accept comment '"nodeforge-acme"' ;;
+  close)
+    for h in $(nft -a list chain inet na_filter input 2>/dev/null | awk '/nodeforge-acme/ { print $NF }'); do
+      nft delete rule inet na_filter input handle "$h"
+    done ;;
+esac
+EOS
+  chmod 755 "$NF_ACME_PORT80"
+}
+
+# Сертификат origin $1 в /etc/nginx/ssl/$1/: Let's Encrypt через acme.sh по webroot
+# (location /.well-known/acme-challenge/ на :80 уже есть) — nginx не останавливается.
+# Продлевает тот же acme.sh из своего cron и перезагружает nginx.
+_cdn_origin_cert() {
+  local d="$1" dir="/etc/nginx/ssl/$1" acme=/root/.acme.sh/acme.sh rc=0
+  install -d -m 755 "$dir" /var/www/certbot
+  if [ -x "$acme" ]; then
+    log "Выпускаю сертификат Let's Encrypt для ${d} (acme.sh, webroot — nginx работает дальше; порт 80 открыт только на время проверки)."
+    _acme_port80_hook_install
+    "$acme" --issue -d "$d" -w /var/www/certbot --keylength ec-256 --server letsencrypt \
+      --pre-hook "${NF_ACME_PORT80} open" --post-hook "${NF_ACME_PORT80} close" || rc=$?
+    # 2 — сертификат на это имя уже есть и продлевать рано: просто ставим его.
+    if { [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; } \
+       && "$acme" --install-cert -d "$d" --ecc --fullchain-file "${dir}/fullchain.pem" \
+            --key-file "${dir}/privkey.pem" --reloadcmd "systemctl reload nginx"; then
+      ok "Сертификат Let's Encrypt для ${d} на месте, продлевает acme.sh."
+      return 0
+    fi
+    err "Let's Encrypt не выдал сертификат для ${d} — см. вывод acme.sh выше."
+  else
+    err "Нет acme.sh (${acme}) — его ставит установщик GHOST OS."
+  fi
+  # Так же поступает и установщик: edge CDN к origin ходит и с самоподписанным.
+  confirm "Поставить самоподписанный сертификат на 10 лет (CDN его принимает, прямой заход в браузере покажет предупреждение)?" \
+    || return 1
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=${d}" -addext "subjectAltName=DNS:${d}" \
+    -keyout "${dir}/privkey.pem" -out "${dir}/fullchain.pem" 2>/dev/null \
+    || { err "openssl не выпустил самоподписанный сертификат."; return 1; }
+  chmod 600 "${dir}/privkey.pem"
+  warn "Самоподписанный сертификат для ${d} на месте. Выпустить настоящий — повтори пункт, когда DNS и порт 80 будут в порядке."
+}
+
+block_cdn_domain() {
+  local f="$NF_CDN_NGINX" old_origin old_cdn origin cdn ip addrs bak code rc
+  if [ ! -f "$f" ]; then
+    err "Не нашёл ${f} — пункт для нод, поставленных установщиком GHOST OS (XHTTP за CDN)."
+    return 1
+  fi
+  read -r old_origin old_cdn < <(awk '$1 == "server_name" { $1 = ""; gsub(/;/, ""); print; exit }' "$f")
+  info "Сейчас: origin ${old_origin:-?}, CDN-имя ${old_cdn:-?}"
+  ask origin "Новый origin (A-запись на этот сервер)" "$old_origin"
+  ask cdn "Новое CDN-имя (CNAME на ресурс CDN)" "$old_cdn"
+  origin="${origin,,}" cdn="${cdn,,}"
+  if ! _cdn_valid_name "$origin" || ! _cdn_valid_name "$cdn"; then err "Это не похоже на доменные имена: ${origin} / ${cdn}"; return 1; fi
+  if [ "$origin" = "$cdn" ]; then err "origin и CDN-имя должны различаться."; return 1; fi
+
+  ip="$(curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true)"
+  addrs="$(_cdn_resolve "$origin")"
+  if [ -z "$ip" ] || [[ " ${addrs} " != *" ${ip} "* ]]; then
+    err "${origin} резолвится в «${addrs:-никуда}», а сервер — ${ip:-?}: CDN и Let's Encrypt придут не сюда."
+    confirm "Всё равно продолжить?" || return 1
+  else
+    ok "${origin} → ${ip} (этот сервер)"
+  fi
+  addrs="$(_cdn_resolve "$cdn")"
+  if [ -z "$addrs" ]; then
+    warn "${cdn} пока не резолвится — нет CNAME на ресурс CDN."
+  elif [[ " ${addrs} " == *" ${ip} "* ]]; then
+    warn "${cdn} смотрит прямо на этот сервер — клиенты пойдут мимо CDN."
+  else
+    ok "${cdn} → ${addrs} (CDN)"
+  fi
+
+  mkdir -p /root/nodeforge-bak
+  bak="/root/nodeforge-bak/$(basename "$f").$(date +%F-%H%M%S)"
+  cp -a "$f" "$bak"
+  log "Копия конфига: ${bak}"
+
+  # 1) Сначала имена: на :80 нового origin уже отвечает ACME-локация.
+  sed -i -E "s|^([[:space:]]*server_name)[[:space:]].*;|\\1 ${origin} ${cdn};|" "$f"
+  _cdn_nginx_apply "$bak" || return 1
+  ok "nginx принимает ${origin} и ${cdn}."
+
+  # 2) Сертификат origin и переключение на него.
+  _cdn_origin_cert "$origin" || { cat "$bak" > "$f"; systemctl reload nginx || true; err "Конфиг возвращён."; return 1; }
+  sed -i -E "s#/etc/nginx/ssl/[^/]+/(fullchain\\.pem|privkey\\.pem)#/etc/nginx/ssl/${origin}/\\1#" "$f"
+  _cdn_nginx_apply "$bak" || return 1
+  if [ -n "$old_origin" ] && [ "$old_origin" != "$origin" ] && [ -x /root/.acme.sh/acme.sh ]; then
+    /root/.acme.sh/acme.sh --remove -d "$old_origin" --ecc >/dev/null 2>&1 || true
+    info "acme.sh больше не продлевает ${old_origin}."
+  fi
+
+  # 3) Проверка: origin напрямую и путь через CDN.
+  code="$(curl -sk -m 8 -o /dev/null -w '%{http_code}' --resolve "${origin}:443:127.0.0.1" "https://${origin}/health" || true)"
+  if [ "$code" = 200 ]; then ok "origin https://${origin}/health → 200"
+  else err "origin https://${origin}/health → ${code:-нет ответа}"; fi
+  rc=0
+  code="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "https://${cdn}/health" 2>/dev/null)" || rc=$?
+  case "$rc:$code" in
+    0:200) ok "Через CDN https://${cdn}/health → 200: CDN ходит в origin." ;;
+    35:*|60:*|51:*)
+      warn "CDN на ${cdn} обрывает TLS: у ресурса нет действующего сертификата для этого имени."
+      _a_hint "консоль CDN → ресурс → личный домен ${cdn} → SSL: выпустить Let's Encrypt (или загрузить свой) и дождаться выпуска" ;;
+    6:*) warn "${cdn} не резолвится — заведи CNAME на ресурс CDN." ;;
+    0:5??)
+      warn "CDN отвечает ${code}: не достучался до origin."
+      _a_hint "в ресурсе CDN origin = ${origin}, протокол HTTPS, порт 443" ;;
+    *) warn "Через CDN https://${cdn}/health → ${code:-нет ответа} (curl ${rc}) — проверь настройки ресурса CDN." ;;
+  esac
+
+  echo
+  info "Осталось в панели Remnawave → Hosts (хост этой ноды): адрес, SNI и Host — ${cdn}; путь тот же."
+  info "Профиль ноды не трогать, если в его xhttpSettings нет поля host (у GHOST OS его нет)."
+  info "В ресурсе CDN: origin — ${origin} (HTTPS, 443), личный домен — ${cdn} с SSL."
+}
+
 # Подтянуть свежий образ ноды и пересоздать контейнер (обрыв ~10 с).
 _fix_node_update() {
   require_node
@@ -5025,6 +5189,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} k)${RST} Порты для панели   ${GRY}— порт ноды и beszel только с IP панели${RST}
    ${BOLD}${GRN} m)${RST} MTU                ${GRY}— замерить путь и выставить MTU интерфейса${RST}
    ${BOLD}${GRN} c)${RST} Сертификат ноды    ${GRY}— продлить, сменить токен Cloudflare, наладить автопродление${RST}
+   ${BOLD}${GRN} o)${RST} Домены CDN-ноды    ${GRY}— XHTTP за CDN (GHOST OS): сменить origin и CDN-имя без переустановки${RST}
    ${BOLD}${GRN} s)${RST} Шейпер скорости    ${GRY}— лимиты на уровне ноды${RST}
    ${BOLD}${GRN} g)${RST} Блок РФ-госсетей   ${GRY}— прятать ноду от зондов госсетей${RST}
    ${BOLD}${GRN} n)${RST} SSH-уведомления    ${GRY}— Telegram при входе по SSH${RST}
@@ -5075,6 +5240,7 @@ menu() {
         k|K) run_block "Порты для панели" block_panel_only ;;
         m|M) run_block "MTU" block_mtu ;;
         c|C) run_block "Сертификат ноды" block_cert ;;
+        o|O) run_block "Домены CDN-ноды" block_cdn_domain ;;
         s|S) run_block "Шейпер" block_shaper ;;
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
