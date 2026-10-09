@@ -97,7 +97,7 @@ NO_COLOR=1 bash <(curl -Ls https://raw.githubusercontent.com/Aleshinson/nodeforg
  
 | № | Пункт | Что делает |
 |---|-------|------------|
-| 6 | RU-блокировка | Штатные + RU geoip/geosite (runetfreedom), bind-mount в `remnanode`, cron-обновление. Печатает JSON `outbounds`/`routing` для панели. |
+| 6 | RU-блокировка | RU geoip/geosite (runetfreedom) + свежий `geosite.dat` (Loyalsoldier) вместо застывшего в образе, bind-mount в `remnanode`, cron-обновление всех трёх. Печатает JSON `outbounds`/`routing` для панели. |
 | 7 | Логи ноды | logrotate + zstd для `/var/log/remnanode`. Забирает эту маску у станзы node-accelerator — иначе две станзы на один файл и logrotate падает. |
 | 8 | XHTTP | `location /<путь>/` в `nginx.conf`, `nginx -t` + откат. |
 | r | gRPC | То же для gRPC (сокет `xrgrpc`). |
@@ -136,7 +136,7 @@ NO_COLOR=1 bash <(curl -Ls https://raw.githubusercontent.com/Aleshinson/nodeforg
 | g | Блок РФ-госсетей | Отдельная nft-таблица, drop входящих с госсетей. |
 | n | SSH-уведомления | Telegram при входе по SSH. |
 | b | Бэкап конфигов | Один архив: sshd, реестр, compose/nginx ноды, logrotate, сеть, nft, cron. |
-| u | Обновить списки | geo / блоклисты / госсети + самолечение cron. |
+| u | Обновить списки | geo (переписывает `update-geo.sh` на актуальный, с `geosite.dat`) / блоклисты / госсети + самолечение cron. |
 | w | netbird: обновить | apt-обновление демона. |
 | l | Fleet-sync | Ноды флота держат IP друг друга в whitelist (через API панели). |
 | v | SNI-проверка ноды | `SNI_VERIFICATION` для mTLS панель→нода (node ≥ 3.4). |

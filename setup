@@ -692,6 +692,31 @@ block_remnanode() {
   fi
 }
  
+# Скрипт авто-обновления geo-ассетов Xray (cron, Вс 04:00). Кроме RU-списков
+# обновляет и штатный geosite.dat: в образе ноды он застывает на дате сборки,
+# и новые домены категорий туда не попадают (google-deepmind без flow.google.com).
+_write_geo_updater() {
+  local assets="$1" geo="$2"
+  { printf '#!/bin/bash\nset -e\nASSETS=%q\nNODE=%q\n' "$assets" "$NODE_CONTAINER"; cat <<'EOS'
+TMP=$(mktemp -d)
+wget -q -O "$TMP/geosite-ru.dat" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+wget -q -O "$TMP/geoip-ru.dat"   https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+wget -q -O "$TMP/geosite.dat"    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+for f in geosite-ru.dat geoip-ru.dat geosite.dat; do
+  [ "$(stat -c%s "$TMP/$f")" -gt 1000000 ] || { echo "$f suspiciously small"; exit 1; }
+done
+mv "$TMP/geosite-ru.dat" "$ASSETS/geosite-ru.dat"
+mv "$TMP/geoip-ru.dat"   "$ASSETS/geoip-ru.dat"
+mv "$TMP/geosite.dat"    "$ASSETS/geosite.dat"
+chmod 644 "$ASSETS"/*.dat
+rmdir "$TMP"
+docker restart "$NODE" >/dev/null
+echo "geo update done: $(date)"
+EOS
+  } > "$geo"
+  chmod +x "$geo"
+}
+
 # ----- 7) RU-блокировка (RU geoip/geosite + bind-mount + cron) -----
 block_rublock() {
   local assets geo cnt
@@ -713,6 +738,16 @@ block_rublock() {
     err "RU-списки скачались подозрительно маленькими — прерываю."
     return 1
   fi
+
+  log "Скачиваю свежий geosite.dat (Loyalsoldier) вместо штатного из образа."
+  wget -qO "${assets}/geosite.dat.new" \
+    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat || true
+  if [ "$(stat -c%s "${assets}/geosite.dat.new" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+    mv "${assets}/geosite.dat.new" "${assets}/geosite.dat"
+  else
+    rm -f "${assets}/geosite.dat.new"
+    warn "geosite.dat не скачался — оставляю штатный, обновит cron."
+  fi
   chmod 644 "$assets"/*.dat
 
   log "Прописываю bind-mount ассетов в docker-compose."
@@ -728,21 +763,7 @@ log "В контейнере .dat-файлов: ${cnt} (ожидаем 4)."
   fi
  
   log "Ставлю авто-обновление списков (cron, воскресенье 04:00)."
-  { printf '#!/bin/bash\nset -e\nASSETS=%q\nNODE=%q\n' "$assets" "$NODE_CONTAINER"; cat <<'EOS'
-TMP=$(mktemp -d)
-wget -q -O "$TMP/geosite-ru.dat" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
-wget -q -O "$TMP/geoip-ru.dat"   https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
-[ "$(stat -c%s "$TMP/geosite-ru.dat")" -gt 1000000 ] || { echo "geosite-ru.dat suspiciously small"; exit 1; }
-[ "$(stat -c%s "$TMP/geoip-ru.dat")"   -gt 1000000 ] || { echo "geoip-ru.dat suspiciously small"; exit 1; }
-mv "$TMP/geosite-ru.dat" "$ASSETS/geosite-ru.dat"
-mv "$TMP/geoip-ru.dat"   "$ASSETS/geoip-ru.dat"
-chmod 644 "$ASSETS"/*.dat
-rmdir "$TMP"
-docker restart "$NODE" >/dev/null
-echo "geo update done: $(date)"
-EOS
-  } > "$geo"
-  chmod +x "$geo"
+  _write_geo_updater "$assets" "$geo"
   if crontab -l 2>/dev/null | grep -qF "$geo"; then
     log "Cron уже настроен."
   else
@@ -2400,10 +2421,12 @@ block_update_lists() {
   step "Обновление всех списков сетей"
   if require_node >/dev/null 2>&1; then geo="$(dirname "$(_node_assets_dir)")/update-geo.sh"; fi
 
-  # 1) RU geoip/geosite для Xray (если настроена RU-блокировка)
+  # 1) geo-ассеты Xray (если настроена RU-блокировка). Скрипт переписываем
+  #    каждый раз: на нодах, настроенных раньше, он не обновлял geosite.dat.
   if [ -n "$geo" ] && [ -x "$geo" ]; then
-    log "RU geoip/geosite (Xray)…"
-    if "$geo"; then ok "RU-списки обновлены."; else warn "RU-списки: ошибка (см. вывод)."; fi
+    _write_geo_updater "$(_node_assets_dir)" "$geo"
+    log "geo-ассеты Xray (RU-списки + geosite.dat)…"
+    if "$geo"; then ok "geo-списки обновлены."; else warn "geo-списки: ошибка (см. вывод)."; fi
     did=1
   fi
 
