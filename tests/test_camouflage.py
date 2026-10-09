@@ -16,6 +16,10 @@ SUSPECT = '''<!doctype html><title>Page_a1b2c3d4</title>
 <meta content="0123456789abcdef0123456789abcdef" name="session-id">
 <!-- 0123456789abcdef --><body class="style-aabbccdd">Old template</body>'''
 CLEAN = '<!doctype html><title>Field notes</title><h1>My field notes</h1>'
+API_VARIANTS = {
+    "reference": "status-codes", "palette": "palettes", "calendar": "months",
+    "typography": "type-scales", "units": "units", "geometry": "shapes", "paper": "paper-sizes",
+}
 
 
 class CamouflageTests(unittest.TestCase):
@@ -180,10 +184,9 @@ _site_auto_fix "$1" example.org "$2" nginx-id "$5" "$6"
         result = self.bash('_site_tool detect "$1"', self.site / "index.html")
         self.assert_ok(result)
 
-    def test_three_api_sites_have_distinct_pages_and_real_json_routes(self):
+    def test_seven_api_sites_have_distinct_pages_and_real_json_routes(self):
         pages = []
-        routes = {"reference": "status-codes", "palette": "palettes", "calendar": "months"}
-        for variant, route in routes.items():
+        for variant, route in API_VARIANTS.items():
             with self.subTest(variant=variant):
                 output = self.base / variant
                 self.assert_ok(self.bash('_site_tool generate "$1" example.org "$2"', output, variant))
@@ -200,20 +203,25 @@ _site_auto_fix "$1" example.org "$2" nginx-id "$5" "$6"
                 paths = set(re.findall(r'/v1/[a-z-]+\.json', page))
                 self.assertGreaterEqual(len(paths), 2)
                 for path in paths:
-                    json.loads((output / path.lstrip("/")).read_text(encoding="utf-8"))
-        self.assertEqual(len(set(pages)), 3)
+                    content = (output / path.lstrip("/")).read_text(encoding="utf-8")
+                    dataset = json.loads(content)
+                    self.assertEqual(dataset["count"], len(dataset["items"]))
+                    self.assertNotRegex(content.lower(), r'vpn|xray|vless|reality|remnawave|egames|nodeforge')
+                self.assertNotRegex(page.lower(), r'vpn|xray|vless|reality|remnawave|egames|nodeforge')
+        self.assertEqual(len(set(pages)), 7)
 
     def test_explicit_variant_replaces_clock_or_custom_site_without_egames(self):
         (self.site / "index.html").write_text(CLEAN)
-        for variant in ("palette", "calendar"):
+        for variant in ("palette", "calendar", "typography", "units", "geometry", "paper"):
             result = self.auto_fix(variant=variant, selected="1")
             self.assert_ok(result)
             self.assertNotIn("UNEXPECTED_PROMPT", result.stderr)
             page = (self.site / "index.html").read_text(encoding="utf-8")
             self.assertIn("/v1/", page)
         self.assertFalse((self.site / "v1" / "palettes.json").exists())
-        self.assertTrue((self.site / "v1" / "months.json").exists())
-        self.assertEqual(len(list(self.backups.glob("site-*/old/index.html"))), 2)
+        self.assertFalse((self.site / "v1" / "shapes.json").exists())
+        self.assertTrue((self.site / "v1" / "paper-sizes.json").exists())
+        self.assertEqual(len(list(self.backups.glob("site-*/old/index.html"))), 6)
 
     def test_bad_api_response_restores_entire_previous_site(self):
         result = self.auto_fix(bad_api="/v1/status-codes.json")
@@ -263,7 +271,8 @@ require('vm').runInNewContext(script, {
         self.assert_ok(result)
 
     def test_menu_selects_variant_without_path_or_confirmation_questions(self):
-        for choice, variant in (("1", "reference"), ("2", "palette"), ("3", "calendar")):
+        for number, variant in enumerate(API_VARIANTS, 1):
+            choice = str(number)
             with self.subTest(choice=choice):
                 result = self.bash('''
 _site_auto_fix() { printf 'DEPLOY:%s:%s\\n' "$5" "$6"; }

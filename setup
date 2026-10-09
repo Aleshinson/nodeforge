@@ -917,6 +917,7 @@ _nginx_container() {
 _site_tool() {
   python3 - "$@" <<'PY'
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -1037,6 +1038,64 @@ def generate(destination, domain, variant="reference"):
         }
         visual = '<div class="hero-art calendar-strip" aria-label="Monday through Sunday">' + ''.join(
             f'<div><span>{name[:3]}</span><strong>{n:02}</strong></div>' for n, name in enumerate(days_en, 1)) + '</div>'
+    elif variant == "typography":
+        title, headline = "Typography API", "Good type starts with a little rhythm."
+        intro = "Modular size scales and system font stacks for websites and editorial layouts. Reference values you can use without downloading a font."
+        endpoints = {
+            "type-scales": ("Modular scales", [{"name": name, "base_px": 16, "ratio": round(ratio, 6),
+                "sizes_px": [round(16 * ratio ** step, 2) for step in range(6)]} for name, ratio in (
+                    ("Major second", 9 / 8), ("Minor third", 6 / 5), ("Major third", 5 / 4), ("Perfect fourth", 4 / 3))]),
+            "font-stacks": ("System font stacks", [{"name": name, "category": category, "css": css} for name, category, css in (
+                ("Editorial", "serif", "Georgia, 'Times New Roman', serif"),
+                ("Book", "serif", "'Palatino Linotype', Palatino, serif"),
+                ("Humanist", "sans-serif", "'Trebuchet MS', Verdana, sans-serif"),
+                ("Utility", "sans-serif", "Verdana, Geneva, sans-serif"),
+                ("Code", "monospace", "Consolas, 'Courier New', monospace"))]),
+        }
+        visual = '<div class="hero-art type-specimen"><strong>Aa</strong><div><span>THE QUICK BROWN FOX</span><p>Form follows the words.</p><small>16 / 20 / 25 / 31.25 / 39.06 / 48.83</small></div></div>'
+    elif variant == "units":
+        title, headline = "Units API", "Different units. One clear reference."
+        intro = "Multipliers for everyday length, mass and time units. Multiply a value by its factor to express it in the base unit for that quantity."
+        endpoints = {
+            "units": ("Unit multipliers", [{"symbol": symbol, "name": name, "quantity": quantity, "base_unit": base,
+                "to_base": factor} for symbol, name, quantity, base, factor in (
+                    ("mm", "millimetre", "length", "m", 0.001), ("cm", "centimetre", "length", "m", 0.01),
+                    ("m", "metre", "length", "m", 1), ("km", "kilometre", "length", "m", 1000),
+                    ("mg", "milligram", "mass", "kg", 0.000001), ("g", "gram", "mass", "kg", 0.001),
+                    ("kg", "kilogram", "mass", "kg", 1), ("s", "second", "time", "s", 1),
+                    ("min", "minute", "time", "s", 60), ("h", "hour", "time", "s", 3600))]),
+            "prefixes": ("Decimal prefixes", [{"name": name, "symbol": symbol, "factor": factor} for name, symbol, factor in (
+                ("micro", "µ", 0.000001), ("milli", "m", 0.001), ("centi", "c", 0.01),
+                ("deci", "d", 0.1), ("kilo", "k", 1000), ("mega", "M", 1000000))]),
+        }
+        visual = '<div class="hero-art measurement"><span>LENGTH / BASE UNIT: METRE</span><div><strong>1 m</strong><b>=</b><strong>100 cm</strong></div><p>10 mm → 1 cm · 1,000 m → 1 km</p></div>'
+    elif variant == "geometry":
+        title, headline = "Geometry API", "A small library of shape and space."
+        intro = "Elementary plane shapes, symbolic formulas and familiar angles. A compact reference for drawing tools, learning projects and visual experiments."
+        endpoints = {
+            "shapes": ("Plane shapes", [
+                {"name": "Circle", "area": "pi * r^2", "perimeter": "2 * pi * r", "variables": {"r": "radius"}},
+                {"name": "Square", "area": "a^2", "perimeter": "4 * a", "variables": {"a": "side length"}},
+                {"name": "Rectangle", "area": "w * h", "perimeter": "2 * (w + h)", "variables": {"w": "width", "h": "height"}},
+                {"name": "Triangle", "area": "b * h / 2", "perimeter": "a + b + c", "variables": {"a": "first side", "b": "base", "c": "third side", "h": "height perpendicular to base"}},
+            ]),
+            "angles": ("Angle reference", [{"degrees": degrees, "radians": round(math.radians(degrees), 8)}
+                for degrees in (0, 30, 45, 60, 90, 120, 180, 270, 360)]),
+        }
+        visual = '<div class="hero-art shape-study"><svg viewBox="0 0 660 180" role="img" aria-label="Circle, triangle and square"><circle cx="100" cy="90" r="70"/><path d="M250 160 L330 20 L410 160 Z"/><rect x="480" y="20" width="140" height="140"/></svg><span>01 / CIRCLE</span><span>02 / TRIANGLE</span><span>03 / SQUARE</span></div>'
+    elif variant == "paper":
+        title, headline = "Paper API", "A place for every printed idea."
+        intro = "A-series sheet dimensions and suggested margin presets for print layouts. Measurements are in millimetres; check your printer for its actual printable area."
+        endpoints = {
+            "paper-sizes": ("A-series sheets", [{"name": name, "width_mm": width, "height_mm": height} for name, width, height in (
+                ("A0", 841, 1189), ("A1", 594, 841), ("A2", 420, 594), ("A3", 297, 420),
+                ("A4", 210, 297), ("A5", 148, 210), ("A6", 105, 148))]),
+            "print-margins": ("Suggested margins", [{"name": name, "top_mm": margin, "right_mm": margin,
+                "bottom_mm": margin, "left_mm": margin, "purpose": purpose} for name, margin, purpose in (
+                    ("Compact", 10, "Dense reference sheets"), ("Everyday", 15, "Notes and handouts"),
+                    ("Reading", 20, "Longer text documents"), ("Spacious", 25, "Short editorial pieces"))]),
+        }
+        visual = '<div class="hero-art paper-sheet"><span>210 × 297 mm</span><strong>A4</strong><div class="paper-lines" aria-hidden="true"></div><small>Room for an idea.</small></div>'
     else:
         raise ValueError("Неизвестный вариант API-сайта: " + variant)
 
@@ -1111,7 +1170,26 @@ body.palette { --bg:#f6eee5; --panel:#fff7ef; --ink:#362b27; --muted:#725d51; --
 .calendar-strip { display:grid; grid-template-columns:repeat(7,1fr); border:1px solid var(--line); background:var(--panel); }
 .calendar-strip div { padding:18px; border-right:1px solid var(--line); } .calendar-strip div:last-child { border:0; }
 .calendar-strip span { display:block; font-size:12px; color:var(--muted); } .calendar-strip strong { display:block; font:2rem Georgia,serif; margin-top:12px; }
-@media(max-width:760px) { header,main,footer { padding:22px; } .docs,.reference .hero,.palette .endpoint-list { grid-template-columns:minmax(0,1fr); gap:24px; } .hero { padding-top:15px; } .hero-art { margin-top:15px; } .calendar-strip div { padding:10px 5px; text-align:center; } .calendar-strip strong { font-size:1.4rem; } .swatches { height:120px; } .swatches span { left:3px; bottom:6px; padding:2px; font-size:9px; } header { flex-wrap:wrap; gap:8px; } }
+body.typography { --bg:#f4f2ee; --panel:#fff; --ink:#292326; --muted:#6d6268; --line:#cfc5c9; --accent:#913052; --code:#ebe6e8; }
+.typography h1 { font-style:italic; } .type-specimen { display:flex; align-items:center; gap:45px; border-top:3px solid var(--ink); border-bottom:1px solid var(--line); padding:18px 0; }
+.type-specimen strong { font:italic 8rem/1 Georgia,serif; color:var(--accent); } .type-specimen span { font:10px Consolas,monospace; letter-spacing:.12em; }
+.type-specimen p { margin:12px 0; font:1.7rem Georgia,serif; } .type-specimen small { color:var(--muted); font:11px Consolas,monospace; }
+body.units { color-scheme:dark; --bg:#112529; --panel:#193238; --ink:#e4eeeb; --muted:#aec7c5; --line:#37555a; --accent:#e0bd70; --code:#193238; }
+.units h1 { font-family:'Trebuchet MS',sans-serif; } .measurement { padding:28px; border:1px solid var(--line); background:repeating-linear-gradient(90deg,transparent 0,transparent 39px,var(--line) 40px,transparent 41px); }
+.measurement > span,.measurement p { font:12px Consolas,monospace; color:var(--muted); } .measurement > div { display:flex; align-items:baseline; flex-wrap:wrap; gap:24px; padding:20px 0; }
+.measurement strong { font:400 clamp(2.4rem,6vw,4.8rem)/1.2 Consolas,monospace; } .measurement b { font:3rem Georgia,serif; color:var(--accent); }
+body.geometry { --bg:#fff4d9; --panel:#fffaef; --ink:#38251e; --muted:#735447; --line:#d7b992; --accent:#a03b20; --code:#f7e7c6; }
+.geometry h1 { font-family:'Trebuchet MS',sans-serif; font-weight:bold; } .shape-study { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:15px; }
+.shape-study svg { grid-column:1/-1; width:100%; max-height:200px; fill:none; stroke:var(--accent); stroke-width:3; }
+.shape-study span { text-align:center; font:11px Consolas,monospace; letter-spacing:.08em; }
+.geometry .docs { grid-template-columns:minmax(0,1fr); gap:25px; } .geometry aside { display:flex; align-items:center; flex-wrap:wrap; gap:25px; }
+.geometry aside h2,.geometry .aside-note { margin:0; } .geometry aside a { border:0; } .geometry .endpoint-list { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:30px; }
+body.paper { --bg:#f1efe4; --panel:#fffdf5; --ink:#27382e; --muted:#5b6c5d; --line:#bcc8b6; --accent:#406449; --code:#e3e8dc; }
+.paper .hero { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(0,.8fr); align-items:center; gap:55px; }
+.paper-sheet { width:210px; max-width:100%; aspect-ratio:210/297; padding:24px; justify-self:center; display:flex; flex-direction:column; border:1px solid var(--line); background:var(--panel); box-shadow:8px 8px 0 #dce2d4; }
+.paper-sheet span,.paper-sheet small { font:11px Consolas,monospace; color:var(--muted); } .paper-sheet strong { font:4.7rem Georgia,serif; padding:15px 0; }
+.paper-lines { flex:1; margin-bottom:15px; background:repeating-linear-gradient(transparent 0,transparent 15px,var(--line) 16px,transparent 17px); }
+@media(max-width:760px) { header,main,footer { padding:22px; } .docs,.reference .hero,.palette .endpoint-list,.geometry .endpoint-list,.paper .hero { grid-template-columns:minmax(0,1fr); gap:24px; } .hero { padding-top:15px; } .hero-art { margin-top:15px; } .calendar-strip div { padding:10px 5px; text-align:center; } .calendar-strip strong { font-size:1.4rem; } .swatches { height:120px; } .swatches span { left:3px; bottom:6px; padding:2px; font-size:9px; } header { flex-wrap:wrap; gap:8px; } .type-specimen { flex-direction:column; align-items:flex-start; gap:18px; } .type-specimen strong { font-size:6rem; } .measurement { padding:18px; } .measurement > div { gap:12px; } .shape-study { gap:6px; } .shape-study span { font-size:9px; letter-spacing:0; } }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 </style></head>
 <body class="__VARIANT__"><header><a class="brand" href="/">__DOMAIN__</a><span class="header-note">JSON / READ ONLY / V1</span></header>
@@ -1368,7 +1446,7 @@ _site_install() (
 _site_auto_fix() (
   local target="$1" sni="$2" backup_base="$3" ngx="$4" markers rc=0
   local variant="${5:-reference}" selected="${6:-0}"
-  case "$variant" in reference|palette|calendar) ;; *) err "Неизвестный вариант сайта."; return 1 ;; esac
+  case "$variant" in reference|palette|calendar|typography|units|geometry|paper) ;; *) err "Неизвестный вариант сайта."; return 1 ;; esac
   # An explicit variant selection authorizes full replacement, including the
   # previous clock page. Unattended calls still require the eGames fingerprint.
   if [ "$selected" != 1 ]; then
@@ -1401,11 +1479,15 @@ _site_choose() {
     1) info "Маркеры eGames не обнаружены. Можно заменить текущий сайт выбранным вариантом API." ;;
     *) err "Не удалось проверить текущий сайт — замена отменена."; return 1 ;;
   esac
-  info "Выбор 1–3 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
+  info "Выбор 1–7 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
   cat <<'EOF'
   1) HTTP Reference API — HTTP-коды и методы, тёмная документация
   2) Palette API        — палитры и цвета, светлая галерея
   3) Calendar API       — месяцы и дни недели, календарный справочник
+  4) Typography API     — шрифтовые шкалы и системные шрифты
+  5) Units API          — единицы измерения и десятичные приставки
+  6) Geometry API       — геометрические фигуры, формулы и углы
+  7) Paper API          — форматы бумаги и примеры полей для печати
   0) Назад без изменений
 EOF
   while true; do
@@ -1414,8 +1496,12 @@ EOF
       1) variant=reference; break ;;
       2) variant=palette; break ;;
       3) variant=calendar; break ;;
+      4) variant=typography; break ;;
+      5) variant=units; break ;;
+      6) variant=geometry; break ;;
+      7) variant=paper; break ;;
       0|"") return 0 ;;
-      *) warn "Выберите 1, 2, 3 или 0." ;;
+      *) warn "Выберите номер от 1 до 7 или 0." ;;
     esac
   done
   _site_auto_fix "$target" "$sni" "$backup_base" "$ngx" "$variant" 1
@@ -4138,7 +4224,7 @@ _audit_camouflage() {
         case "$rc" in
           0)
             _a_warn "Сайт содержит признаки публичной заглушки: ${markers}"
-            _a_fix "Полностью заменить сайт eGames (3 варианта API, бэкап и HTTPS-проверка)" 0 block_camouflage ;;
+            _a_fix "Полностью заменить сайт eGames (7 вариантов API, бэкап и HTTPS-проверка)" 0 block_camouflage ;;
           1) info "Известные HTML-маркеры в ответе не найдены; это не гарантия нераспознаваемости VPN." ;;
           *) _a_warn "Не удалось проверить HTML сайта на признаки шаблона" ;;
         esac
@@ -5191,7 +5277,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 7)${RST} Логи ноды       ${GRY}— logrotate + zstd${RST}
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
    ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
-   ${BOLD}${GRN} h)${RST} Свой API-сайт   ${GRY}— 3 варианта на выбор, полная замена сайта с бэкапом${RST}
+   ${BOLD}${GRN} h)${RST} Свой API-сайт   ${GRY}— 7 вариантов на выбор, полная замена сайта с бэкапом${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
