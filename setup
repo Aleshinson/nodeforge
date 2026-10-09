@@ -5201,13 +5201,16 @@ self_update() {
   step "Обновление скрипта"
   log "Источник: ${UPDATE_URL}"
  
-  local dest="$SELF" tmp
+  local dest="$SELF" tmp url="${UPDATE_URL%%#*}" separator='?'
   case "$dest" in
     /dev/fd/*|/proc/*|"") dest="$(pwd)/setup.sh" ;;   # запущено не из файла
   esac
  
-  tmp="$(mktemp)"
-  if ! curl -fsSL "$UPDATE_URL" -o "$tmp"; then
+  # Revalidate and use a new cache key: a branch URL may still serve old content.
+  [[ "$url" == *\?* ]] && separator='&'
+  url="${url}${separator}_nodeforge_update=$(date +%s)-$$-${RANDOM}"
+  tmp="$(mktemp)" || { err "Не удалось создать временный файл обновления."; return 1; }
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 -H 'Cache-Control: no-cache' "$url" -o "$tmp"; then
     err "Не удалось скачать обновление с ${UPDATE_URL}."
     rm -f "$tmp"; return 1
   fi
@@ -5215,17 +5218,24 @@ self_update() {
     err "Скачанный файл не похож на скрипт (пустой или без shebang) — обновление отменено."
     rm -f "$tmp"; return 1
   fi
-  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
-    rm -f "$tmp"
-    log "У тебя уже последняя версия (${dest})."
-    return 0
+  if ! bash -n "$tmp"; then
+    err "В скачанном скрипте ошибка синтаксиса — обновление отменено."
+    rm -f "$tmp"; return 1
   fi
- 
-  cat "$tmp" > "$dest"
+  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+    log "Файл ${dest} уже совпадает со скачанной версией."
+  else
+    if ! cat "$tmp" > "$dest"; then
+      err "Не удалось сохранить обновление в ${dest}."
+      rm -f "$tmp"; return 1
+    fi
+    chmod +x "$dest" 2>/dev/null || true
+    ok "Скрипт обновлён: ${dest}"
+  fi
   rm -f "$tmp"
-  chmod +x "$dest" 2>/dev/null || true
-  ok "Скрипт обновлён: ${dest}"
-  log "Перезапускаю обновлённую версию..."
+  # The on-disk file can be fresh while this process still has old functions.
+  # Always exec it, including when started via bash <(curl ...).
+  log "Перезапускаю скрипт, чтобы меню соответствовало скачанной версии..."
   exec bash "$dest"
 }
  
