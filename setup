@@ -2942,6 +2942,93 @@ block_panel_only() {
 
 
 # ============================================================================
+#  ОТКАЗ НА ПОРТЫ, КУДА СТУЧАТСЯ КЛИЕНТЫ  (REFUSE_TCP в реестре)
+# ----------------------------------------------------------------------------
+#  Хост подписки смотрит на порт, где никто не слушает. na_filter молча роняет SYN,
+#  клиент повторяет его, и автобан за скан банит общий IP оператора. Своя таблица на
+#  хуке input раньше na_filter отвечает на такие SYN отказом (RST): в счёт скана они
+#  не идут, клиент сразу видит «закрыто». Лечит симптом — сам хост правится в панели.
+# ============================================================================
+REFUSE_BIN="/usr/local/sbin/nodeforge-refuse"
+
+_refuse_write_runtime() {
+  cat > "$REFUSE_BIN" <<'EOS'
+#!/bin/bash
+# nodeforge refuse — на TCP-порты из REFUSE_TCP отвечать RST раньше na_filter.
+# Читает /etc/nodeforge/firewall.env.
+set -eu
+ENV=/etc/nodeforge/firewall.env
+[ -f "$ENV" ] && . "$ENV"
+ports="$(printf '%s\n' "${REFUSE_TCP:-}" | tr ', ' '\n\n' | sed '/^$/d' | sort -un | paste -sd,)"
+if [ -z "$ports" ]; then
+  nft delete table inet nodeforge_refuse 2>/dev/null || true
+  echo "refuse: портов нет — правило снято"
+  exit 0
+fi
+nft -f - <<NFT
+table inet nodeforge_refuse
+delete table inet nodeforge_refuse
+table inet nodeforge_refuse {
+	chain in {
+		type filter hook input priority -20; policy accept;
+		tcp dport { ${ports} } tcp flags syn / fin,syn,rst,ack counter reject with tcp reset
+	}
+}
+NFT
+echo "refuse: на TCP ${ports} отвечаю отказом"
+EOS
+  chmod 755 "$REFUSE_BIN"
+  cat > /etc/systemd/system/nodeforge-refuse.service <<'EOS'
+[Unit]
+Description=nodeforge: answer RST on closed ports that stale client hosts knock on
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nodeforge-refuse
+ExecStop=/usr/sbin/nft delete table inet nodeforge_refuse
+
+[Install]
+WantedBy=multi-user.target
+EOS
+  systemctl daemon-reload
+}
+
+# Поставить/снять отказ по реестру (идемпотентно, переживает ребут).
+refuse_apply() {
+  fw_load
+  _refuse_write_runtime
+  if [ -z "${REFUSE_TCP:-}" ]; then
+    systemctl disable --now --quiet nodeforge-refuse.service 2>/dev/null || true
+    nft delete table inet nodeforge_refuse 2>/dev/null || true
+    ok "Отказ на порты снят."
+    return 0
+  fi
+  systemctl enable --quiet nodeforge-refuse.service
+  systemctl restart nodeforge-refuse.service
+  ok "На TCP ${REFUSE_TCP} отвечаю отказом — клиенты со старым хостом не попадут в бан за скан."
+  info "Сам хост с этим портом исправь в панели Remnawave → Hosts — тогда клиенты перестанут стучаться."
+}
+
+_fix_refuse_port() {
+  local port="$1"
+  fw_load
+  if ss -Hltn "( sport = :${port} )" 2>/dev/null | grep -q .; then
+    err "На TCP ${port} кто-то слушает — отвечать отказом нельзя."; return 1
+  fi
+  fw_set REFUSE_TCP "$(_merge_ports "${REFUSE_TCP:-}" "$port")"
+  refuse_apply
+}
+
+_fix_unrefuse_ports() {
+  fw_set REFUSE_TCP ""
+  refuse_apply
+}
+
+
+# ============================================================================
 #  m)  MTU  (путь до интернета уже, чем MTU интерфейса)
 # ----------------------------------------------------------------------------
 #  У части хостеров трафик идёт через туннель (GRE и т.п.), и путь пропускает
@@ -4309,6 +4396,7 @@ _audit_firewall() {
   if nft list table inet na_filter >/dev/null 2>&1; then
     _audit_cgnat_limits
     _audit_banned_clients
+    _audit_client_closed_ports
   fi
 
   # Без na_filter наружу открыто всё, что слушает; показываем то, чего нет в реестре.
@@ -4350,26 +4438,120 @@ _audit_cgnat_limits() {
   fi
 }
 
-# Баны, под которые попали IP, с которых сегодня реально ходили клиенты: автобан
-# na_filter (скан портов одним абонентом банит весь общий IP) и CrowdSec.
+# Записи «[na portscan]» за сутки: «IP порт», строка на попытку. Лог na_filter
+# ограничен по частоте — это нижняя оценка.
+_portscan_hits_24h() {
+  journalctl -k --since '-24 hours' --no-pager 2>/dev/null | grep -F '[na portscan]' \
+    | awk '{ s = ""; d = ""; p = ""
+             for (i = 1; i <= NF; i++) {
+               if ($i ~ /^SRC=/) s = substr($i, 5)
+               else if ($i ~ /^DPT=/) d = substr($i, 5)
+               else if ($i ~ /^PROTO=/) p = substr($i, 7)
+             }
+             if (p == "TCP" && s != "" && d != "") print s, d }' || true
+}
+
+# «IP пользователь» клиентов из лога Xray: текущий файл и ротированные за последние
+# N суток (по умолчанию 1: с текущим это сутки-двое — не короче окна _portscan_hits_24h).
+_xray_client_users() {
+  local d=/var/log/remnanode days="${1:-1}" f
+  { while read -r f; do
+      case "$f" in
+        *.zst) zstd -dcq "$f" ;;
+        *.gz)  zcat "$f" ;;
+        *)     cat "$f" ;;
+      esac
+    done < <(find "$d" -maxdepth 1 -name 'access.log-*' -mtime -"$days" 2>/dev/null | sort)
+    cat "$d/access.log"
+  } 2>/dev/null | grep -a ' accepted ' \
+    | sed -nE 's/.* from (tcp:|udp:)?(([0-9]{1,3}\.){3}[0-9]{1,3}):[0-9]+ .*email: ([^ ]+).*/\2 \4/p' \
+    | sort -u || true
+}
+
+# Баны, под которые попали IP, с которых сегодня реально ходили клиенты. Клиентов
+# режет автобан na_filter (скан портов одним абонентом банит весь общий IP) и CrowdSec —
+# но только если он стоит не на одном SSH: при CROWDSEC_SCOPE=ssh его списки режут лишь
+# порт SSH. «Подозрительный» (suspect) — не бан.
 _audit_banned_clients() {
-  local L=/var/log/remnanode/access.log clients banned hit
+  local L=/var/log/remnanode/access.log scope users banned hits hit ip why list=""
   [ -f "$L" ] || return 0
-  clients="$(mktemp)"; banned="$(mktemp)"
-  tail -n 300000 "$L" | grep ' accepted ' | grep -oE 'from (tcp:|udp:)?([0-9]{1,3}\.){3}[0-9]{1,3}:' \
-    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$clients"
+  scope="$(grep -oE 'CROWDSEC_SCOPE:=[a-z]+' /etc/node-accelerator/protect.conf 2>/dev/null | cut -d= -f2 || true)"
+  users="$(mktemp)"; banned="$(mktemp)"; hits="$(mktemp)"
+  _xray_client_users > "$users"
   { nft list set inet na_filter autoban_v4 2>/dev/null
-    nft list set inet na_filter suspect_v4 2>/dev/null
-    nft list table ip crowdsec 2>/dev/null
-  } | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$banned"
-  hit="$(comm -12 "$clients" "$banned" | head -20 | paste -sd,)"
-  rm -f "$clients" "$banned"
+    if [ "$scope" != ssh ]; then nft list table ip crowdsec 2>/dev/null; fi
+  } | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u > "$banned" || true
+  hit="$(awk '{print $1}' "$users" | sort -u | comm -12 - "$banned" | head -20 | paste -sd, || true)"
   if [ -n "$hit" ]; then
-    _a_fail "В бане IP, с которых сегодня ходили клиенты: ${hit}"
+    _portscan_hits_24h > "$hits"
+    for ip in ${hit//,/ }; do
+      why="$(awk -v ip="$ip" '$1 == ip {print $2}' "$hits" | sort | uniq -c | sort -rn | head -2 \
+        | awk '{printf "%sTCP %s", (NR > 1 ? ", " : ""), $2}' || true)"
+      list="${list:+${list}, }${ip}${why:+ (скан: ${why})}"
+    done
+  fi
+  rm -f "$users" "$banned" "$hits"
+  if [ "$scope" = ssh ]; then info "CrowdSec режет только SSH (CROWDSEC_SCOPE=ssh) — клиентов его списки не трогают"; fi
+  if [ -n "$hit" ]; then
+    _a_fail "В бане IP, с которых сегодня ходили клиенты: ${list}"
     _a_hint "за общим IP оператора — много абонентов; бан одного = обрыв у всех"
     _a_fix "Снять баны с IP клиентов (и внести в allowlist CrowdSec)" 0 _fix_unban_clients "$hit"
   else
     _a_ok "Среди забаненных нет IP сегодняшних клиентов"
+  fi
+}
+
+# Клиенты, которые раз за разом бьют в ОДИН закрытый порт: в их подписке есть хост с этим
+# портом, а на ноде его никто не слушает (вход убрали или порт сменили, а хост остался).
+# na_filter молча роняет SYN, клиент повторяет, и автобан за скан банит общий IP оператора.
+# Сканер перебирает порты, такой адрес — нет: от 20 попыток, и 90% из них — в этот порт.
+# Порт показываем, если среди таких адресов есть клиенты ноды за неделю: в один порт
+# бьют и сканеры телнета, а клиент мог сегодня не дойти до 443 — его IP как раз в бане.
+_audit_client_closed_ports() {
+  local users hits found port nsrc ncl ulist
+  users="$(mktemp)"; hits="$(mktemp)"; found="$(mktemp)"
+  _xray_client_users 7 > "$users"
+  _portscan_hits_24h > "$hits"
+  awk 'NR == FNR { u[$1] = (($1 in u) ? u[$1] "," : "") $2; next }
+       { n[$1]++; c[$1 " " $2]++ }
+       END { for (k in c) { split(k, a, " ")
+               if (c[k] >= 20 && c[k] * 10 >= n[a[1]] * 9) print a[2], a[1], ((a[1] in u) ? u[a[1]] : "-") } }' \
+    "$users" "$hits" | sort -n > "$found" || true
+  while read -r port; do
+    nsrc="$(awk -v p="$port" '$1 == p' "$found" | wc -l)"
+    ncl="$(awk -v p="$port" '$1 == p && $3 != "-"' "$found" | wc -l)"
+    [ "$ncl" -gt 0 ] || continue
+    ulist="$(awk -v p="$port" '$1 == p && $3 != "-" {print $3}' "$found" | tr ',' '\n' | sort -u | head -8 | paste -sd, || true)"
+    _a_fail "Клиенты стучатся на закрытый TCP ${port}: за сутки бьют в него раз за разом ${nsrc} IP, клиентов ноды за неделю среди них ${ncl} (пользователи Xray: ${ulist})"
+    _a_hint "в их подписке хост с портом ${port}, а на ноде его никто не слушает: панель Remnawave → Hosts, хост с адресом этой ноды и портом ${port} — исправь порт или удали"
+    _a_hint "пока стучатся, автобан за скан банит на час весь общий IP оператора"
+    _a_fix "Отвечать отказом на TCP ${port} — клиенты перестанут попадать в бан за скан" 0 _fix_refuse_port "$port"
+  done < <(awk '{print $1}' "$found" | sort -un)
+  rm -f "$users" "$hits" "$found"
+  _audit_refused_ports
+}
+
+# Порты, на которые нода уже отвечает отказом: стучатся ли ещё (счётчик — с запуска правила).
+_audit_refused_ports() {
+  local pk since mono age=0
+  [ -n "${REFUSE_TCP:-}" ] || return 0
+  if ! nft list table inet nodeforge_refuse >/dev/null 2>&1; then
+    _a_warn "TCP ${REFUSE_TCP}: отказ записан в реестре, но правило не стоит — клиенты снова попадают в бан за скан"
+    _a_fix "Отвечать отказом на TCP ${REFUSE_TCP} (восстановить правило)" 0 refuse_apply
+    return 0
+  fi
+  pk="$(nft list table inet nodeforge_refuse 2>/dev/null | grep -oE 'counter packets [0-9]+' | awk '{s += $3} END {print s + 0}' || true)"
+  since="$(systemctl show -p ActiveEnterTimestamp --value nodeforge-refuse.service 2>/dev/null || true)"
+  mono="$(systemctl show -p ActiveEnterTimestampMonotonic --value nodeforge-refuse.service 2>/dev/null || true)"
+  if is_uint "${mono:-}" && [ "$mono" -gt 0 ]; then age=$(( $(cut -d. -f1 /proc/uptime) - mono / 1000000 )); fi
+  if [ "${pk:-0}" -gt 0 ]; then
+    _a_warn "TCP ${REFUSE_TCP}: с ${since:-запуска} отказано ${pk} раз — клиенты всё ещё стучатся"
+    _a_hint "хост с этим портом не исправлен в панели или у клиентов не обновились подписки"
+  elif [ "$age" -ge $(( 3 * 86400 )) ]; then
+    _a_ok "TCP ${REFUSE_TCP}: отвечаю отказом, с ${since} никто не стучался"
+    _a_fix "Убрать отказ на TCP ${REFUSE_TCP} — клиенты больше не стучатся" 0 _fix_unrefuse_ports
+  else
+    _a_ok "TCP ${REFUSE_TCP}: отвечаю отказом, с ${since:-запуска} никто не стучался"
   fi
 }
 
