@@ -690,6 +690,7 @@ block_remnanode() {
   if confirm "Перезапустить ${NODE_CONTAINER} (docker compose down && up -d в ${NODE_DIR})?"; then
     ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
   fi
+  info "После подключения ноды к панели и включения Reality на 443 выполни j: HTTP 301 + HSTS."
 }
  
 # Скрипт авто-обновления geo-ассетов Xray (cron, Вс 04:00). Кроме RU-списков
@@ -1529,6 +1530,255 @@ block_camouflage() {
   _site_choose "$target" "$sni" /root/nodeforge-bak "$ngx"
 }
 
+# ----- j) HTTP 301 + HSTS для selfsteal-ноды -----
+# Python встроен в setup: однофайловый запуск с GitHub остаётся рабочим.
+_node_http_tool() {
+  python3 - "$@" <<'PY'
+import json
+from pathlib import Path
+import re
+import shlex
+import sys
+
+
+def parse(text):
+    # Keep source offsets: do not rewrite unrelated locations, comments or keys.
+    pattern = r'''\s+|\#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{};]|(?:\\.|\$\{[^}]*\}|[^\s{};\#"'\\])+'''
+    tokens = [(m.group(), m.start(), m.end()) for m in re.finditer(pattern, text)
+              if not m.group().isspace() and not m.group().startswith('#')]
+    root = dict(words=[], children=[], start=0, open=0, close=len(text), end=len(text))
+    stack, words = [root], []
+    for token, start, end in tokens:
+        if token in (';', '{'):
+            if not words:
+                raise ValueError('Пустая директива nginx.')
+            node = dict(words=[shlex.split(w[0])[0] for w in words],
+                        start=words[0][1], end=end, children=[], open=end, close=end)
+            stack[-1]['children'].append(node)
+            words = []
+            if token == '{':
+                stack.append(node)
+        elif token == '}':
+            if words or len(stack) == 1:
+                raise ValueError('Некорректные скобки nginx; regex с фигурными скобками заключите в кавычки.')
+            stack[-1].update(close=start, end=end)
+            stack.pop()
+        else:
+            words.append((token, start, end))
+    if words or len(stack) != 1:
+        raise ValueError('Незавершённый конфиг nginx.')
+    return root
+
+
+def children(node, name):
+    return [n for n in node['children'] if n['words'][0] == name]
+
+
+def walk(node):
+    yield node
+    for child in node['children']:
+        yield from walk(child)
+
+
+def prepare(filename, output):
+    info = json.loads(Path(filename).read_text())[0]
+    if info['HostConfig']['NetworkMode'] != 'host':
+        raise ValueError('Нужен nginx с network_mode: host; для bridge сначала настройте публикацию 80/tcp.')
+    configs = [m for m in info['Mounts'] if m['Type'] == 'bind' and
+               (m['Destination'] == '/etc/nginx/nginx.conf' or
+                re.fullmatch(r'/etc/nginx/conf.d/[^/]+\.conf', m['Destination']))]
+    if len(configs) != 1:
+        raise ValueError('Нужен один bind-mount файла nginx.conf в контейнере ноды.')
+    path = Path(configs[0]['Source'])
+    text = path.read_text(encoding='utf-8')
+    root = parse(text)
+    http = children(root, 'http')
+    if len(http) > 1:
+        raise ValueError('Несколько http-блоков.')
+    scope = http[0] if http else root
+    servers = children(scope, 'server')
+    tls = [s for s in servers if any('ssl' in n['words'] for n in children(s, 'listen'))]
+    sites = [s for s in tls if not any(n['words'][1:] == ['on'] for n in children(s, 'ssl_reject_handshake'))]
+    if len(sites) != 1:
+        raise ValueError('Поддерживается одна TLS-заглушка; конфиг с несколькими сайтами требует ручной настройки.')
+    site = sites[0]
+    names = children(site, 'server_name')
+    if len(names) != 1 or len(names[0]['words']) != 2:
+        raise ValueError('Нужен один домен server_name заглушки.')
+    domain = names[0]['words'][1]
+    if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', domain) or '.' not in domain:
+        raise ValueError('Нужен конкретный домен без масок и переменных.')
+    if any(n['words'] and n['words'][0] == 'include' for n in walk(site)):
+        raise ValueError('include внутри TLS-сайта: проверьте наследование HSTS вручную.')
+    edits = []
+
+    def upsert(node, name, line, header=False):
+        matches = [n for n in node['children'] if n['words'][0] == name and
+                   (not header or len(n['words']) > 1 and n['words'][1].lower() == 'strict-transport-security')]
+        if matches:
+            edits.append((matches[0]['start'], matches[0]['end'], line))
+            edits.extend((n['start'], n['end'], '') for n in matches[1:])
+        else:
+            edits.append((node['close'], node['close'], '\n    ' + line + '\n'))
+
+    upsert(scope, 'ssl_protocols', 'ssl_protocols TLSv1.2 TLSv1.3;')
+    for server in tls:
+        # The default server's TLS settings also govern shared listening sockets.
+        upsert(server, 'ssl_protocols', 'ssl_protocols TLSv1.2 TLSv1.3;')
+    if not children(site, 'add_header'):
+        inherited = [text[n['start']:n['end']] for n in children(scope, 'add_header')
+                     if len(n['words']) > 1 and n['words'][1].lower() != 'strict-transport-security']
+        if inherited:
+            edits.append((site['close'], site['close'], '\n    ' + '\n    '.join(inherited) + '\n'))
+    for node in walk(site):
+        if node is site or children(node, 'add_header'):
+            upsert(node, 'add_header', 'add_header Strict-Transport-Security "max-age=31536000" always;', header=True)
+
+    port80 = [s for s in servers if any(re.search(r'(?:^|:)80$', n['words'][1])
+              for n in children(s, 'listen') if len(n['words']) > 1)]
+    matching = [s for s in port80 if any(domain in n['words'][1:] for n in children(s, 'server_name'))]
+    if len(matching) > 1:
+        raise ValueError('Несколько HTTP-серверов для домена заглушки.')
+    redirect = 'return 301 https://' + domain + '$request_uri;'
+    if matching:
+        server = matching[0]
+        if server in tls or [n['words'] for n in children(server, 'server_name')] != [['server_name', domain]]:
+            raise ValueError('Порт 80 делится с другим доменом или TLS; настройте редирект вручную.')
+        listeners = children(server, 'listen')
+        addresses = [n['words'][1] for n in listeners]
+        if any(a not in ('80', '0.0.0.0:80', '*:80', '[::]:80') for a in addresses):
+            raise ValueError('HTTP привязан к отдельному IP: нужен публичный listen 80; проверьте конфиг вручную.')
+        if not any(a in ('80', '0.0.0.0:80', '*:80') for a in addresses):
+            edits.append((server['close'], server['close'], '\n    listen 80;\n'))
+        locations = [n for n in children(server, 'location') if n['words'][1:] == ['/']]
+        if children(server, 'return'):
+            upsert(server, 'return', redirect)
+        elif len(locations) == 1:
+            upsert(locations[0], 'return', redirect)
+        elif not locations:
+            edits.append((server['close'], server['close'], '\n    location / { ' + redirect + ' }\n'))
+        else:
+            raise ValueError('Неоднозначный location / на порту 80.')
+    else:
+        # Append after the TLS server: existing XHTTP/gRPC helpers target the first server.
+        block = '\nserver {\n    listen 80;\n    server_name ' + domain + ';\n    location / { ' + redirect + ' }\n}\n'
+        edits.append((scope['close'], scope['close'], block))
+    for start, end, replacement in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:start] + replacement + text[end:]
+    Path(output).write_text(text, encoding='utf-8')
+    print(path.as_posix())
+    print(domain)
+
+
+def check_headers(filename, scheme, domain):
+    lines = Path(filename).read_text().splitlines()
+    headers = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition(':')
+        if sep:
+            headers[key.lower()] = value.strip()
+    if scheme == 'http':
+        if not lines or lines[0].split()[1:2] != ['301'] or headers.get('location') != 'https://' + domain + '/':
+            raise ValueError('HTTP: нужен 301 на https://' + domain + '/.')
+    else:
+        hsts = re.search(r'(?:^|;)\s*max-age=(\d+)', headers.get('strict-transport-security', ''), re.I)
+        if not hsts or int(hsts[1]) < 15552000:
+            raise ValueError('HTTPS: отсутствует HSTS с max-age >= 15552000.')
+
+
+try:
+    if sys.argv[1] == 'prepare':
+        prepare(*sys.argv[2:])
+    elif sys.argv[1] == 'headers':
+        check_headers(*sys.argv[2:])
+    else:
+        raise ValueError('Неизвестная команда.')
+except (ValueError, OSError, KeyError, IndexError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+_node_http_probe() {
+  local sni="$1" headers rc=0 version
+  headers="$(mktemp)" || return 1
+  curl --noproxy '*' -fsS --max-time 10 -o /dev/null -D "$headers" \
+    --resolve "${sni}:80:127.0.0.1" "http://${sni}/" \
+    && _node_http_tool headers "$headers" http "$sni" || rc=1
+  for version in 1.2 1.3; do
+    curl --noproxy '*' -fsS --max-time 10 -o /dev/null -D "$headers" \
+      --tlsv"${version}" --tls-max "$version" --resolve "${sni}:443:127.0.0.1" "https://${sni}/" \
+      && _node_http_tool headers "$headers" https "$sni" || rc=1
+  done
+  rm -f "$headers"
+  return "$rc"
+}
+
+_node_http_open_port() {
+  fw_load || return 1
+  # Only add the HTTP port; NODE_PORT, PANEL_IPS and all custom ports stay intact.
+  fw_set EXTRA_TCP "$(_merge_ports "${EXTRA_TCP:-}" 80)" || return 1
+  if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
+    apply_firewall || return 1
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    ufw allow 80/tcp || return 1
+  else
+    warn "80/tcp записан в реестр. na_filter/UFW не активен — проверьте внешний фаервол хостера."
+  fi
+}
+
+block_http_hardening() (
+  # Subshell scopes the lock and rollback traps, including run_block's errexit.
+  require_node || return 1
+  command -v python3 >/dev/null 2>&1 || { err "Нужен python3 (apt install python3)."; return 1; }
+  command -v flock >/dev/null 2>&1 || { err "Нужен flock (apt install util-linux)."; return 1; }
+  local backup_base="${1:-/root/nodeforge-bak}" ngx work context f sni backup="" armed=0 attempt good=0
+  local -a containers
+  mapfile -t containers < <(docker ps --filter "label=com.docker.compose.project.working_dir=${NODE_DIR}" \
+    --format '{{.ID}} {{.Image}}' | awk '$2 ~ /(^|\/)nginx(:|@|$)/ {print $1}')
+  [ "${#containers[@]}" -eq 1 ] || { err "Нужен один работающий nginx в compose-проекте ноды."; return 1; }
+  ngx="${containers[0]}"
+  work="$(mktemp -d)" || return 1
+  _http_cleanup() {
+    if [ "$armed" -eq 1 ]; then
+      if cat "$backup/nginx.conf" > "$f" && docker exec "$ngx" nginx -t && docker exec "$ngx" nginx -s reload; then
+        warn "Конфиг nginx восстановлен из ${backup}."
+      else
+        err "Не удалось полностью откатить nginx. Резервная копия: ${backup}/nginx.conf"
+      fi
+    fi
+    rm -rf -- "$work"
+  }
+  trap _http_cleanup EXIT
+  trap 'exit 130' HUP INT TERM
+  docker inspect "$ngx" > "$work/inspect.json" || return 1
+  context="$(_node_http_tool prepare "$work/inspect.json" "$work/nginx.conf")" || return 1
+  f="${context%%$'\n'*}"; sni="${context#*$'\n'}"
+  # Lock the original file and keep its inode: Docker bind-mounts the file itself.
+  exec 9< "$f" || return 1
+  flock -n 9 || { err "Конфиг nginx сейчас меняется другим процессом."; return 1; }
+  context="$(_node_http_tool prepare "$work/inspect.json" "$work/nginx.conf")" || return 1
+  if ! cmp -s "$f" "$work/nginx.conf"; then
+    mkdir -p "$backup_base" || return 1
+    backup="$(mktemp -d "${backup_base}/http-XXXXXXXX")" || return 1
+    cp -p "$f" "$backup/nginx.conf" || return 1
+    armed=1
+    cat "$work/nginx.conf" > "$f" || return 1
+    docker exec "$ngx" nginx -t || return 1
+    docker exec "$ngx" nginx -s reload || return 1
+  fi
+  for attempt in 1 2 3; do
+    if _node_http_probe "$sni"; then good=1; break; fi
+    sleep 1
+  done
+  [ "$good" -eq 1 ] || { err "Локальная проверка HTTP/TLS/HSTS не прошла."; return 1; }
+  # Keep a verified nginx config even if the firewall update fails; report failure.
+  armed=0
+  _node_http_open_port || { err "nginx настроен, но открыть 80/tcp не удалось. Повторите пункт j."; return 1; }
+  ok "${sni}: HTTP 301, TLS 1.2/1.3 и HSTS проверены локально."
+  info "Повторите внешнюю проверку vpn-hub.pro: доступность 80 также зависит от фаервола хостера."
+)
+
 # ----- 9) location в nginx ноды (общий upsert для XHTTP/gRPC) -----
 # Удаляет старый location /<path>/ и вставляет свежий блок в первый
 # server { } (валидация nginx -t + рестарт nginx/remnanode, откат при ошибке).
@@ -2080,7 +2330,7 @@ fw_neutralize_ufw() {
 apply_firewall() {
   fw_load
   fw_neutralize_ufw
-  local tcp udp wl tmp
+  local tcp udp wl tmp rc=0
   tcp="$(_merge_ports "${TCP_PORTS:-443}" "${EXTRA_TCP:-}")"
   udp="$(_merge_ports "${UDP_PORTS:-443}" "${EXTRA_UDP:-}")"
   # Панель ходит на служебные порты (порт ноды, beszel) — её адреса всегда в whitelist,
@@ -2101,10 +2351,11 @@ apply_firewall() {
   ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-}" \
   ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-1}" BLOCK_TOR="${BLOCK_TOR:-0}" \
   SAFETY_DELAY=300 REMNAWAVE_NONINTERACTIVE=1 NA_REF="$NA_REF" \
-    bash "$tmp" protect || warn "protect вернул ненулевой код — см. вывод выше."
+    bash "$tmp" protect || rc=$?
   rm -f "$tmp"
-  panel_only_apply
-  fw_confirm_safety
+  if [ "$rc" -ne 0 ]; then err "protect завершился с кодом ${rc}. Фаервол не подтверждён."; return "$rc"; fi
+  panel_only_apply || return 1
+  fw_confirm_safety || return 1
   warn "Быстрый статус потом: na-fw-status"
 }
 
@@ -2154,6 +2405,7 @@ fw_verify() {
   else err "na-firewall НЕ в автозагрузке — после ребута защиты не будет."; bad=1; fi
   if na_safety_armed; then warn "Сейфти-таймер всё ещё взведён."; bad=1; fi
   if [ "$bad" -ne 0 ]; then warn "Повтори «f) Починить фаервол»."; fi
+  return "$bad"
 }
 
 # Показать, что реально слушает на сервере (порт, протокол, процесс).
@@ -2564,7 +2816,7 @@ log "Восстановил cron для RU-geo (Вс 04:00)."
 PANEL_ONLY_BIN="/usr/local/sbin/nodeforge-panel-only"
 
 _panel_only_write_runtime() {
-  cat > "$PANEL_ONLY_BIN" <<'EOS'
+  cat > "$PANEL_ONLY_BIN" <<'EOS' || return 1
 #!/bin/bash
 # nodeforge panel-only — служебные порты (порт ноды + PANEL_PORTS, напр. beszel)
 # принимают соединения только с PANEL_IPS. Читает /etc/nodeforge/firewall.env.
@@ -2594,8 +2846,8 @@ table inet nodeforge_panel_only {
 NFT
 echo "panel-only: порты ${ports} открыты только для ${ips}"
 EOS
-  chmod 755 "$PANEL_ONLY_BIN"
-  cat > /etc/systemd/system/nodeforge-panel-only.service <<'EOS'
+  chmod 755 "$PANEL_ONLY_BIN" || return 1
+  cat > /etc/systemd/system/nodeforge-panel-only.service <<'EOS' || return 1
 [Unit]
 Description=nodeforge: service ports reachable only from the panel
 After=network-pre.target
@@ -2665,11 +2917,11 @@ _panel_in_na_whitelist() {
 # Поставить/обновить фильтр по реестру (идемпотентно, переживает ребут).
 panel_only_apply() {
   local ports
-  fw_load
+  fw_load || return 1
   ports="$(_merge_ports "${NODE_PORT:-2222}" "${PANEL_PORTS:-}")"
-  _panel_only_write_runtime
-  systemctl enable --quiet nodeforge-panel-only.service
-  systemctl restart nodeforge-panel-only.service
+  _panel_only_write_runtime || return 1
+  systemctl enable --quiet nodeforge-panel-only.service || return 1
+  systemctl restart nodeforge-panel-only.service || return 1
   if [ -z "${PANEL_IPS:-}" ]; then
     warn "PANEL_IPS не задан — порты ${ports} открыты всем, кого пропускает na_filter (пункт «k»)."
     return 0
@@ -5288,6 +5540,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN} 8)${RST} XHTTP           ${GRY}— location в nginx${RST}
    ${BOLD}${GRN} r)${RST} gRPC            ${GRY}— location в nginx (сокет xrgrpc)${RST}
    ${BOLD}${GRN} h)${RST} Свой API-сайт   ${GRY}— 7 вариантов на выбор, полная замена сайта с бэкапом${RST}
+   ${BOLD}${GRN} j)${RST} HTTP + HSTS     ${GRY}— 301 на 80, TLS 1.2/1.3, HSTS, открыть 80/tcp${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
  
@@ -5325,7 +5578,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → h → m → a.  Можно несколько номеров через пробел.${RST}
+ ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → h → j → m → a.  Можно несколько номеров через пробел.${RST}
 EOF
 }
  
@@ -5364,6 +5617,7 @@ menu() {
         g|G) run_block "Блок РФ-госсетей" block_govblock ;;
         r|R) run_block "gRPC" block_grpc ;;
         h|H) run_block "Свой API-сайт вместо заглушки" block_camouflage ;;
+        j|J) run_block "HTTP 301 + HSTS" block_http_hardening ;;
         n|N) run_block "SSH-уведомления" block_ssh_notify ;;
         b|B) run_block "Бэкап конфигов" block_backup ;;
         u|U) run_block "Обновить списки сетей" block_update_lists ;;
