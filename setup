@@ -4083,6 +4083,9 @@ _audit_system() {
   if [ "${used:-0}" -ge 90 ]; then _a_fail "Диск / заполнен на ${used}%"
   elif [ "${used:-0}" -ge 80 ]; then _a_warn "Диск / заполнен на ${used}%"
   else _a_ok "Диск / заполнен на ${used}%"; fi
+  if [ "${used:-0}" -ge 80 ]; then
+    _a_fix "Освободить место на диске (покажет, что можно удалить, и спросит про каждое)" 0 block_disk_cleanup
+  fi
 
   ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
   if [ "$ntp" = yes ]; then _a_ok "Часы синхронизированы (NTP)"
@@ -4091,18 +4094,10 @@ _audit_system() {
     _a_fix "Включить синхронизацию времени (NTP)" 0 _fix_ntp
   fi
 
-  if [ -f /var/run/reboot-required ]; then
-    pkgs="$(sort -u /var/run/reboot-required.pkgs 2>/dev/null)"
-    # Обновилось штатное generic-ядро, а работает XanMod — перезагрузка его не включит.
-    case "$(uname -r)" in
-      *generic*) ;;
-      *) pkgs="$(printf '%s\n' "$pkgs" | grep -vE '^linux-(image|headers|modules)[^ ]*-generic$|^linux-base$')" ;;
-    esac
-    if [ -n "$pkgs" ]; then
-      pkgs="$(printf '%s\n' "$pkgs" | paste -sd' ' | cut -c1-80)"
-      _a_warn "Система ждёт перезагрузки: ${pkgs}"
-      _a_fix "Перезагрузить сервер (обновились: ${pkgs})" 2 _fix_reboot
-    fi
+  pkgs="$(_reboot_pending_pkgs)"
+  if [ -n "$pkgs" ]; then
+    _a_warn "Система ждёт перезагрузки: ${pkgs}"
+    _a_fix "Перезагрузить сервер (обновились: ${pkgs})" 2 _fix_reboot
   fi
 }
 
@@ -5627,6 +5622,517 @@ block_audit() {
 }
 
 
+# ===================== ОБНОВЛЕНИЕ СИСТЕМЫ И МЕСТО НА ДИСКЕ =====================
+# Обновление (пункт «e») само следит за местом: считает, сколько нужно apt, при
+# нехватке предлагает очистку (пункт «x»), а если и после неё не влезает —
+# ставит обновления порциями и удаляет скачанное после каждой.
+
+# Их обновление перезапускает dockerd, а с ним все контейнеры ноды: клиенты рвутся.
+SYSUPD_DOCKER_PKGS="${SYSUPD_DOCKER_PKGS:-docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras}"
+# Запас сверх расчёта apt (распаковка, initramfs, журнал), МБ.
+SYSUPD_RESERVE_MB="${SYSUPD_RESERVE_MB:-300}"
+# Текущие логи больше этого предлагаем обнулить, МБ.
+CLEAN_BIG_LOG_MB="${CLEAN_BIG_LOG_MB:-100}"
+# Архивы логов ноды младше этого не трогаем: по ним аудит смотрит клиентов за прошлые дни.
+CLEAN_NODE_LOG_DAYS="${CLEAN_NODE_LOG_DAYS:-30}"
+
+# Свободно на файловой системе пути $1, МБ.
+_free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR == 2 {print $4 + 0}'; }
+
+# Пути $1 и $2 на одной файловой системе.
+_same_fs() { [ "$(stat -c %d "$1" 2>/dev/null)" = "$(stat -c %d "$2" 2>/dev/null)" ]; }
+
+# МБ → «512 МБ» / «1.4 ГБ» (знак отбрасывается — его говорит текст вокруг).
+_mb_h() { awk -v m="${1:-0}" 'BEGIN { if (m < 0) m = -m; if (m >= 1024) printf "%.1f ГБ\n", m / 1024; else printf "%d МБ\n", m }'; }
+
+# Сумма размеров со stdin, по одному в строке («143MB», «1,024 kB», «1.2G», «0 B») → МБ вверх.
+_sum_sizes_mb() {
+  awk '
+    { s = $0; gsub(/[ \t,]/, "", s); n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+      u = toupper(u); sub(/I?B$/, "", u)
+      if (u == "") t += n / 1048576; else if (u == "K") t += n / 1024; else if (u == "M") t += n
+      else if (u == "G") t += n * 1024; else if (u == "T") t += n * 1048576 }
+    END { printf "%d\n", (t == int(t)) ? t : int(t) + 1 }'
+}
+
+# Первые $2 (по умолчанию 6) строк списка через запятую и «и ещё N».
+_short_list() {
+  awk -v max="${2:-6}" 'NF { n++; if (n <= max) s = s (s ? ", " : "") $1 }
+    END { if (n > max) s = s " и ещё " (n - max); print s }' <<<"$1"
+}
+
+# apt-get без вопросов. Свои конфиги (sshd_config после харденинга и т.п.) не
+# перетираются; needrestart только перечисляет службы, а не рестартует их сам.
+_sysupd_apt() {
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+}
+
+# Сколько скачает и сколько прибавит на диске `apt-get "$@"`: «скачать_МБ рост_МБ»
+# (рост < 0 — место освободится). apt печатает итог, слышит «нет» и ничего не ставит.
+_apt_need() {
+  LC_ALL=C apt-get --assume-no "$@" 2>/dev/null | awk '
+    function mb(n, u) { gsub(",", "", n); n += 0; sub(/\/.*/, "", u)
+      if (u == "B") return n / 1048576; if (u == "kB") return n / 1024
+      if (u == "MB") return n; if (u == "GB") return n * 1024; return 0 }
+    function up(x) { return (x == int(x)) ? x : (x > 0 ? int(x) + 1 : int(x) - 1) }
+    /^Need to get / { dl = mb($4, $5) }
+    /^After this operation, / { g = mb($4, $5); if ($0 ~ /freed/) g = -g }
+    END { printf "%d %d\n", up(dl), up(g) }' || true
+}
+
+# Что поставит `apt-get upgrade --with-new-pkgs`: строки «пакет версия upgrade|new».
+_sysupd_plan() {
+  LC_ALL=C apt-get -s upgrade --with-new-pkgs 2>/dev/null | awk '
+    /^Inst / { old = ($3 ~ /^\[/); v = old ? $4 : $3; gsub(/[()]/, "", v)
+               print $2, v, (old ? "upgrade" : "new") }' || true
+}
+
+# Размер скачивания пакетов плана (stdin: «пакет версия …») → «пакет МБ».
+_sysupd_sizes() {
+  local -a specs=()
+  local name ver _rest
+  while read -r name ver _rest; do specs+=("${name}=${ver}"); done
+  if [ "${#specs[@]}" -eq 0 ]; then return 0; fi
+  apt-cache show --no-all-versions "${specs[@]}" 2>/dev/null | awk '
+    /^Package: / { p = $2 }
+    /^Size: / && !(p in seen) { seen[p] = 1; m = $2 / 1048576; printf "%s %d\n", p, (m == int(m)) ? m : int(m) + 1 }' || true
+}
+
+# Свободно под обновление, МБ: кеш apt и /usr на разных разделах — меньшее из двух.
+_sysupd_free() {
+  local cache usr
+  cache="$(_free_mb /var/cache/apt/archives)"; usr="$(_free_mb /usr)"
+  if [ "$cache" -lt "$usr" ]; then echo "$cache"; else echo "$usr"; fi
+}
+
+# Хватит ли места на «скачать $1 МБ, прибавится $2 МБ» с запасом.
+_sysupd_fits() {
+  local dl="$1" grow="$2"
+  if [ "$grow" -lt 0 ]; then grow=0; fi
+  if _same_fs /var/cache/apt/archives /usr; then
+    [ $((dl + grow + SYSUPD_RESERVE_MB)) -le "$(_free_mb /usr)" ]
+  else
+    [ $((dl + SYSUPD_RESERVE_MB)) -le "$(_free_mb /var/cache/apt/archives)" ] \
+      && [ $((grow + SYSUPD_RESERVE_MB)) -le "$(_free_mb /usr)" ]
+  fi
+}
+
+# Пакеты Docker из плана $1 (через пробел).
+_sysupd_docker_in_plan() {
+  local p out=""
+  for p in $SYSUPD_DOCKER_PKGS; do
+    if awk -v p="$p" '$1 == p {f = 1} END {exit !f}' <<<"$1"; then out="${out:+$out }$p"; fi
+  done
+  printf '%s' "$out"
+}
+
+# Придержать пакеты; печатает те, что придержали мы (чужие удержания не трогаем).
+_sysupd_hold() {
+  local p already
+  already="$(apt-mark showhold 2>/dev/null || true)"
+  for p in "$@"; do
+    if ! grep -qx "$p" <<<"$already"; then apt-mark hold "$p" >/dev/null && printf '%s ' "$p"; fi
+  done
+}
+
+# Порциями: в каждую — сколько влезает с запасом (по расчёту самого apt, вместе
+# с зависимостями), после установки скачанное удаляется. Сначала мелкие пакеты.
+_sysupd_staged() {
+  local -a queue=() batch=()
+  local -A size=()
+  local name mb sum budget dl grow part=0
+  while read -r name mb; do queue+=("$name"); size[$name]="$mb"; done \
+    < <(_sysupd_plan | awk '$3 == "upgrade"' | _sysupd_sizes | sort -k2,2n)
+
+  while [ "${#queue[@]}" -gt 0 ]; do
+    budget=$(( $(_free_mb /var/cache/apt/archives) - SYSUPD_RESERVE_MB ))
+    batch=() sum=0
+    for name in "${queue[@]}"; do
+      if [ "${#batch[@]}" -gt 0 ] && [ $((sum + ${size[$name]:-1})) -gt "$budget" ]; then break; fi
+      batch+=("$name"); sum=$((sum + ${size[$name]:-1}))
+    done
+    # Зависимости apt досчитает сам: не влезло — делим порцию пополам.
+    while true; do
+      read -r dl grow < <(_apt_need install --only-upgrade --no-remove "${batch[@]}")
+      if _sysupd_fits "$dl" "$grow"; then break; fi
+      if [ "${#batch[@]}" -eq 1 ]; then
+        err "Не хватает места даже на ${batch[0]}: скачать $(_mb_h "$dl"), прибавится $(_mb_h "$grow"), нужен запас $(_mb_h "$SYSUPD_RESERVE_MB")."
+        err "Свободно $(_mb_h "$(_free_mb /var/cache/apt/archives)"). Освободи место (пункт x) или увеличь диск у хостера."
+        return 1
+      fi
+      batch=("${batch[@]:0:$(( ${#batch[@]} / 2 ))}")
+    done
+    part=$((part + 1))
+    log "Порция ${part}: ${#batch[@]} пак., скачать $(_mb_h "$dl") — $(_short_list "$(printf '%s\n' "${batch[@]}")" 5)"
+    _sysupd_apt install --only-upgrade --no-remove "${batch[@]}"
+    apt-get clean
+    queue=("${queue[@]:${#batch[@]}}")
+  done
+  ok "Все порции поставлены (${part})."
+}
+
+# Пакеты, ради которых система ждёт перезагрузки (пусто — не ждёт).
+# Обновилось штатное generic-ядро, а работает XanMod — перезагрузка его не включит.
+_reboot_pending_pkgs() {
+  local pkgs
+  if [ ! -f /var/run/reboot-required ]; then return 0; fi
+  pkgs="$(sort -u /var/run/reboot-required.pkgs 2>/dev/null || true)"
+  case "$(uname -r)" in
+    *generic*) ;;
+    *) pkgs="$(grep -vE '^linux-(image|headers|modules)[^ ]*-generic$|^linux-base$' <<<"$pkgs" || true)" ;;
+  esac
+  sed '/^$/d' <<<"$pkgs" | paste -sd' ' | cut -c1-80
+}
+
+# Предложить одну очистку: «что» МБ «пояснение» функция [аргумент]. Меньше 5 МБ — молчим.
+_clean_offer() {
+  local what="$1" mb="${2:-0}" note="$3" fn="$4" arg="${5:-}" line
+  if [ "$mb" -lt 5 ]; then return 0; fi
+  CLEAN_FOUND=$((CLEAN_FOUND + 1))
+  echo
+  printf '  %s%s%s — %s%s%s\n' "$BOLD" "$what" "$RST" "$YLW" "$(_mb_h "$mb")" "$RST"
+  if [ -n "$note" ]; then
+    while IFS= read -r line; do printf '    %s%s%s\n' "$GRY" "$line" "$RST"; done <<<"$note"
+  fi
+  if confirm "  Удалить?"; then
+    if "$fn" ${arg:+"$arg"}; then ok "  Готово."; else warn "  Не получилось — см. вывод выше."; fi
+  fi
+}
+
+_docker_ok() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+_autoremove_pkgs() { LC_ALL=C apt-get -s autoremove --purge 2>/dev/null | awk '/^(Remv|Purg) / {print $2}' || true; }
+
+# «заголовок»: показать, что уберёт apt autoremove (старые ядра, осиротевшие зависимости), и спросить.
+_offer_autoremove() {
+  local list mb
+  list="$(_autoremove_pkgs)"
+  if [ -z "$list" ]; then return 0; fi
+  # shellcheck disable=SC2016  # ${Installed-Size} — формат dpkg-query, не bash
+  mb="$(xargs -r dpkg-query -W -f='${Installed-Size}\n' <<<"$list" 2>/dev/null | awk '{s += $1} END {printf "%d\n", s / 1024}' || true)"
+  _clean_offer "${1}: $(wc -l <<<"$list") шт." "${mb:-0}" "$(_short_list "$list")" _clean_autoremove
+}
+
+_clean_autoremove() { _sysupd_apt autoremove --purge; }
+
+_rotated_logs() {
+  find /var/log -xdev \( -path /var/log/remnanode -o -path /var/log/journal \) -prune -o -type f \
+    \( -name '*.gz' -o -name '*.zst' -o -name '*.xz' -o -name '*.bz2' -o -name '*.old' -o -regex '.*\.[0-9]+' \) \
+    -print0 2>/dev/null || true
+}
+
+# Крупные ТЕКУЩИЕ логи. Учёт входов (lastlog, wtmp…) не трогаем: lastlog разреженный,
+# а обнулённый wtmp стирает историю входов.
+_big_logs() {
+  find /var/log -xdev -path /var/log/journal -prune -o -type f -size +"${CLEAN_BIG_LOG_MB}"M \
+    ! -name '*.gz' ! -name '*.zst' ! -name '*.xz' ! -name '*.bz2' ! -name '*.old' ! -regex '.*\.[0-9]+' \
+    ! -name lastlog ! -name 'wtmp*' ! -name 'btmp*' ! -name faillog -print 2>/dev/null || true
+}
+
+_old_node_logs() {
+  find /var/log/remnanode -xdev -type f \( -name '*.zst' -o -name '*.gz' \) -mtime +"$CLEAN_NODE_LOG_DAYS" -print0 2>/dev/null || true
+}
+
+_crash_files() { find /var/crash /var/lib/systemd/coredump -xdev -type f -print0 2>/dev/null || true; }
+_old_tmp() { find /tmp /var/tmp -xdev -type f -mtime +10 -print0 2>/dev/null || true; }
+
+# Размер файлов из списка с NUL-разделителем (stdin), МБ.
+_files0_mb() { du -cm --files0-from=- 2>/dev/null | awk 'END {print $1 + 0}' || true; }
+
+# Образы, не нужные ни одному контейнеру (ни запущенному, ни остановленному): «ID имя размер».
+# Образ с несколькими тегами — одна строка под первым тегом, поэтому удалять — по ID.
+# Размер — свои слои образа (UniqueSize): общие слои в простой сумме посчитались бы
+# по разу на каждый образ, и вышло бы больше диска. Безымянные — в «мусоре Docker».
+# \n в шаблоне — голый: docker сам делает из него перевод строки, а {{"\n"}} ломает разбор.
+_docker_unused_images() {
+  docker system df -v --format '{{range .Images}}{{.ID}} {{.Repository}} {{.Tag}} {{.Containers}} {{.UniqueSize}}\n{{end}}' 2>/dev/null \
+    | awk '!($2 == "<none>" && $3 == "<none>") && $4 == "0" { print $1, $2 ":" $3, $5 }' || true
+}
+
+# Логи контейнеров больше 50 МБ: «файл МБ имя».
+_docker_big_logs() {
+  local f mb id name
+  for f in /var/lib/docker/containers/*/*-json.log; do
+    if [ ! -f "$f" ]; then continue; fi
+    mb="$(du -m "$f" 2>/dev/null | cut -f1 || true)"
+    if [ "${mb:-0}" -lt 50 ]; then continue; fi
+    id="$(basename "$(dirname "$f")")"
+    name="$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##' || true)"
+    printf '%s %s %s\n' "$f" "$mb" "${name:-${id:0:12}}"
+  done
+}
+
+_clean_rotated_logs() { _rotated_logs | xargs -0 -r rm -f; }
+_clean_old_node_logs() { _old_node_logs | xargs -0 -r rm -f; }
+_clean_crash() { _crash_files | xargs -0 -r rm -f; }
+_clean_old_tmp() { _old_tmp | xargs -0 -r rm -f; }
+# Обнуляем, а не удаляем: служба держит файл открытым и пишет дальше в него же.
+_clean_big_logs() { _big_logs | while IFS= read -r f; do truncate -s 0 "$f"; done; }
+_clean_docker_logs() { _docker_big_logs | while read -r f _mb _name; do truncate -s 0 "$f"; done; }
+_clean_docker_junk() { docker image prune -f >/dev/null && docker builder prune -f >/dev/null; }
+# -f снимает все теги образа; контейнеров у этих образов нет — список только из таких.
+_clean_docker_unused() { _docker_unused_images | awk '{print $1}' | xargs -r docker rmi -f >/dev/null; }
+_clean_snaps() {
+  snap list --all 2>/dev/null | awk 'NR > 1 && /disabled/ {print $1, $3}' \
+    | while read -r n r; do snap remove "$n" --revision="$r"; done
+}
+
+block_disk_cleanup() {
+  local CLEAN_FOUND=0 before after list mb usage junk_img junk_cache total used
+  before="$(_free_mb /)"
+  df -h -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | sed 's/^/  /' || true
+  info "Ищу, что можно удалить. Про каждое спрошу отдельно."
+
+  _clean_offer "Скачанные пакеты apt" "$(du -sm /var/cache/apt 2>/dev/null | cut -f1 || true)" \
+    "уже установлены — повторно не нужны" _sysupd_apt clean
+  _offer_autoremove "Ненужные пакеты (старые ядра, осиротевшие зависимости)"
+
+  if command -v journalctl >/dev/null 2>&1; then
+    usage="$(journalctl --disk-usage 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "up") print $(i + 1)}' | _sum_sizes_mb || true)"
+    _clean_offer "Журнал systemd сверх 100 МБ" "$(( ${usage:-0} - 100 ))" \
+      "старые записи; последние 100 МБ останутся" journalctl --vacuum-size=100M
+  fi
+  _clean_offer "Архивы логов в /var/log" "$(_rotated_logs | _files0_mb)" \
+    "уже ротированные (.gz, .zst, .1…), кроме логов ноды" _clean_rotated_logs
+  list="$(_big_logs)"
+  if [ -n "$list" ]; then
+    mb="$(tr '\n' '\0' <<<"$list" | _files0_mb)"
+    _clean_offer "Крупные текущие логи — обнулить" "$mb" \
+      "$(xargs -r -d '\n' du -h <<<"$list" 2>/dev/null | sort -rh | head -8 || true)
+служба пишет дальше в тот же файл; содержимое пропадёт" _clean_big_logs
+  fi
+  if [ -d /var/log/remnanode ]; then
+    _clean_offer "Архивы логов ноды старше ${CLEAN_NODE_LOG_DAYS} дн." "$(_old_node_logs | _files0_mb)" \
+      "свежие ${CLEAN_NODE_LOG_DAYS} дн. останутся — по ним аудит (d) смотрит клиентов" _clean_old_node_logs
+  fi
+
+  if _docker_ok; then
+    junk_img="$(docker images -f dangling=true --format '{{.Size}}' 2>/dev/null | _sum_sizes_mb || true)"
+    junk_cache="$(docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null \
+      | awk -F'|' '$1 == "Build Cache" {split($2, r, " "); print r[1]}' | _sum_sizes_mb || true)"
+    _clean_offer "Мусор Docker: безымянные образы и кеш сборки" "$(( ${junk_img:-0} + ${junk_cache:-0} ))" \
+      "остаются от прошлых обновлений; контейнерам не нужны" _clean_docker_junk
+    list="$(_docker_big_logs)"
+    if [ -n "$list" ]; then
+      _clean_offer "Логи контейнеров Docker больше 50 МБ — обнулить" "$(awk '{s += $2} END {print s + 0}' <<<"$list")" \
+        "$(awk '{printf "%s — %d МБ\n", $3, $2}' <<<"$list")" _clean_docker_logs
+    fi
+    list="$(_docker_unused_images)"
+    if [ -n "$list" ]; then
+      # Хранилище containerd (Docker 29) завышает и UniqueSize. Потолок оценки — все образы
+      # минус нужные контейнерам целиком: общие с ними слои при удалении останутся.
+      mb="$(awk '{print $3}' <<<"$list" | _sum_sizes_mb)"
+      total="$(docker system df --format '{{.Type}}|{{.Size}}' 2>/dev/null | awk -F'|' '$1 == "Images" {print $2}' | _sum_sizes_mb || true)"
+      used="$(docker system df -v --format '{{range .Images}}{{.Containers}} {{.Size}}\n{{end}}' 2>/dev/null \
+        | awk '$1 != "0" {print $2}' | _sum_sizes_mb || true)"
+      if [ "${total:-0}" -gt 0 ] && [ "$mb" -gt $(( total - ${used:-0} )) ]; then mb=$(( total - ${used:-0} )); fi
+      _clean_offer "Образы Docker, не нужные ни одному контейнеру: $(wc -l <<<"$list") шт." "$mb" \
+        "$(awk '{print $2}' <<<"$list" | head -8)
+оценка: у образов общие слои; понадобятся — скачаются заново" _clean_docker_unused
+    fi
+  fi
+
+  if command -v snap >/dev/null 2>&1; then
+    mb="$(snap list --all 2>/dev/null | awk 'NR > 1 && /disabled/ {print $1 "_" $3}' \
+      | while read -r s; do printf '/var/lib/snapd/snaps/%s.snap\0' "$s"; done | _files0_mb)"
+    _clean_offer "Старые версии snap-пакетов" "$mb" "отключённые ревизии; рабочие остаются" _clean_snaps
+  fi
+  _clean_offer "Аварийные дампы (/var/crash, coredump)" "$(_crash_files | _files0_mb)" "" _clean_crash
+  _clean_offer "Временные файлы старше 10 дней (/tmp, /var/tmp)" "$(_old_tmp | _files0_mb)" "" _clean_old_tmp
+
+  after="$(_free_mb /)"
+  echo
+  if [ "$CLEAN_FOUND" -eq 0 ]; then ok "Мусора больше 5 МБ не нашёл."; fi
+  ok "Свободно на /: было $(_mb_h "$before"), стало $(_mb_h "$after")."
+  info "Что ещё крупное (скрипт это не трогает — смотри сам):"
+  timeout 60 du -xm --max-depth=3 / 2>/dev/null | sort -rn | awk 'NR > 1 && $1 >= 200' | head -12 \
+    | while read -r mb usage; do printf '    %8s  %s\n' "$(_mb_h "$mb")" "$usage"; done || true
+}
+
+# Логи контейнеров уже ограничены (или пишутся не в json-file).
+_docker_logs_limited() {
+  [ -f /etc/docker/daemon.json ] || return 1
+  python3 -c 'import json, sys
+d = json.load(open("/etc/docker/daemon.json"))
+sys.exit(0 if d.get("log-driver", "json-file") != "json-file" or "max-size" in d.get("log-opts", {}) else 1)' 2>/dev/null
+}
+
+_hyg_apt() {
+  cat >/etc/apt/apt.conf.d/99nodeforge-clean <<'EOF'
+// nodeforge: скачанные пакеты удаляются после установки, кеш чистится раз в неделю.
+APT::Keep-Downloaded-Packages "false";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  ok "apt: скачанные пакеты больше не копятся."
+}
+
+_hyg_journald() {
+  mkdir -p /etc/systemd/journald.conf.d
+  printf '[Journal]\nSystemMaxUse=200M\n' >/etc/systemd/journald.conf.d/90-nodeforge.conf
+  systemctl restart systemd-journald
+  ok "Журнал systemd — не больше 200 МБ."
+}
+
+# Лимит логов контейнеров в daemon.json. Docker НЕ перезапускаем (нода не рвётся):
+# лимит возьмут контейнеры, созданные после ближайшего рестарта Docker — ребут,
+# обновление Docker; контейнер ноды пересоздаётся при её обновлении.
+_hyg_docker() {
+  local tmp
+  tmp="$(mktemp)"
+  if ! python3 - "$tmp" <<'PY'
+import json, os, sys
+path = "/etc/docker/daemon.json"
+d = {}
+if os.path.exists(path):
+    text = open(path).read().strip()
+    d = json.loads(text) if text else {}
+opts = d.setdefault("log-opts", {})
+opts.setdefault("max-size", "20m")
+opts.setdefault("max-file", "3")
+with open(sys.argv[1], "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+PY
+  then rm -f "$tmp"; warn "daemon.json не разобрать — оставил как есть."; return 1; fi
+  # Кривой daemon.json = Docker не стартует после ребута, а с ним и нода.
+  # grep без -q: ранний выход рвёт dockerd по SIGPIPE, и под pipefail выходит «не умеет».
+  if dockerd --help 2>&1 | grep -- '--validate' >/dev/null && ! dockerd --validate --config-file="$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; warn "Docker не принял новый daemon.json — оставил прежний."; return 1
+  fi
+  mkdir -p /etc/docker
+  if [ -f /etc/docker/daemon.json ]; then cp -a /etc/docker/daemon.json /etc/docker/daemon.json.nodeforge-bak; fi
+  cat "$tmp" >/etc/docker/daemon.json
+  rm -f "$tmp"
+  ok "Docker: логи контейнеров — до 3 файлов по 20 МБ (для контейнеров, созданных после рестарта Docker)."
+}
+
+# Профилактика: чтобы место не забивалось снова. Спрашивает один раз, если что-то не настроено.
+_sysupd_hygiene() {
+  local apt=0 jd=0 dk=0
+  if [ ! -f /etc/apt/apt.conf.d/99nodeforge-clean ]; then apt=1; fi
+  if command -v journalctl >/dev/null 2>&1 \
+     && ! grep -rqs '^[[:space:]]*SystemMaxUse=' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/; then jd=1; fi
+  if _docker_ok && command -v python3 >/dev/null 2>&1 && ! _docker_logs_limited; then dk=1; fi
+  if [ $((apt + jd + dk)) -eq 0 ]; then return 0; fi
+  echo
+  info "Чтобы место не забивалось снова, можно настроить:"
+  if [ "$apt" = 1 ]; then echo "    • apt удаляет скачанные пакеты сразу после установки и раз в неделю чистит кеш"; fi
+  if [ "$jd" = 1 ]; then echo "    • журнал systemd — не больше 200 МБ"; fi
+  if [ "$dk" = 1 ]; then echo "    • логи контейнеров Docker — до 3 файлов по 20 МБ (Docker сейчас не перезапускается)"; fi
+  if ! confirm "Настроить?"; then return 0; fi
+  if [ "$apt" = 1 ]; then _hyg_apt; fi
+  if [ "$jd" = 1 ]; then _hyg_journald; fi
+  if [ "$dk" = 1 ]; then _hyg_docker || true; fi
+}
+
+# После обновления: что не обновилось, ненужные пакеты, профилактика, перезагрузка.
+_sysupd_after() {
+  local skipped="$1" left pkgs CLEAN_FOUND=0
+  left="$(_sysupd_plan | awk '$3 == "upgrade" {print $1}' | grep -vxF -f <(tr ' ' '\n' <<<"$skipped" | sed '/^$/d') || true)"
+  if [ -n "$left" ]; then
+    warn "Не обновились: $(_short_list "$left" 10)"
+    warn "  (придержаны, ждут поэтапной выкатки Ubuntu или требуют удалить другие пакеты — это решай руками: apt full-upgrade)"
+  fi
+  _offer_autoremove "Больше не нужны после обновления (старые ядра, зависимости)"
+  _sysupd_hygiene
+  pkgs="$(_reboot_pending_pkgs)"
+  if [ -n "$pkgs" ]; then
+    warn "Система ждёт перезагрузки: ${pkgs}"
+    _fix_reboot
+  fi
+}
+
+block_sysupdate() {
+  local plan ups n dl grow dock choice held="" lists_free
+  if ! command -v apt-get >/dev/null 2>&1; then err "Обновление системы умеет только apt (Debian/Ubuntu)."; return 1; fi
+
+  # Сборка initramfs для нового ядра на крошечной ВМ без swap валит dpkg по OOM.
+  n="$(awk '/^MemAvailable:/ {m = $2} /^SwapFree:/ {s = $2} END {print int((m + s) / 1024)}' /proc/meminfo)"
+  if [ "${n:-0}" -lt 256 ]; then
+    warn "Оперативной памяти вместе со swap свободно ${n} МБ — dpkg может упасть посреди установки."
+    warn "Лучше сначала swap (пункт 2 optimize) или остановить лишнее."
+    if ! confirm "Всё равно обновлять?"; then warn "Обновление отменено."; return 0; fi
+  fi
+
+  lists_free="$(_free_mb /var/lib/apt/lists)"
+  if [ "$lists_free" -lt "$SYSUPD_RESERVE_MB" ]; then
+    warn "Свободно всего $(_mb_h "$lists_free") — могут не скачаться даже списки пакетов. Сначала освободим место."
+    block_disk_cleanup
+  fi
+
+  wait_for_apt
+  log "Обновляю списки пакетов."
+  if ! apt-get update -qq; then
+    err "apt-get update не прошёл (см. выше). Если дело в месте — пункт x) Очистить диск."
+    return 1
+  fi
+
+  plan="$(_sysupd_plan)"
+  dock="$(_sysupd_docker_in_plan "$plan")"
+  if [ -n "$dock" ]; then
+    warn "В обновлении Docker (${dock}): он перезапустится, а с ним все контейнеры ноды — клиенты оборвутся на 10–30 с."
+    choose_from_list choice "Как обновлять?" "Всё, кроме Docker" \
+      "Всё, кроме Docker" "Всё, включая Docker (нода снята с балансировки)"
+    if [ "$choice" = "Всё, кроме Docker" ]; then
+      # shellcheck disable=SC2086  # список пакетов через пробел
+      held="$(_sysupd_hold $dock)"
+      # Удержание только на время пункта: прервётся — снимется всё равно.
+      # shellcheck disable=SC2064  # список раскрывается сейчас — так и нужно
+      if [ -n "$held" ]; then trap "apt-mark unhold ${held} >/dev/null 2>&1 || true" EXIT; fi
+      plan="$(_sysupd_plan)"
+    fi
+  fi
+
+  ups="$(awk '$3 == "upgrade" {print $1}' <<<"$plan")"
+  if [ -z "$ups" ]; then
+    ok "Обновлять нечего — всё свежее."
+  else
+    n="$(wc -l <<<"$ups")"
+    info "Обновится пакетов: ${n} — $(_short_list "$ups" 12)"
+    if grep -qE '^linux-(image|modules)|xanmod' <<<"$plan"; then
+      info "В обновлении ядро — в конце понадобится перезагрузка (спрошу)."
+      if mountpoint -q /boot && [ "$(_free_mb /boot)" -lt 200 ]; then
+        warn "В отдельном /boot свободно $(_mb_h "$(_free_mb /boot)") — новое ядро может не поместиться."
+        local CLEAN_FOUND=0
+        _offer_autoremove "Старые ядра и ненужные пакеты"
+      fi
+    fi
+
+    read -r dl grow < <(_apt_need upgrade --with-new-pkgs)
+    if [ "$grow" -ge 0 ]; then
+      info "Скачать $(_mb_h "$dl"), на диске прибавится $(_mb_h "$grow"); свободно $(_mb_h "$(_sysupd_free)") (запас $(_mb_h "$SYSUPD_RESERVE_MB"))."
+    else
+      info "Скачать $(_mb_h "$dl"), после установки освободится $(_mb_h "$grow"); свободно $(_mb_h "$(_sysupd_free)")."
+    fi
+    if ! _sysupd_fits "$dl" "$grow"; then
+      warn "Места на обновление целиком не хватает."
+      block_disk_cleanup
+      read -r dl grow < <(_apt_need upgrade --with-new-pkgs)
+    fi
+
+    if _sysupd_fits "$dl" "$grow"; then
+      if ! confirm "Обновить ${n} пак. сейчас?"; then warn "Обновление отложено."; return 0; fi
+      _sysupd_apt upgrade --with-new-pkgs
+      apt-get clean
+    else
+      warn "Целиком всё равно не влезает — обновлю порциями: каждая скачивается, ставится и сразу удаляется."
+      if ! confirm "Обновлять порциями?"; then warn "Обновление отложено."; return 0; fi
+      _sysupd_staged
+    fi
+    ok "Пакеты обновлены."
+  fi
+
+  if [ -n "$held" ]; then
+    # shellcheck disable=SC2086
+    apt-mark unhold $held >/dev/null
+    trap - EXIT
+    warn "Docker не обновлён — по выбору. Обнови его этим же пунктом, когда снимешь ноду с балансировки."
+  fi
+  _sysupd_after "$held"
+}
+
+
 # ============================ МЕНЮ ============================
 # self_update вызывается НАПРЯМУЮ из меню (не через run_block), чтобы exec
 # мог заменить весь процесс на свежую версию.
@@ -5736,6 +6242,8 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: аудит / node-diagnostic / node-accelerator${RST}
    ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
    ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
+   ${BOLD}${GRN} e)${RST} Обновить систему ${GRY}— apt с расчётом места: не хватает — предложит, что удалить, или обновит порциями${RST}
+   ${BOLD}${GRN} x)${RST} Очистить диск    ${GRY}— найдёт, что можно удалить, и спросит про каждое${RST}
  
  ${BOLD}${MAG}Дополнительно (опционально)${RST}${GRY}:${RST}
    ${BOLD}${GRN} p)${RST} Порты              ${GRY}— показать активные + добавить/убрать/применить${RST}
@@ -5789,6 +6297,8 @@ menu() {
         15) self_update ;;
         a|A) run_block "Аудит ноды" block_audit ;;
         d|D) run_block "Доступность из РФ" block_ru_access ;;
+        e|E) run_block "Обновление системы" block_sysupdate ;;
+        x|X) run_block "Очистка диска" block_disk_cleanup ;;
         p|P) block_ports ;;
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
