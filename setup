@@ -656,7 +656,9 @@ block_netbird() {
     sleep 1
   fi
 
-  if netbird up --setup-key "$key"; then
+  # --disable-dns: иначе netbird подменяет /etc/resolv.conf своим резолвером, и через него
+  # идут все запросы ноды (и Xray). Ноде имена netbird не нужны — панель ходит по IP.
+  if netbird up --setup-key "$key" --disable-dns; then
     ok "netbird подключён."
     netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|FQDN' | sed 's/^/   /' || true
   else
@@ -3034,8 +3036,13 @@ _fix_unrefuse_ports() {
 #  У части хостеров трафик идёт через туннель (GRE и т.п.), и путь пропускает
 #  меньше 1500 байт, а интерфейс остаётся 1500. Тогда каждый новый поток теряет
 #  первый большой пакет и ждёт ICMP «frag needed»; где ICMP режут — висит совсем.
+#  Потери в сети хостера на узкий путь не похожи: узкий путь не пропускает большой
+#  пакет НИ РАЗУ, а при потерях часть больших пакетов доходит. По этому и различаем.
 # ============================================================================
 MTU_TARGETS="1.1.1.1 8.8.8.8 77.88.8.8 9.9.9.9"
+MTU_STD=1500
+# «<интерфейс>=<MTU>»: подтверждено замером с потолком 1500 — аудит не просит перемерить.
+NF_MTU_ENV=/etc/nodeforge/mtu.env
 
 # Пройдёт ли до $1 пакет размером $2 (с заголовками IP+ICMP) без фрагментации.
 # Потери у хостеров идут пачками по 1–2 с: «не прошёл» — только если молчат обе серии.
@@ -3044,6 +3051,13 @@ _df_ping() {
   ping -Mdo -c3 -i0.3 -W1 -q -s "$s" "$1" >/dev/null 2>&1 && return 0
   sleep 1
   ping -Mdo -c3 -i0.3 -W1 -q -s "$s" "$1" >/dev/null 2>&1
+}
+
+# Сколько из $3 пакетов размером $2 вернулось от $1. Ни одного — ping выходит с ошибкой,
+# под pipefail это погасило бы вызывающего: глушим здесь.
+_df_count() {
+  { ping -Mdo -c "$3" -i0.2 -W1 -q -s $(( $2 - 28 )) "$1" 2>/dev/null || true; } \
+    | awk -F', ' '/received/ { n = $2 + 0 } END { print n + 0 }'
 }
 
 # Путь MTU до $1 в пределах [1280, $2]: бинарный поиск. Код 1 — цель молчит.
@@ -3058,24 +3072,49 @@ _path_mtu() {
   echo "$lo"
 }
 
-# Меряет путь до MTU_TARGETS. Итог — в MTU_IFACE / MTU_CUR / MTU_PATH (максимум по целям):
-# туннель хостера сужает путь до всех целей разом, а потеря пакета занижает замер одной.
-# Минимум по целям с каждым запуском опускал MTU всё ниже (USA-нода: 1500→1380→1353→1295).
+# Меряет путь до MTU_TARGETS; потолок — текущий MTU интерфейса. Итог — в MTU_IFACE /
+# MTU_CUR / MTU_PATH; MTU_LOSSY=1 — замер занизили потери, а не узкий путь.
+# Берём максимум по целям: туннель хостера сужает путь до всех целей разом, а потеря пакета
+# занижает замер одной. Минимум по целям с каждым запуском опускал MTU всё ниже
+# (USA-нода, 25.10.2026: 1500 → 1380 → 1353 → 1295 при пути 1500).
 mtu_probe() {
-  local t m
+  local t m n
+  local -a alive=()
   MTU_IFACE="$(_default_iface)"
-  MTU_CUR="" MTU_PATH=""
+  MTU_CUR="" MTU_PATH="" MTU_LOSSY=0
   [ -n "$MTU_IFACE" ] || return 1
   MTU_CUR="$(cat "/sys/class/net/${MTU_IFACE}/mtu")"
   for t in $MTU_TARGETS; do
     if m="$(_path_mtu "$t" "$MTU_CUR")"; then
       printf '   %-10s путь MTU %s\n' "$t" "$m"
+      alive+=("$t")
       if [ -z "$MTU_PATH" ] || [ "$m" -gt "$MTU_PATH" ]; then MTU_PATH="$m"; fi
     else
       printf '   %-10s %sне отвечает на ping%s\n' "$t" "$GRY" "$RST"
     fi
   done
-  [ -n "$MTU_PATH" ]
+  [ -n "$MTU_PATH" ] || return 1
+  if [ "$MTU_PATH" -lt "$MTU_CUR" ]; then
+    for t in "${alive[@]}"; do
+      n="$(_df_count "$t" "$MTU_CUR" 10)"
+      if [ "$n" -gt 0 ]; then
+        printf '   %-10s %s из 10 пакетов по %s байт дошли — путь их пропускает, это потери\n' "$t" "$n" "$MTU_CUR"
+        MTU_PATH="$MTU_CUR" MTU_LOSSY=1
+        break
+      fi
+    done
+  fi
+}
+
+_mtu_verified() { awk -F= -v i="$1" '$1 == i { v = $2 } END { print v }' "$NF_MTU_ENV" 2>/dev/null || true; }
+
+_mtu_verified_set() {
+  local tmp
+  mkdir -p /etc/nodeforge
+  tmp="$(mktemp)"
+  { grep -v "^${1}=" "$NF_MTU_ENV" 2>/dev/null || true; echo "${1}=${2}"; } > "$tmp"
+  mv "$tmp" "$NF_MTU_ENV"
+  chmod 644 "$NF_MTU_ENV"
 }
 
 # Кто поднимает интерфейс — туда MTU и пишем, чтобы пережил ребут.
@@ -3147,33 +3186,66 @@ EOS
   esac
 }
 
+# Вернуть интерфейсу MTU $2 и снять страховку.
+_mtu_restore() {
+  ip link set "$1" mtu "$2"
+  systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+}
+
 block_mtu() {
   local ifc cur path kind where ipbin
+  ipbin="$(command -v ip)"
+  ifc="$(_default_iface)"
+  [ -n "$ifc" ] || { err "Нет маршрута по умолчанию — не понять, какой интерфейс мерить."; return 1; }
+  cur="$(cat "/sys/class/net/${ifc}/mtu")"
+  # Страховка на всё время работы: если связь пропадёт (скрипт умрёт вместе с SSH) —
+  # через 3 минуты интерфейс вернётся к прежнему MTU.
+  systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+  systemd-run --quiet --unit=nodeforge-mtu-revert --on-active=180 "$ipbin" link set "$ifc" mtu "$cur"
+  # Выше MTU интерфейса ping не пошлёт. MTU ниже стандартного мог остаться от прошлого
+  # замера (старые версии скрипта занижали его на потерях) — на время замера ставим 1500.
+  if [ "$cur" -lt "$MTU_STD" ]; then
+    info "MTU ${ifc} = ${cur}, ниже стандартных ${MTU_STD}. На время замера ставлю ${MTU_STD} — проверю, не занижен ли."
+    "$ipbin" link set "$ifc" mtu "$MTU_STD"
+  fi
   info "Меряю путь MTU: ping с запретом фрагментации до ${MTU_TARGETS// /, }…"
-  mtu_probe || { err "Ни одна контрольная точка не ответила на ping — путь MTU не измерить."; return 1; }
-  ifc="$MTU_IFACE"; cur="$MTU_CUR"; path="$MTU_PATH"
-  if [ "$path" -ge "$cur" ]; then
+  if ! mtu_probe; then
+    _mtu_restore "$ifc" "$cur"
+    err "Ни одна контрольная точка не ответила на ping — путь MTU не измерить."
+    return 1
+  fi
+  path="$MTU_PATH"
+  if [ "$MTU_LOSSY" = 1 ]; then
+    warn "Сеть теряет пакеты: на замер это повлияло, на MTU — нет. Сами потери — в аудите, раздел «Маршруты»."
+  fi
+  if [ "$path" -eq "$cur" ]; then
+    _mtu_restore "$ifc" "$cur"
+    _mtu_verified_set "$ifc" "$cur"
     ok "Интерфейс ${ifc}: MTU ${cur}, путь пропускает столько же — менять нечего."
     return 0
   fi
-  warn "Путь пропускает ${path} байт, а ${ifc} шлёт по ${cur}: каждое новое направление теряет первый большой пакет."
+  if [ "$path" -lt "$cur" ]; then
+    warn "Путь пропускает ${path} байт, а ${ifc} шлёт по ${cur}: каждое новое направление теряет первый большой пакет."
+  else
+    warn "Путь пропускает ${path} байт, а ${ifc} шлёт по ${cur}: MTU занижен — лишние пакеты на каждый поток."
+  fi
   read -r kind where <<<"$(_net_backend "$ifc")"
   info "Интерфейс настраивает: ${kind}${where:+ (${where})}"
-  confirm "Выставить MTU ${path} на ${ifc} — сейчас и после перезагрузки?" || { warn "Отменено."; return 1; }
-  ipbin="$(command -v ip)"
-  # Страховка: если связь пропадёт (скрипт умрёт вместе с SSH) — через 3 минуты MTU вернётся.
-  systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
-  systemd-run --quiet --unit=nodeforge-mtu-revert --on-active=180 "$ipbin" link set "$ifc" mtu "$cur"
+  if ! confirm "Выставить MTU ${path} на ${ifc} (сейчас ${cur}) — сейчас и после перезагрузки?"; then
+    _mtu_restore "$ifc" "$cur"
+    warn "Отменено."
+    return 1
+  fi
   "$ipbin" link set "$ifc" mtu "$path"
   sleep 2
   if ! curl -fsS -m 10 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
     err "После смены MTU HTTPS наружу не работает — возвращаю ${cur}."
-    "$ipbin" link set "$ifc" mtu "$cur"
-    systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+    _mtu_restore "$ifc" "$cur"
     return 1
   fi
   _mtu_persist "$ifc" "$path" "$kind" "$where"
   systemctl stop nodeforge-mtu-revert.timer 2>/dev/null || true
+  _mtu_verified_set "$ifc" "$path"
   ok "MTU ${ifc} = ${path} — сейчас и после перезагрузки. Живые соединения не рвутся."
 }
 
@@ -3436,42 +3508,237 @@ _fix_ifupdown_inet6() {
   ok "Со следующей загрузки сеть поднимается без ошибок; перезагружать сейчас не нужно."
 }
 
+# Netplan-интерфейсы (id), которым netplan прописывает IPv6: адрес, шлюз, маршрут, DNS, DHCPv6.
+# Смотрим сгенерированные .network — то, что networkd применяет на деле.
+_netplan_inet6_ids() {
+  local f id
+  for f in /run/systemd/network/10-netplan-*.network; do
+    [ -f "$f" ] || continue
+    if grep -qE '^(Address|Gateway|Destination|DNS)=[^#]*:[^#]*:|^DHCP=(yes|ipv6)|^IPv6AcceptRA=(yes|true)' "$f"; then
+      id="${f##*/10-netplan-}"; printf '%s\n' "${id%.network}"
+    fi
+  done
+}
+
+# Имя интерфейса по id netplan (из [Match] сгенерированного .network).
+_netplan_iface() {
+  local f="/run/systemd/network/10-netplan-${1}.network" n
+  n="$(awk -F= '$1 == "Name" { print $2; exit }' "$f" 2>/dev/null || true)"
+  echo "${n:-$1}"
+}
+
+# Те же id, но только где IPv6 выключен: networkd не может применить IPv6 и навсегда остаётся
+# в «configuring» — systemd-networkd-wait-online уходит в таймаут, за ним всё, что ждёт сеть.
+_netplan_inet6_blocked() {
+  local id ifc
+  _netplan_inet6_ids | while read -r id; do
+    ifc="$(_netplan_iface "$id")"
+    if [ ! -d /proc/sys/net/ipv6 ] || [ "$(cat "/proc/sys/net/ipv6/conf/${ifc}/disable_ipv6" 2>/dev/null)" = 1 ]; then
+      printf '%s\n' "$id"
+    fi
+  done
+}
+
+# Убрать IPv6 из /etc/netplan для id $@ и применить: networkctl reload переконфигурирует только
+# их, IPv4-адрес остаётся. Страховка как у MTU: пропадёт связь — через 3 минуты вернутся прежние
+# файлы. Комментарии в правленых YAML теряются (копия — в /root/nodeforge-bak).
+_netplan_inet6_off() {
+  local bak id
+  [ "$#" -gt 0 ] || return 0
+  if ! python3 -c 'import yaml' 2>/dev/null; then err "Нет python3-yaml — netplan не поправить."; return 1; fi
+  bak="/root/nodeforge-bak/netplan.$(date +%F-%H%M%S)"
+  mkdir -p /root/nodeforge-bak
+  cp -a /etc/netplan "$bak"
+  python3 - /etc/netplan "$@" <<'PY'
+import os, sys, yaml
+
+root, ids = sys.argv[1], set(sys.argv[2:])
+v6 = lambda s: str(s).count(":") >= 2
+for name in sorted(os.listdir(root)):
+    path = os.path.join(root, name)
+    if not name.endswith((".yaml", ".yml")) or not os.path.isfile(path):
+        continue
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    hit = False
+    for kind in ("ethernets", "bonds", "bridges", "vlans", "wifis"):
+        for dev_id, dev in ((doc.get("network") or {}).get(kind) or {}).items():
+            if dev_id not in ids or not isinstance(dev, dict):
+                continue
+            hit = True
+            # адрес — строка или {адрес: {lifetime, label}}
+            addrs = [a for a in dev.get("addresses") or [] if not v6(a if isinstance(a, str) else next(iter(a)))]
+            routes = [r for r in dev.get("routes") or [] if not (v6(r.get("to", "")) or v6(r.get("via", "")))]
+            for key, val in (("addresses", addrs), ("routes", routes)):
+                if val:
+                    dev[key] = val
+                else:
+                    dev.pop(key, None)
+            ns = dev.get("nameservers") or {}
+            if "addresses" in ns:
+                ns["addresses"] = [a for a in ns["addresses"] if not v6(a)]
+                if not ns["addresses"]:
+                    del ns["addresses"]
+            for key in ("gateway6", "dhcp6-overrides", "ipv6-privacy", "ipv6-mtu",
+                        "ipv6-address-generation", "ipv6-address-token"):
+                dev.pop(key, None)
+            dev.update({"dhcp6": False, "accept-ra": False, "link-local": []})
+    if hit:
+        with open(path, "w") as fh:
+            yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False, allow_unicode=True)
+PY
+  if ! netplan generate; then
+    cp -a "$bak"/. /etc/netplan/; netplan generate || true
+    err "netplan не принял правку — вернул как было (копия в ${bak})."
+    return 1
+  fi
+  systemctl stop nodeforge-net-revert.timer 2>/dev/null || true
+  systemd-run --quiet --unit=nodeforge-net-revert --on-active=180 \
+    /bin/sh -c "cp -a '${bak}'/. /etc/netplan/ && netplan generate && networkctl reload"
+  networkctl reload
+  for id in "$@"; do networkctl reconfigure "$(_netplan_iface "$id")" 2>/dev/null || true; done
+  sleep 3
+  if ! curl -fsS -m 10 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace; then
+    err "После правки netplan HTTPS наружу не работает — возвращаю как было."
+    cp -a "$bak"/. /etc/netplan/; netplan generate; networkctl reload
+    systemctl stop nodeforge-net-revert.timer 2>/dev/null || true
+    return 1
+  fi
+  systemctl stop nodeforge-net-revert.timer 2>/dev/null || true
+  ok "IPv6 убран из netplan ($*): ни адреса, ни link-local, ни RA. Копия прежних файлов — ${bak}."
+}
+
+_fix_netplan_inet6() {
+  local -a ids
+  mapfile -t ids < <(_netplan_inet6_blocked)
+  _netplan_inet6_off "${ids[@]}"
+}
+
 _fix_disable_ipv6() {
-  # Сначала настройки ifupdown: иначе на следующей загрузке ifup упадёт на IPv6-адресе.
+  local -a ids
+  # Сначала настройки сети: иначе на следующей загрузке ifup упадёт на IPv6-адресе,
+  # а networkd застрянет в «configuring».
   _ifupdown_inet6_off
+  mapfile -t ids < <(_netplan_inet6_ids)
+  _netplan_inet6_off "${ids[@]}"
   _sysctl_persist net.ipv6.conf.all.disable_ipv6 1
   _sysctl_persist net.ipv6.conf.default.disable_ipv6 1
   ok "IPv6 выключен (${NF_SYSCTL}): сайты открываются по IPv4 без ожидания IPv6."
 }
 
-# Время резолва домена через системный резолвер (им пользуется Xray), мс; пусто — не резолвится.
-_dns_ms() {
-  local t0 t1
-  t0="${EPOCHREALTIME/,/.}"   # в части локалей разделитель — запятая
-  resolvectl query --cache=no "$1" >/dev/null 2>&1 || return 1
-  t1="${EPOCHREALTIME/,/.}"
-  awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%d", (b - a) * 1000 }'
+# ----- DNS -----
+# Xray (freedom, domainStrategy AsIs) резолвит сайты по resolv.conf своего контейнера, а его
+# Docker копирует с хоста при старте контейнера (сеть host) и потом не обновляет. Поэтому
+# резолвер ноды — статичный /etc/resolv.conf: заглушку systemd-resolved Docker в контейнер
+# не отдаёт, а options отсюда доезжают и до Xray (Go их читает). timeout:1 — при потерях
+# у хостера следующий сервер через 1 с, а не через 5.
+AUD_DNS_NAMES="google.com telegram.org wikipedia.org cloudflare.com"
+NF_RESOLV_CONF='# nodeforge: резолвер ноды; его же Docker копирует в контейнер ноды (Xray).
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 1.0.0.1
+options timeout:1 attempts:3 rotate'
+
+_nameservers() { awk '$1 == "nameserver" { print $2 }' "$1" 2>/dev/null | paste -sd' ' || true; }
+
+# resolv.conf уже наш: те же серверы и быстрое переключение — чинить им нечего.
+_resolv_is_ours() {
+  [ "$(_nameservers /etc/resolv.conf)" = "$(printf '%s\n' "$NF_RESOLV_CONF" | awk '$1 == "nameserver" { print $2 }' | paste -sd' ')" ] \
+    && grep -qE '^options.*timeout:1' /etc/resolv.conf
 }
 
-AUD_DNS_NAMES="google.com telegram.org wikipedia.org cloudflare.com"
+# Какой resolv.conf Docker кладёт в контейнер: при одной заглушке 127.0.0.53 — настоящие
+# серверы systemd-resolved.
+_resolv_effective() {
+  if [ "$(_nameservers /etc/resolv.conf)" = 127.0.0.53 ]; then echo /run/systemd/resolve/resolv.conf
+  else echo /etc/resolv.conf; fi
+}
+
+# Работающие контейнеры с сетью host: «имя путь_к_resolv.conf».
+_host_net_resolv() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps -q 2>/dev/null | xargs -r docker inspect -f '{{.Name}} {{.HostConfig.NetworkMode}} {{.ResolvConfPath}}' 2>/dev/null \
+    | awk '$2 == "host" { sub(/^\//, "", $1); print $1, $3 }' || true
+}
+
+# Контейнеры (сеть host), чей resolv.conf разошёлся с хостом — резолвят не туда, куда нода.
+_resolv_stale_containers() {
+  local want name f
+  want="$(_nameservers "$(_resolv_effective)")"
+  _host_net_resolv | while read -r name f; do
+    [ "$(_nameservers "$f")" = "$want" ] || printf '%s\n' "$name"
+  done
+}
+
+# resolv.conf хоста — в контейнеры с сетью host, в тот же инод: файл примонтирован, Xray
+# перечитывает его сам (Go — раз в 5 с), перезапуск не нужен. Docker эту правку допускает.
+_fix_container_resolv() {
+  local src name f
+  src="$(_resolv_effective)"
+  _host_net_resolv | while read -r name f; do
+    [ -f "$f" ] || continue
+    cat "$src" > "$f"
+    printf '   %-20s → %s\n' "$name" "$(_nameservers "$f")"
+  done
+}
+
+# Время резолва AUD_DNS_NAMES («имя мс» или «имя FAIL») тем путём, что у Xray: из контейнера
+# ноды (те же серверы и options). Нет контейнера — с хоста. Кэша по пути нет.
+_dns_times() {
+  local ct code
+  # shellcheck disable=SC2016  # код выполняется в sh контейнера
+  code='for d in "$@"; do s=$(date +%s%N); if getent ahostsv4 "$d" >/dev/null; then echo "$d $(( ($(date +%s%N) - s) / 1000000 ))"; else echo "$d FAIL"; fi; done'
+  ct="$( { require_node >/dev/null 2>&1 && echo "$NODE_CONTAINER"; } || true )"
+  # shellcheck disable=SC2086  # список имён — словами
+  if [ -n "$ct" ] && docker exec "$ct" sh -c 'command -v getent' >/dev/null 2>&1; then
+    docker exec "$ct" sh -c "$code" _ $AUD_DNS_NAMES
+  else
+    sh -c "$code" _ $AUD_DNS_NAMES
+  fi
+}
+
+# NetBird с включённым DNS при обычном resolv.conf (не заглушке resolved) подменяет его своим
+# резолвером 100.x — через него идут ВСЕ запросы ноды, и Xray тоже; на потерях его форвардер
+# отвечает по 2 с и дольше. Ноде имена netbird не нужны: панель ходит на неё по IP.
+_netbird_dns_on() {
+  command -v netbird >/dev/null 2>&1 || return 1
+  ! grep -hqE '"DisableDNS":[[:space:]]*true' /var/lib/netbird/*.json /etc/netbird/config.json 2>/dev/null
+}
+
+_netbird_dns_off() {
+  if ! netbird up --help 2>/dev/null | grep -q -- '--disable-dns'; then
+    err "Этот netbird не умеет --disable-dns — обнови его (пункт 6) и повтори."; return 1
+  fi
+  log "Выключаю DNS в NetBird: связь панели с нодой прервётся на несколько секунд, клиентов не заденет."
+  netbird down >/dev/null 2>&1 || true   # вернёт resolv.conf, который подменял
+  sleep 1
+  if ! netbird up --disable-dns >/dev/null; then err "netbird up --disable-dns не удался — проверь: netbird status"; return 1; fi
+  rm -f /etc/resolv.conf.original.netbird
+  sleep 5
+  if netbird status 2>/dev/null | grep -q 'Management: Connected'; then ok "NetBird подключён и DNS ноды больше не трогает."
+  else warn "NetBird ещё подключается — проверь: netbird status"; fi
+}
 
 _fix_dns() {
-  local d ms
-  install -d /etc/systemd/resolved.conf.d
-  cat > /etc/systemd/resolved.conf.d/nodeforge-dns.conf <<'EOS'
-# nodeforge: резолвер ноды — Cloudflare/Google, а не DNS хостера.
-# Domains=~. — все запросы идут сюда; узкие домены netbird остаются на wt0.
-[Resolve]
-DNS=1.1.1.1 8.8.8.8
-FallbackDNS=9.9.9.9
-Domains=~.
-EOS
-  systemctl restart systemd-resolved
-  sleep 1
-  for d in $AUD_DNS_NAMES; do
-    if ms="$(_dns_ms "$d")"; then printf '   %-16s %s мс\n' "$d" "$ms"; else err "${d}: не резолвится"; return 1; fi
-  done
-  ok "Резолвер ноды: 1.1.1.1, 8.8.8.8 (/etc/systemd/resolved.conf.d/nodeforge-dns.conf)."
+  local d ms bad=""
+  if _netbird_dns_on; then _netbird_dns_off || return 1; fi
+  mkdir -p /root/nodeforge-bak
+  cp -L /etc/resolv.conf "/root/nodeforge-bak/resolv.conf.$(date +%F-%H%M%S)" 2>/dev/null || true
+  rm -f /etc/resolv.conf
+  printf '%s\n' "$NF_RESOLV_CONF" > /etc/resolv.conf
+  chmod 644 /etc/resolv.conf
+  # Прежняя версия настраивала резолвер через systemd-resolved — при статичном resolv.conf
+  # этот файл никто не читает.
+  if [ -f /etc/systemd/resolved.conf.d/nodeforge-dns.conf ]; then
+    rm -f /etc/systemd/resolved.conf.d/nodeforge-dns.conf
+    systemctl try-restart systemd-resolved 2>/dev/null || true
+  fi
+  _fix_container_resolv
+  while read -r d ms; do
+    if [ "$ms" = FAIL ]; then bad="${bad:+${bad} }${d}"; else printf '   %-16s %s мс\n' "$d" "$ms"; fi
+  done < <(_dns_times)
+  if [ -n "$bad" ]; then err "Не резолвится: ${bad}"; return 1; fi
+  ok "Резолвер ноды: 1.1.1.1, 8.8.8.8, 1.0.0.1, переключение через 1 с (/etc/resolv.conf, у Xray — так же)."
 }
 
 _fix_netbird_restart() {
@@ -4111,6 +4378,7 @@ _audit_system() {
 
 _audit_network() {
   local cc qd probing ct ctmax pct retr outs rp drops d ctt uin urb in6 dns_srv dns_sum dns_n dns_bad ms
+  local dns_slow stale
   local conns segs rts live msg
   step "Сеть и MTU"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
@@ -4122,6 +4390,12 @@ _audit_network() {
     if [ "$MTU_PATH" -lt "$MTU_CUR" ]; then
       _a_fail "MTU: ${MTU_IFACE}=${MTU_CUR}, а путь пропускает ${MTU_PATH} — первый большой пакет каждого нового потока теряется"
       _a_fix "Выставить MTU ${MTU_PATH} на ${MTU_IFACE} (сейчас и после ребута)" 0 block_mtu
+    elif [ "$MTU_CUR" -lt "$MTU_STD" ] && [ "$(_mtu_verified "$MTU_IFACE")" != "$MTU_CUR" ]; then
+      # Выше MTU интерфейса аудит не меряет (он только читает) — это делает пункт «m)».
+      _a_warn "MTU: ${MTU_IFACE}=${MTU_CUR}, ниже стандартных ${MTU_STD}, и не проверен замером с потолком ${MTU_STD} — мог остаться заниженным от прошлых замеров на потерях"
+      _a_fix "Перемерить MTU с потолком ${MTU_STD} и поднять, если путь шире (на время замера — ${MTU_STD} со страховкой)" 0 block_mtu
+    elif [ "$MTU_LOSSY" = 1 ]; then
+      _a_ok "MTU: ${MTU_IFACE}=${MTU_CUR}, путь пропускает столько же (замер мешали потери — см. «Маршруты»)"
     else
       _a_ok "MTU: ${MTU_IFACE}=${MTU_CUR}, путь пропускает столько же"
     fi
@@ -4211,22 +4485,45 @@ _audit_network() {
     _a_hint "IPv4 поднимается раньше, поэтому нода работает; но сеть стартует с ошибкой, и то, что после неё, не применяется"
     _a_fix "Убрать IPv6 из настроек сети ${in6} (IPv4 не трогается, сеть не перезапускается)" 0 _fix_ifupdown_inet6
   fi
+  in6="$(_netplan_inet6_blocked | paste -sd' ' || true)"
+  if [ -n "$in6" ]; then
+    _a_fail "IPv6 выключен, а netplan прописывает IPv6 на ${in6} — networkd не может его применить и не заканчивает настройку сети"
+    _a_hint "IPv4 есть, нода работает; но systemd-networkd-wait-online уходит в таймаут, а за ним apt-daily и всё, что ждёт сеть"
+    _a_fix "Убрать IPv6 из netplan ${in6} (IPv4-адрес остаётся, страховка 3 мин)" 0 _fix_netplan_inet6
+  fi
 
-  # DNS: Xray резолвит сайты системным резолвером — медленный DNS = каждый сайт открывается с паузой.
-  if command -v resolvectl >/dev/null 2>&1; then
-    dns_srv="$(resolvectl status 2>/dev/null | awk -F': ' '/Current DNS Server/ {print $2}' | sort -u | paste -sd' ')"
-    dns_sum=0 dns_n=0 dns_bad=""
-    for d in $AUD_DNS_NAMES; do
-      if ms="$(_dns_ms "$d")"; then dns_sum=$(( dns_sum + ms )); dns_n=$(( dns_n + 1 )); else dns_bad="${dns_bad:+${dns_bad} }${d}"; fi
-    done
-    if [ -n "$dns_bad" ]; then
-      _a_fail "DNS ноды (${dns_srv:-?}) не резолвит: ${dns_bad}"
-      _a_fix "Резолвер ноды → 1.1.1.1 и 8.8.8.8" 0 _fix_dns
-    elif [ "$dns_n" -gt 0 ] && [ $(( dns_sum / dns_n )) -ge 150 ]; then
-      _a_warn "DNS ноды (${dns_srv:-?}) медленный: в среднем $(( dns_sum / dns_n )) мс на запрос — каждый новый сайт ждёт"
-      _a_fix "Резолвер ноды → 1.1.1.1 и 8.8.8.8" 0 _fix_dns
-    elif [ "$dns_n" -gt 0 ]; then
-      _a_ok "DNS ноды (${dns_srv:-?}): в среднем $(( dns_sum / dns_n )) мс без кэша"
+  # DNS: Xray резолвит сайты по resolv.conf своего контейнера — медленный DNS = каждый
+  # новый сайт открывается с паузой. Мерим тем же путём (из контейнера ноды).
+  dns_srv="$(_nameservers "$(_resolv_effective)")"
+  if grep -q 'Generated by NetBird' /etc/resolv.conf 2>/dev/null; then
+    _a_fail "DNS ноды подменил NetBird (${dns_srv}): через его резолвер идут все запросы, и Xray тоже — на потерях он отвечает по 2 с и дольше"
+    _a_fix "Выключить DNS в NetBird (ноде имена netbird не нужны) и поставить резолвер 1.1.1.1 / 8.8.8.8" 0 _fix_dns
+  fi
+  stale="$(_resolv_stale_containers | paste -sd' ' || true)"
+  if [ -n "$stale" ]; then
+    _a_warn "Контейнеры ${stale} резолвят не через те серверы, что нода (${dns_srv}): Docker копирует resolv.conf только при старте"
+    _a_fix "Обновить resolv.conf в контейнерах ${stale} (без перезапуска)" 0 _fix_container_resolv
+  fi
+  dns_sum=0 dns_n=0 dns_bad="" dns_slow=0
+  while read -r d ms; do
+    if [ "$ms" = FAIL ]; then dns_bad="${dns_bad:+${dns_bad} }${d}"; continue; fi
+    case "$ms" in ''|*[!0-9]*) continue ;; esac
+    dns_sum=$(( dns_sum + ms )); dns_n=$(( dns_n + 1 ))
+    if [ "$ms" -ge 1000 ]; then dns_slow=$(( dns_slow + 1 )); fi
+  done < <(_dns_times)
+  if [ -n "$dns_bad" ]; then
+    _a_fail "DNS ноды (${dns_srv:-?}) не резолвит: ${dns_bad}"
+  elif [ "$dns_n" -gt 0 ] && [ $(( dns_sum / dns_n )) -ge 150 ]; then
+    _a_warn "DNS ноды (${dns_srv:-?}) медленный: в среднем $(( dns_sum / dns_n )) мс на запрос — каждый новый сайт ждёт"
+    if [ "$dns_slow" -gt 0 ]; then _a_hint "${dns_slow} из ${dns_n} запросов ждали таймаута — пакеты до резолвера теряются (см. «Маршруты»)"; fi
+  elif [ "$dns_n" -gt 0 ]; then
+    _a_ok "DNS ноды (${dns_srv:-?}): в среднем $(( dns_sum / dns_n )) мс, как у Xray"
+  fi
+  if [ -n "$dns_bad" ] || { [ "$dns_n" -gt 0 ] && [ $(( dns_sum / dns_n )) -ge 150 ]; }; then
+    if _resolv_is_ours; then
+      _a_hint "резолвер уже настроен скриптом — задержку даёт сеть хостера, со стороны ноды чинить нечего"
+    else
+      _a_fix "Резолвер ноды → 1.1.1.1, 8.8.8.8, 1.0.0.1 с переключением через 1 с" 0 _fix_dns
     fi
   fi
 }
