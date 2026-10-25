@@ -3038,7 +3038,13 @@ _fix_unrefuse_ports() {
 MTU_TARGETS="1.1.1.1 8.8.8.8 77.88.8.8 9.9.9.9"
 
 # Пройдёт ли до $1 пакет размером $2 (с заголовками IP+ICMP) без фрагментации.
-_df_ping() { ping -Mdo -c2 -i0.3 -W1 -q -s $(( $2 - 28 )) "$1" >/dev/null 2>&1; }
+# Потери у хостеров идут пачками по 1–2 с: «не прошёл» — только если молчат обе серии.
+_df_ping() {
+  local s=$(( $2 - 28 ))
+  ping -Mdo -c3 -i0.3 -W1 -q -s "$s" "$1" >/dev/null 2>&1 && return 0
+  sleep 1
+  ping -Mdo -c3 -i0.3 -W1 -q -s "$s" "$1" >/dev/null 2>&1
+}
 
 # Путь MTU до $1 в пределах [1280, $2]: бинарный поиск. Код 1 — цель молчит.
 _path_mtu() {
@@ -3052,7 +3058,9 @@ _path_mtu() {
   echo "$lo"
 }
 
-# Меряет путь до MTU_TARGETS. Итог — в MTU_IFACE / MTU_CUR / MTU_PATH (минимум по целям).
+# Меряет путь до MTU_TARGETS. Итог — в MTU_IFACE / MTU_CUR / MTU_PATH (максимум по целям):
+# туннель хостера сужает путь до всех целей разом, а потеря пакета занижает замер одной.
+# Минимум по целям с каждым запуском опускал MTU всё ниже (USA-нода: 1500→1380→1353→1295).
 mtu_probe() {
   local t m
   MTU_IFACE="$(_default_iface)"
@@ -3062,7 +3070,7 @@ mtu_probe() {
   for t in $MTU_TARGETS; do
     if m="$(_path_mtu "$t" "$MTU_CUR")"; then
       printf '   %-10s путь MTU %s\n' "$t" "$m"
-      if [ -z "$MTU_PATH" ] || [ "$m" -lt "$MTU_PATH" ]; then MTU_PATH="$m"; fi
+      if [ -z "$MTU_PATH" ] || [ "$m" -gt "$MTU_PATH" ]; then MTU_PATH="$m"; fi
     else
       printf '   %-10s %sне отвечает на ping%s\n' "$t" "$GRY" "$RST"
     fi
