@@ -540,7 +540,7 @@ block_optimize() {
 block_protect() {
   local node_port tcp_ports udp_ports whitelist ssh_port
   info "Защита: ЕДИНЫЙ фаервол nftables (na_filter) + CrowdSec + блоклисты. Один владелец — без ufw."
-  warn "Запускай ПОСЛЕ поднятия ноды. В конце спрошу, работает ли вход в новом окне: без «да» фаервол через 5 мин удалится сам."
+  warn "В конце спрошу, работает ли вход в новом окне: без «да» фаервол через 5 мин удалится сам."
   echo
   fw_load
   ssh_port="$(detect_ssh_port 2>/dev/null || echo "${SSH_PORT:-22}")"
@@ -693,6 +693,260 @@ block_remnanode() {
     ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
   fi
   info "После подключения ноды к панели и включения Reality на 443 выполни j: HTTP 301 + HSTS."
+}
+
+# ----- Своя установка ноды (вариант полной установки «i») -----
+# Та же раскладка, что у установщика eGames: nginx маскировки на unix-сокете за Reality +
+# remnanode, оба network_mode: host — её знают пункты h, j, 8, r, 9 и аудит. Сертификат —
+# wildcard Let's Encrypt через Cloudflare DNS-01, как у нод флота; дальше его ведёт пункт «c».
+# ufw не включается: фаервол один — na_filter (пункт 3), второй раз его пересобирать незачем.
+NF_NODE_DIR=/opt/remnanode
+NF_CF_INI=/root/.secrets/certbot/cloudflare.ini
+
+# Внешний IPv4 сервера, каким его видит интернет (пусто — не узнал).
+_public_ipv4() {
+  curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true
+}
+
+_docker_install() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    ok "Docker уже есть: $(docker --version 2>/dev/null)."
+    return 0
+  fi
+  log "Ставлю Docker официальным установщиком (get.docker.com)."
+  wait_for_apt
+  curl -fsSL https://get.docker.com | sh
+  systemctl enable --now docker
+  docker compose version >/dev/null 2>&1 || { err "После установки нет docker compose."; return 1; }
+}
+
+# Домен маскировки: его клиент шлёт в SNI, nginx отдаёт как сайт.
+_node_ask_domain() {
+  local __var="$1" d ips me
+  me="$(_public_ipv4)"
+  while true; do
+    ask_required d "Домен ноды (selfsteal), напр. fi.example.com"
+    d="${d,,}"
+    if ! _cdn_valid_name "$d"; then warn "Нужно доменное имя без схемы и пути."; continue; fi
+    ips="$(_cdn_resolve "$d")"
+    if [ -n "$me" ] && [[ " ${ips} " == *" ${me} "* ]]; then
+      ok "${d} указывает на этот сервер (${me})."
+      break
+    fi
+    warn "${d} указывает на ${ips:-ничего}, а IP сервера — ${me:-не узнал}: клиенты придут не сюда, пока не поправишь A-запись."
+    if confirm "Оставить ${d}?"; then break; fi
+  done
+  printf -v "$__var" '%s' "$d"
+}
+
+# SECRET_KEY из панели: голое значение или строка «SECRET_KEY=…» из её compose, с кавычками.
+_node_ask_secret() {
+  local __var="$1" v
+  info "SECRET_KEY: панель → Nodes → добавить ноду → скопировать SECRET_KEY (можно целой строкой SECRET_KEY=…)."
+  while true; do
+    read -rsp "SECRET_KEY (ввод скрыт): " v; echo
+    v="${v#*SECRET_KEY=}"
+    v="${v//[[:space:]]/}"
+    v="${v#[!A-Za-z0-9+/]}"
+    v="${v%[!A-Za-z0-9+/=]}"
+    if [[ "$v" =~ ^[A-Za-z0-9+/=._-]{40,}$ ]]; then break; fi
+    warn "Не похоже на SECRET_KEY из панели — вставь ещё раз."
+  done
+  printf -v "$__var" '%s' "$v"
+}
+
+# Wildcard на родителя домена ноды $2: fi.example.com → example.com и *.example.com.
+# Уже выпущенный и покрывающий домен сертификат берём как есть. Имя сертификата — в $1.
+_node_cert() {
+  local __var="$1" domain="$2" base live
+  base="${domain#*.}"
+  case "$base" in *.*) ;; *) base="$domain" ;; esac
+  live="/etc/letsencrypt/live/${base}/fullchain.pem"
+  if [ -f "$live" ] && [ "$(_cert_days "$live")" -ge 30 ] \
+     && openssl x509 -noout -checkhost "$domain" -in "$live" 2>/dev/null | grep -q 'does match'; then
+    ok "Сертификат ${base} уже есть и покрывает ${domain} — беру его."
+  else
+    wait_for_apt
+    apt-get update -y
+    apt-get install -y certbot python3-certbot-dns-cloudflare
+    if grep -q '^[[:space:]]*dns_cloudflare_api_token' "$NF_CF_INI" 2>/dev/null \
+       && confirm "Взять токен Cloudflare из ${NF_CF_INI}?"; then
+      :
+    else
+      _cf_token_set "$NF_CF_INI" "$base"
+    fi
+    log "Выпускаю ${base} и *.${base} (DNS-01 через Cloudflare, 1–2 мин)."
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$NF_CF_INI" \
+      --dns-cloudflare-propagation-seconds 60 --cert-name "$base" -d "$base" -d "*.${base}" \
+      --key-type ecdsa --elliptic-curve secp384r1 \
+      --register-unsafely-without-email --agree-tos --non-interactive
+  fi
+  systemctl enable --now certbot.timer
+  printf -v "$__var" '%s' "$base"
+}
+
+# docker-compose.yml ноды: сертификат $1, SECRET_KEY $2.
+_node_compose_yml() {
+  local cert="$1" key="$2"
+  cat <<EOF
+x-common: &common
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  restart: always
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: 5
+
+services:
+  remnawave-nginx:
+    image: nginx:${NGINX_TARGET}
+    container_name: remnawave-nginx
+    hostname: remnawave-nginx
+    <<: [*common, *logging]
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt/live/${cert}/fullchain.pem:/etc/nginx/ssl/${cert}/fullchain.pem:ro
+      - /etc/letsencrypt/live/${cert}/privkey.pem:/etc/nginx/ssl/${cert}/privkey.pem:ro
+      - /dev/shm:/dev/shm:rw
+      - /var/www/html:/var/www/html:ro
+    command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
+
+  remnanode:
+    image: remnawave/node:latest
+    container_name: remnanode
+    hostname: remnanode
+    <<: [*common, *logging]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NODE_PORT=${NODE_PORT:-2222}
+      - SECRET_KEY=${key}
+    volumes:
+      - /dev/shm:/dev/shm:rw
+      - /var/log/remnanode:/var/log/remnanode
+EOF
+}
+
+# nginx.conf маскировки: домен $1, сертификат $2.
+_node_nginx_text() {
+  local domain="$1" cert="$2"
+  cat <<'EOF'
+server_names_hash_bucket_size 64;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ecdh_curve X25519:prime256v1:secp384r1;
+ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305';
+ssl_prefer_server_ciphers on;
+ssl_session_timeout 1d;
+ssl_session_cache shared:MozSSL:10m;
+ssl_session_tickets off;
+EOF
+  cat <<EOF
+
+server {
+    server_name ${domain};
+    listen unix:/dev/shm/nginx.sock ssl proxy_protocol;
+    http2 on;
+
+    ssl_certificate "/etc/nginx/ssl/${cert}/fullchain.pem";
+    ssl_certificate_key "/etc/nginx/ssl/${cert}/privkey.pem";
+    ssl_trusted_certificate "/etc/nginx/ssl/${cert}/fullchain.pem";
+
+    root /var/www/html;
+    index index.html;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+}
+
+server {
+    listen unix:/dev/shm/nginx.sock ssl proxy_protocol default_server;
+    server_name _;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+    ssl_reject_handshake on;
+    return 444;
+}
+EOF
+}
+
+# Стек ноды на диск: домен $1, сертификат $2, SECRET_KEY $3. Ключ лежит в compose —
+# файл только для root.
+_node_write_stack() {
+  local domain="$1" cert="$2" key="$3" dir="$NF_NODE_DIR"
+  mkdir -p "$dir" /var/log/remnanode /var/www/html
+  ( umask 077; _node_compose_yml "$cert" "$key" > "${dir}/docker-compose.yml" )
+  _node_nginx_text "$domain" "$cert" > "${dir}/nginx.conf"
+  # Заглушка до пункта «h»: он ставит настоящий сайт целиком.
+  if [ ! -s /var/www/html/index.html ]; then
+    cat > /var/www/html/index.html <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Welcome</title></head>
+<body><h1>Welcome</h1><p>The site is being set up.</p></body></html>
+EOF
+  fi
+}
+
+# Нода работает: nginx проходит nginx -t, панель передала конфиг и Xray слушает 443,
+# сайт открывается через Xray. 443 появится только после подключения панели.
+_node_check() {
+  local domain="$1" ngx i
+  ngx="$(_nginx_container)"
+  if [ -z "$ngx" ] || ! docker exec "$ngx" nginx -t >/dev/null 2>&1; then
+    err "nginx ноды не запущен или его конфиг не проходит nginx -t — смотри: docker logs remnawave-nginx"
+    return 1
+  fi
+  log "Жду, пока панель передаст ноде конфиг и Xray займёт 443 (до 2 мин)."
+  for i in $(seq 1 24); do
+    if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then break; fi
+    sleep 5
+  done
+  if [ -z "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
+    err "Xray не слушает 443: панель не подключилась к ноде или в профиле нет Reality на 443."
+    info "В панели: нода с адресом этого сервера (или его netbird-IP), порт ${NODE_PORT:-2222}, профиль назначен. Потом повтори шаг."
+    return 1
+  fi
+  if curl -fsS -m 10 -o /dev/null --resolve "${domain}:443:127.0.0.1" "https://${domain}/"; then
+    ok "https://${domain} открывается через Xray и nginx — маскировка работает."
+  else
+    err "443 слушает, но https://${domain} не открывается: target Reality — /dev/shm/nginx.sock (xver 1), SNI — ${domain}."
+    return 1
+  fi
+}
+
+block_node_own() {
+  local domain cert key
+  fw_load
+  if require_node >/dev/null 2>&1; then
+    info "Нода уже стоит (${NODE_DIR}, контейнер ${NODE_CONTAINER}) — проверяю её, ничего не переставляю."
+    _node_check "$(awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$(_node_nginx_conf)")"
+    return
+  fi
+  if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
+    err "Порт 443 уже занят — нода его не получит:"
+    ss -Hltnp 'sport = :443' >&2
+    return 1
+  fi
+  _docker_install
+  _node_ask_domain domain
+  _node_ask_secret key
+  _node_cert cert "$domain"
+  _node_write_stack "$domain" "$cert" "$key"
+  log "Поднимаю ноду (${NF_NODE_DIR})."
+  ( cd "$NF_NODE_DIR" && docker compose up -d )
+  _cert_hook_ensure
+  info "Сайт пока заглушка — настоящий поставит пункт «h»."
+  _node_check "$domain"
 }
  
 # Скрипт авто-обновления geo-ассетов Xray (cron, Вс 04:00). Кроме RU-списков
@@ -1716,11 +1970,21 @@ _node_http_probe() {
   return "$rc"
 }
 
+# protect gives every TCP_PORTS entry its own rule "tcp dport N ct state new accept".
+_na_tcp_open() {
+  nft list chain inet na_filter input 2>/dev/null | grep -qE "(^|[[:space:]])tcp dport ${1} ct state new accept"
+}
+
 _node_http_open_port() {
   fw_load || return 1
   # Only add the HTTP port; NODE_PORT, PANEL_IPS and all custom ports stay intact.
   fw_set EXTRA_TCP "$(_merge_ports "${EXTRA_TCP:-}" 80)" || return 1
   if command -v nft >/dev/null 2>&1 && nft list table inet na_filter >/dev/null 2>&1; then
+    # Already open: a protect rerun would only re-download node-accelerator and re-arm safety.
+    if _na_tcp_open 80; then
+      ok "80/tcp уже открыт в na_filter."
+      return 0
+    fi
     apply_firewall || return 1
   elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     ufw allow 80/tcp || return 1
@@ -2232,6 +2496,22 @@ ${GRY}────────────────────────�
 EOF
 }
  
+# Проверка номер $1 из подменю «14». Скрипты сторонние: их сбой — не ошибка пункта.
+_run_check() {
+  case "$1" in
+    1) echo; step "IP region";          bash <(wget -qO- https://ipregion.vrnt.xyz) || true ;;
+    2) echo; step "CensorCheck geoblock"; bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true ;;
+    3) echo; step "CensorCheck DPI";    bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
+    4) echo; step "IP.Check.Place";     bash <(curl -fLs IP.Check.Place) -l en || true ;;
+    5) echo; step "IPQuality";          bash <(curl -fLs https://Check.Place) -EI || true ;;
+    6) echo; step "Russian iPerf3";     bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true ;;
+    7) echo; step "YABS";               curl -fsSL yabs.sh | bash -s -- -4 || true ;;
+    8) echo; step "bench.sh";           wget -qO- bench.sh | bash || true ;;
+    9) echo; step "sysbench CPU";       sysbench cpu run --threads=1 || true ;;
+    *) warn "Неизвестный пункт: $1" ;;
+  esac
+}
+
 submenu_checks() {
   local choice c
   ensure_check_dependencies || {
@@ -2243,19 +2523,8 @@ submenu_checks() {
     read -rp "Выбор: " choice
     [ -z "$choice" ] && continue
     for c in $choice; do
-      case "$c" in
-        1) echo; step "IP region";          bash <(wget -qO- https://ipregion.vrnt.xyz) || true ;;
-        2) echo; step "CensorCheck geoblock"; bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock || true ;;
-        3) echo; step "CensorCheck DPI";    bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi || true ;;
-        4) echo; step "IP.Check.Place";     bash <(curl -fLs IP.Check.Place) -l en || true ;;
-        5) echo; step "IPQuality";          bash <(curl -fLs https://Check.Place) -EI || true ;;
-        6) echo; step "Russian iPerf3";     bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) || true ;;
-        7) echo; step "YABS";               curl -fsSL yabs.sh | bash -s -- -4 || true ;;
-        8) echo; step "bench.sh";           wget -qO- bench.sh | bash || true ;;
-        9) echo; step "sysbench CPU";       sysbench cpu run --threads=1 || true ;;
-        0)  return 0 ;;
-        *)  warn "Неизвестный пункт: ${c}" ;;
-      esac
+      if [ "$c" = 0 ]; then return 0; fi
+      _run_check "$c"
     done
     echo
     read -rp "Нажмите Enter для возврата в меню проверок..." _
@@ -2893,7 +3162,7 @@ _ask_panel_ips() {
     ips="${ips// /}"
     if [ "$ips" = "-" ]; then ips=""; break; fi
     if _valid_ipv4_list "$ips"; then break; fi
-    warn "Нужны IPv4-адреса или подсети через запятую, напр. 100.109.8.19 (netbird-IP, если панель ходит по netbird)."
+    warn "Нужны IPv4-адреса или подсети через запятую, напр. 100.64.0.10 (netbird-IP, если панель ходит по netbird)."
   done
   if [ -z "$ips" ]; then
     warn "Без IP панели порт ноды${PANEL_PORTS:+ и ${PANEL_PORTS}} остаются доступны всем, кого пропускает na_filter."
@@ -3779,12 +4048,18 @@ _cf_api() {
 }
 
 # Спросить API-токен (скрытый ввод), проверить в Cloudflare и записать в ini $1 (600).
-# До записи: токен активен и видит зоны всех сертификатов этого ini. Старый ключ на диск
-# не бэкапим — в нём может быть ключ ко всему аккаунту Cloudflare.
+# До записи: токен активен и видит зоны имён $2 (по умолчанию — всех сертификатов этого
+# ini). Старый ключ на диск не бэкапим — в нём может быть ключ ко всему аккаунту Cloudflare.
 _cf_token_set() {
-  local ini="$1" names zones n d uncovered="" CF_TOKEN
+  local ini="$1" domains="${2:-}" names zones n d uncovered="" CF_TOKEN
   names="$(_cf_certs_for_ini "$ini")"
-  info "Токен: Cloudflare → My Profile → API Tokens → Create Token → шаблон «Edit zone DNS»; зоны сертификатов: ${names:-?}."
+  if [ -z "$domains" ]; then
+    for n in $names; do
+      domains="${domains} $(openssl x509 -noout -ext subjectAltName -in "/etc/letsencrypt/live/${n}/cert.pem" 2>/dev/null \
+                             | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://; s/^\*\.//' | sort -u | paste -sd' ' || true)"
+    done
+  fi
+  info "Токен: Cloudflare → My Profile → API Tokens → Create Token → шаблон «Edit zone DNS»; зоны для: ${domains:-?}."
   info "Если на другой ноде этих зон продление работает — подходящий токен лежит там в ${ini}."
   read -rsp "API-токен Cloudflare (ввод скрыт): " CF_TOKEN; echo
   if [ -z "$CF_TOKEN" ]; then warn "Токен не введён — ничего не менял."; return 1; fi
@@ -3793,13 +4068,10 @@ _cf_token_set() {
   fi
   zones="$(_cf_api 'zones?per_page=50' 2>/dev/null \
     | python3 -c 'import json,sys; print("\n".join(z["name"] for z in json.load(sys.stdin).get("result", [])))' 2>/dev/null || true)"
-  for n in $names; do
-    for d in $(openssl x509 -noout -ext subjectAltName -in "/etc/letsencrypt/live/${n}/cert.pem" 2>/dev/null \
-                 | grep -oE 'DNS:[^, ]+' | sed 's/^DNS://; s/^\*\.//' | sort -u || true); do
-      if ! printf '%s\n' "$zones" | awk -v d="$d" 'd == $0 || substr(d, length(d) - length($0)) == "." $0 { f = 1 } END { exit !f }'; then
-        uncovered="${uncovered:+${uncovered} }${d}"
-      fi
-    done
+  for d in $(tr ' ' '\n' <<<"$domains" | sort -u); do
+    if ! printf '%s\n' "$zones" | awk -v d="$d" 'd == $0 || substr(d, length(d) - length($0)) == "." $0 { f = 1 } END { exit !f }'; then
+      uncovered="${uncovered:+${uncovered} }${d}"
+    fi
   done
   if [ -n "$uncovered" ]; then
     warn "Токен активен, но не видит зоны для: ${uncovered} — продление этих имён упадёт."
@@ -4042,7 +4314,7 @@ block_vk_domain() {
   if ! _cdn_valid_name "$origin" || ! _cdn_valid_name "$cdn"; then err "Это не похоже на доменные имена: ${origin} / ${cdn}"; return 1; fi
   if [ "$origin" = "$cdn" ]; then err "origin и CDN-имя должны различаться."; return 1; fi
 
-  ip="$(curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true)"
+  ip="$(_public_ipv4)"
   addrs="$(_cdn_resolve "$origin")"
   if [ -z "$ip" ] || [[ " ${addrs} " != *" ${ip} "* ]]; then
     err "${origin} резолвится в «${addrs:-никуда}», а сервер — ${ip:-?}: CDN и Let's Encrypt придут не сюда."
@@ -5221,7 +5493,7 @@ _audit_ru() {
   local -a logs rules
   step "Доступность из РФ"
   if ! command -v python3 >/dev/null 2>&1; then _a_warn "Нет python3 — доступность из РФ не проверить"; return 0; fi
-  ip="$(curl -4 -fsS -m 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1 == "ip" { print $2 }' || true)"
+  ip="$(_public_ipv4)"
   if [ -z "$ip" ]; then _a_warn "Не узнал внешний IPv4 ноды — доступность из РФ не проверена"; return 0; fi
   if ! _ru_asn_refresh; then
     info "Диапазоны российских операторов (iptoasn.com) не скачались — клиентов по странам и операторам не разберу"
@@ -6437,6 +6709,146 @@ block_sysupdate() {
   _sysupd_after "$held"
 }
 
+# ============================================================================
+#  i)  ПОЛНАЯ УСТАНОВКА НОДЫ — пункты подряд, с продолжением после reboot
+# ----------------------------------------------------------------------------
+#  Сначала доступность из РФ и вопрос «продолжаем?», потом выбор, чем ставить ноду
+#  (установщик eGames, как пункт 5, или своя установка), дальше 1 → IPv6 → 2 → reboot →
+#  3 → 4 → 5 → 6 → 7 → h → j → 11 → a → проверки 14 (1 2 3 4 6). Текущий шаг и вариант
+#  лежат в /etc/nodeforge/install.state: после ребута или остановки «i» продолжит с шага.
+# ============================================================================
+NF_INSTALL_STATE=/etc/nodeforge/install.state
+NF_INSTALL_STEPS=(
+  "1|SSH-харденинг|block_ssh"
+  "ipv6|Выключить IPv6|_install_ipv6_off"
+  "2|Оптимизация (node-accelerator)|block_optimize"
+  "3|Защита (node-accelerator)|_install_protect"
+  "4|netbird|block_netbird"
+  "5|Нода remnanode|_install_node"
+  "6|RU-блокировка|block_rublock"
+  "7|Логи ноды|block_logs"
+  "h|Свой API-сайт вместо заглушки|block_camouflage"
+  "j|HTTP 301 + HSTS|block_http_hardening"
+  "11|Beszel: агент|block_beszel_agent"
+  "a|Аудит ноды|block_audit"
+  "14|Проверки: IP region, CensorCheck, IP.Check.Place, iPerf3|_install_checks"
+)
+
+# Текущая SSH-сессия пришла на IPv6-адрес сервера (выключение IPv6 её оборвёт).
+_ssh_over_ipv6() {
+  ss -Htn state established "( sport = :$(detect_ssh_port) )" 2>/dev/null \
+    | awk 'substr($3, 1, 1) == "[" && substr($3, 1, 8) != "[::ffff:" { f = 1 } END { exit !f }'
+}
+
+# IPv6 есть — выключить тем же исправлением, что предлагает аудит (sysctl + ifupdown/netplan).
+_install_ipv6_off() {
+  if [ ! -d /proc/sys/net/ipv6 ] || { [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 1 ] \
+       && [ -z "$(_ifupdown_inet6_files)" ] && [ -z "$(_netplan_inet6_ids)" ]; }; then
+    ok "IPv6 на сервере уже выключен."
+    return 0
+  fi
+  if _ssh_over_ipv6; then
+    warn "Ты подключён к серверу по IPv6 — выключение оборвёт эту сессию."
+    if ! confirm "Выключить IPv6 всё равно?"; then warn "IPv6 оставлен."; return 0; fi
+  fi
+  _fix_disable_ipv6
+}
+
+# 80/tcp — сразу в реестр: его откроет этот же protect, и «j» не будет пересобирать фаервол.
+_install_protect() {
+  fw_load
+  fw_set EXTRA_TCP "$(_merge_ports "${EXTRA_TCP:-}" 80)"
+  info "80/tcp добавлен в реестр заранее — под редирект на HTTPS (пункт j)."
+  block_protect
+}
+
+_install_checks() {
+  local c
+  ensure_check_dependencies
+  for c in 1 2 3 4 6; do _run_check "$c"; done
+}
+
+# Чем ставить ноду на шаге 5: egames — установщик eGames (пункт 5), own — своя установка.
+_install_ask_node() {
+  local egames="установщик eGames, как пункт 5 — его меню и вопросы; включает ufw, после него фаервол пересоберётся"
+  local own="своя установка — Docker, nginx + remnanode, Let's Encrypt через Cloudflare; ufw нет, фаервол не пересобирается"
+  local pick
+  choose_from_list pick "Чем ставить ноду (шаг 5)?" "" "$egames" "$own"
+  if [ "$pick" = "$egames" ]; then NF_INSTALL_NODE=egames; else NF_INSTALL_NODE=own; fi
+}
+
+_install_node() {
+  if [ "${NF_INSTALL_NODE:-}" = egames ]; then block_remnanode; else block_node_own; fi
+}
+
+# Ядро поставлено, но не загружено (XanMod из optimize).
+_reboot_pending() {
+  [ -f /var/run/reboot-required ] && return 0
+  ls /boot/vmlinuz-*xanmod* >/dev/null 2>&1 && ! uname -r | grep -q xanmod
+}
+
+# Номер шага с id $1 в NF_INSTALL_STEPS (пусто — такого нет).
+_install_index() {
+  local i
+  for i in "${!NF_INSTALL_STEPS[@]}"; do
+    if [ "${NF_INSTALL_STEPS[i]%%|*}" = "$1" ]; then echo "$i"; return 0; fi
+  done
+}
+
+block_install() {
+  local i=0 id name fn ans resume="" total="${#NF_INSTALL_STEPS[@]}"
+  NF_INSTALL_NODE=""
+  if [ -s "$NF_INSTALL_STATE" ]; then read -r resume NF_INSTALL_NODE < "$NF_INSTALL_STATE"; fi
+  if [ -n "$resume" ]; then
+    i="$(_install_index "$resume")"
+    if [ -z "$i" ]; then
+      warn "Шага «${resume}» из прошлой установки в этой версии скрипта нет."
+      i=0; resume=""
+    else
+      IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
+      info "Незавершённая установка: следующий шаг — ${id}) ${name}."
+      if ! confirm "Продолжить с него?"; then
+        confirm "Начать установку заново?" || return 0
+        i=0; resume=""
+      fi
+    fi
+  fi
+  if [ -z "$resume" ]; then
+    run_block "Доступность из РФ" block_ru_access
+    if ! confirm "Продолжаем установку ноды?"; then warn "Установка остановлена."; return 0; fi
+    NF_INSTALL_NODE=""
+  fi
+  if [ -z "$NF_INSTALL_NODE" ]; then _install_ask_node; fi
+  mkdir -p "$(dirname "$NF_INSTALL_STATE")"
+  while [ "$i" -lt "$total" ]; do
+    IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
+    printf '%s %s\n' "$id" "$NF_INSTALL_NODE" > "$NF_INSTALL_STATE"
+    echo
+    info "Установка: шаг $((i + 1)) из ${total}."
+    if ! run_block "$name" "$fn"; then
+      read -rp "Шаг не прошёл: r — повторить, s — пропустить, 0 — остановить [r]: " ans
+      case "$ans" in
+        s|S|ы|Ы) ;;
+        0) warn "Установка остановлена — пункт «i» продолжит с шага «${name}»."; return 0 ;;
+        *) continue ;;
+      esac
+    fi
+    i=$((i + 1))
+    if [ "$fn" = block_optimize ] && _reboot_pending; then
+      IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
+      printf '%s %s\n' "$id" "$NF_INSTALL_NODE" > "$NF_INSTALL_STATE"
+      echo
+      warn "Новое ядро заработает после перезагрузки."
+      warn "До неё проверь вход в НОВОМ окне: ssh -p $(detect_ssh_port) <пользователь>@$(_public_ipv4)"
+      info "После перезагрузки запусти скрипт и выбери «i» — продолжу с шага «${name}»."
+      if confirm "Перезагрузить сейчас?"; then reboot; fi
+      return 0
+    fi
+  done
+  rm -f "$NF_INSTALL_STATE"
+  ok "Установка ноды завершена: все шаги пройдены."
+}
+
 
 # ============================ МЕНЮ ============================
 # self_update вызывается НАПРЯМУЮ из меню (не через run_block), чтобы exec
@@ -6497,6 +6909,7 @@ run_block() {
   else
     err "${name} — прервано (код ${rc}, см. вывод выше)."
   fi
+  return "$rc"
 }
  
 banner() {
@@ -6567,13 +6980,15 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} v)${RST} SNI-проверка ноды  ${GRY}— mTLS панель→нода: SNI_VERIFICATION вкл/выкл (node ≥ 3.4)${RST}
  
  ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
+   ${BOLD}${YLW} i)${RST} ${WHT}Полная установка${RST} ${GRY}— d → «продолжаем?» → 1 IPv6 2 → reboot → 3 4 5 6 7 h j 11 → a → проверки 14${RST}
    ${BOLD}${YLW}16)${RST} ① До ребута       ${GRY}(1 + 2)  → потом reboot${RST}
    ${BOLD}${YLW}17)${RST} ② Поднять ноду    ${GRY}(4 + 5)${RST}
    ${BOLD}${YLW}18)${RST} ③ Настроить ноду  ${GRY}(6 + 7 + 8)${RST}
    ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода по шагам:  16 → reboot → 17 → 18 → 19 → h → j → m → a.  Можно несколько номеров через пробел.${RST}
+ ${DIM}Чистая нода целиком: i (после reboot — снова i). По шагам: 16 → reboot → 17 → 18 → 19 → h → j → m → a.${RST}
+ ${DIM}Можно несколько номеров через пробел.${RST}
 EOF
 }
  
@@ -6621,6 +7036,7 @@ menu() {
         w|W) run_block "netbird: обновление" netbird_update ;;
         l|L) run_block "Fleet-sync" block_fleet ;;
         v|V) run_block "SNI-проверка ноды" block_sni_verification ;;
+        i|I) block_install ;;   # шаги сама запускает через run_block
         16) run_block "SSH-харденинг" block_ssh
             run_block "Оптимизация (node-accelerator)" block_optimize ;;
         17) run_block "netbird" block_netbird
@@ -6643,6 +7059,9 @@ main() {
   banner
   require_root
   ensure_apt_lock_timeout
+  if [ -s "$NF_INSTALL_STATE" ]; then
+    warn "Есть незавершённая установка ноды — пункт «i» продолжит с места остановки."
+  fi
   menu
 }
  

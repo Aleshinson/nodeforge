@@ -245,7 +245,7 @@ apply_firewall
         for failure in ('runtime', 'enable', 'restart'):
             result = self.bash('''
 FAILURE="$1"
-fw_load() { SSH_PORT=22; NODE_PORT=2222; TCP_PORTS=443; UDP_PORTS=443; PANEL_IPS=100.109.8.19; }
+fw_load() { SSH_PORT=22; NODE_PORT=2222; TCP_PORTS=443; UDP_PORTS=443; PANEL_IPS=100.64.0.10; }
 fw_neutralize_ufw() { :; }
 curl() {
   while [ "$#" -gt 0 ]; do
@@ -275,7 +275,7 @@ fw_verify
 
     def test_port_registration_preserves_existing_ports_and_panel_access(self):
         registry = self.base / 'firewall.env'
-        registry.write_text('EXTRA_TCP="8443"\nPANEL_IPS="100.109.8.19"\nNODE_PORT="2222"\n')
+        registry.write_text('EXTRA_TCP="8443"\nPANEL_IPS="100.64.0.10"\nNODE_PORT="2222"\n')
         result = self.bash('''
 FW_ENV="$1"
 fw_init() { :; }
@@ -285,7 +285,7 @@ apply_firewall() { fw_load; printf 'PORTS:%s NODE:%s PANEL:%s' "$EXTRA_TCP" "$NO
 _node_http_open_port
 ''', registry)
         self.assert_ok(result)
-        self.assertIn('PORTS:80,8443 NODE:2222 PANEL:100.109.8.19', result.stdout)
+        self.assertIn('PORTS:80,8443 NODE:2222 PANEL:100.64.0.10', result.stdout)
 
     def test_menu_dispatches_http_hardening(self):
         result = self.bash('''
