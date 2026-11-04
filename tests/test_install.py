@@ -1,4 +1,4 @@
-"""Full install (i), own node layout and the j firewall shortcut: real Bash, stubbed system."""
+"""Full install (i), own node layout, node version (t) and the j shortcut: real Bash, stubbed system."""
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ NL = chr(10)
 CR = chr(92) + "r"
 # Windows: python3 is "python"; it and openssl print CRLF; flock is absent.
 SHIM = ('python3() { python "$@" | tr -d "' + CR + '"; }; '
-        'openssl() { command openssl "$@" | tr -d "' + CR + '"; }; flock() { :; };') if os.name == "nt" else ""
+        'openssl() { MSYS2_ARG_CONV_EXCL="*" command openssl "$@" | tr -d "' + CR + '"; }; flock() { :; };') if os.name == "nt" else ""
 DOMAIN = "de.example.org"
 CERT = "example.org"
 SECRET = "eyJub2RlQ2VydFBlbSI6Ii0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLSJ9" + "=="
@@ -598,6 +598,199 @@ _cf_token_set "$INI" "$DOMAINS"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("other.net", result.stderr)
         self.assertFalse(ini.exists())
+
+
+COMPOSE = """# stack of the node
+services:
+  remnawave-nginx:
+    image: nginx:1.30
+    container_name: remnawave-nginx
+    network_mode: host
+
+  remnanode:
+    image: IMAGE
+    container_name: remnanode
+    network_mode: host
+"""
+
+
+def hub_tag(name, day, digest):
+    return {"name": name, "last_updated": f"2026-{day}T10:00:00Z", "digest": "sha256:" + digest}
+
+
+# The order is the Hub's, by date: 2.9.0 was rebuilt last among the old ones.
+HUB = json.dumps({"results": [
+    hub_tag("3.4.4", "11-02", "d444"), hub_tag("latest", "11-02", "d444"), hub_tag("dev", "11-02", "ddev"),
+    hub_tag("3.4.3", "10-22", "d443"), hub_tag("3.4.2", "10-06", "d442"), hub_tag("2.9.0", "08-01", "d290"),
+    hub_tag("2.10.0", "07-01", "d2100"),
+]})
+OTHER_ITEM, LATEST_ITEM, CANCEL_ITEM = "7", "6", "8"
+SECOND_VERSION = "2"
+
+# docker and the network are stubbed; compose parsing, run_block and set -e are real.
+NODE_STUBS = """
+docker() {
+  echo "docker $*" >> "$LOG"
+  case "$1" in
+    ps) echo "remnawave/node:latest<TAB>$STACK" ;;
+    pull) [ -z "${PULL_FAIL:-}" ] ;;
+    exec) echo "${EXEC_OUT:-Xray 26.7.28 (Xray, Penetrates Everything.)}" ;;
+    logs) echo "why it crashed" ;;
+    compose) [ -z "${UP_FAIL:-}" ] ;;
+    inspect)
+      case "$3" in
+        *State*) echo "${STATE:-running 0}" ;;
+        *Config.Image*) echo "remnawave/node:${TAG:-latest}" ;;
+        *) echo sha256:running ;;
+      esac ;;
+    image)
+      case "$4" in
+        *RepoDigests*) echo "remnawave/node@sha256:${RUNNING:-d444}" ;;
+        *) echo "${PULLED_ID:-sha256:pulled}" ;;
+      esac ;;
+  esac
+}
+curl() { [ -z "${HUB_DOWN:-}" ] && cat "$HUB"; }
+sleep() { :; }
+ss() { [ -z "${LISTEN:-}" ] || echo "LISTEN 0 4096 *:443"; }
+_mptcp_enabled() { [ -n "${MPTCP:-}" ]; }
+""".replace("<TAB>", chr(9))
+
+
+class NodeVersionTests(BashCase):
+    UP = "docker compose up -d --no-deps remnanode"
+
+    def setUp(self):
+        super().setUp()
+        self.stack = self.base / "stack"
+        self.stack.mkdir()
+        self.compose = self.stack / "docker-compose.yml"
+        self.calls = self.base / "calls.log"
+        self.hub = self.base / "hub.json"
+        put(self.hub, HUB)
+
+    def script(self, body, flags):
+        env = "".join(f'{k}="{v}"; ' for k, v in flags.items())
+        return 'STACK="$PWD/$1"; LOG="$PWD/$2"; HUB="$PWD/$3"; ' + env + NODE_STUBS + body
+
+    def switch(self, answers, image="remnawave/node:latest", **flags):
+        put(self.compose, COMPOSE.replace("IMAGE", image))
+        script = self.script('run_block "Версия ноды" block_node_version', flags)
+        return self.bash(script, self.stack, self.calls, self.hub, stdin=NL.join(answers) + NL)
+
+    def log(self):
+        return self.calls.read_text(encoding="utf-8").splitlines() if self.calls.exists() else []
+
+    def stack_text(self):
+        return self.compose.read_text(encoding="utf-8")
+
+    def assert_untouched(self, image="remnawave/node:latest"):
+        self.assertEqual(self.stack_text(), COMPOSE.replace("IMAGE", image))
+        self.assertNotIn(self.UP, self.log())
+
+    def test_enter_rolls_back_to_the_version_before_the_running_one(self):
+        result = self.switch(["", "y"])
+        self.assert_ok(result)
+        self.assertIn("(это 3.4.4)", result.stderr + result.stdout)
+        self.assertEqual(self.stack_text(), COMPOSE.replace("IMAGE", "remnawave/node:3.4.3"))
+        log = self.log()
+        self.assertLess(log.index("docker pull remnawave/node:3.4.3"), log.index(self.UP))
+        self.assertIn("Xray 26.7.28", result.stdout + result.stderr)
+
+    def test_versions_go_by_number_and_service_tags_are_hidden(self):
+        out = self.switch(["", "y"]).stdout
+        self.assertLess(out.index("2.10.0"), out.index("2.9.0"))
+        self.assertLess(out.index("3.4.4 от 2026-11-02, сейчас"), out.index("3.4.3 от 2026-10-22"))
+        self.assertNotIn("dev от", out)
+
+    def test_missing_version_leaves_the_node_alone(self):
+        result = self.switch(["", "y"], PULL_FAIL=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_untouched()
+
+    def test_node_that_does_not_stay_up_is_put_back(self):
+        result = self.switch(["", "y"], STATE="restarting 2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.stack_text(), COMPOSE.replace("IMAGE", "remnawave/node:latest"))
+        self.assertEqual(self.log().count(self.UP), 2)
+        self.assertIn("why it crashed", result.stdout + result.stderr)
+
+    def test_failed_recreate_is_put_back(self):
+        result = self.switch(["", "y"], UP_FAIL=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.stack_text(), COMPOSE.replace("IMAGE", "remnawave/node:latest"))
+
+    def test_without_docker_hub_the_version_is_typed_by_hand(self):
+        # latest, other, cancel: the list of versions is empty.
+        result = self.switch(["2", "v3.4.3", "y"], HUB_DOWN=1)
+        self.assert_ok(result)
+        self.assertIn("Docker Hub не ответил", result.stdout + result.stderr)
+        self.assertIn("image: remnawave/node:3.4.3", self.stack_text())
+
+    def test_back_to_latest_unpins_the_node(self):
+        result = self.switch([LATEST_ITEM, "y"], image="remnawave/node:3.4.3", RUNNING="d443")
+        self.assert_ok(result)
+        self.assertIn("docker pull remnawave/node:latest", self.log())
+        self.assertIn("image: remnawave/node:latest", self.stack_text())
+        self.assertNotIn("закреплена", result.stdout + result.stderr)
+
+    def test_cancel_and_no_change_nothing(self):
+        for answers in ([CANCEL_ITEM], ["", "n"]):
+            with self.subTest(answers=answers):
+                self.calls.unlink(missing_ok=True)
+                self.assert_ok(self.switch(answers))
+                self.assert_untouched()
+                self.assertFalse([c for c in self.log() if c.startswith("docker pull")])
+
+    def test_text_that_is_not_a_tag_is_refused(self):
+        result = self.switch([OTHER_ITEM, "3.4.3;reboot"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_untouched()
+        self.assertFalse([c for c in self.log() if c.startswith("docker pull")])
+
+    def test_same_version_recreates_nothing(self):
+        result = self.switch([SECOND_VERSION, "y"], image="remnawave/node:3.4.3", RUNNING="d443",
+                             PULLED_ID="sha256:running")
+        self.assert_ok(result)
+        self.assert_untouched("remnawave/node:3.4.3")
+
+    def test_registry_with_port_stays_in_the_image(self):
+        image = "registry.example.org:5000/remnawave/node"
+        self.assert_ok(self.switch(["", "y"], image=image))
+        self.assertIn(f"docker pull {image}:3.4.3", self.log())
+        self.assertIn(f"image: {image}:3.4.3", self.stack_text())
+
+    def test_old_version_warns_about_the_kernel_while_mptcp_is_on(self):
+        self.assertIn("MPTCP", self.switch(["", "y"], MPTCP=1).stderr)
+        self.assertNotIn("MPTCP", self.switch(["", "y"]).stderr)
+        self.assertNotIn("MPTCP", self.switch([LATEST_ITEM, "y"], MPTCP=1).stderr)
+
+    def test_failed_wait_for_443_only_warns(self):
+        # 443 was open before the swap: the stub keeps it closed afterwards.
+        put(self.compose, COMPOSE.replace("IMAGE", "remnawave/node:latest"))
+        body = ('ss() { if grep -q "compose up" "$LOG"; then return 0; fi; echo "LISTEN 0 4096 *:443"; }; '
+                'run_block "Версия ноды" block_node_version')
+        result = self.bash(self.script(body, {}), self.stack, self.calls, self.hub, stdin="" + NL + "y" + NL)
+        self.assert_ok(result)
+        self.assertIn("не занял 443", result.stdout + result.stderr)
+
+    def test_docker_exec_failure_is_not_taken_for_a_version(self):
+        # Docker prints its own exec error to stdout, with exit code 126.
+        result = self.switch(["", "y"], EXEC_OUT="OCI runtime exec failed: xray not found")
+        self.assert_ok(result)
+        self.assertNotIn(", Xray", result.stdout + result.stderr)
+
+    def test_version_order(self):
+        script = ('for p in "3.4.3 3.4.4" "3.4.4 3.4.4" "3.10.0 3.4.4" "latest 3.4.4" "dev 3.4.4"; do '
+                  'set -- $p; if _version_older "$1" "$2"; then echo "OLDER=$1"; fi; done')
+        self.assertEqual(self.bash(script).stdout.split(), ["OLDER=3.4.3"])
+
+    def test_audit_mentions_a_pinned_version(self):
+        script = self.script("_audit_node_image remnanode", {"TAG": "3.4.3"})
+        put(self.compose, COMPOSE.replace("IMAGE", "remnawave/node:3.4.3"))
+        result = self.bash(script, self.stack, self.calls, self.hub)
+        self.assert_ok(result)
+        self.assertIn("закреплена", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

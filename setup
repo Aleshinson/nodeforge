@@ -975,21 +975,26 @@ EOF
   fi
 }
 
+_node_wait_443() {
+  local i
+  log "Жду, пока панель передаст ноде конфиг и Xray займёт 443 (до 2 мин)."
+  for i in $(seq 1 24); do
+    if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
 # Нода работает: nginx проходит nginx -t, панель передала конфиг и Xray слушает 443,
 # сайт открывается через Xray. 443 появится только после подключения панели.
 _node_check() {
-  local domain="$1" ngx i
+  local domain="$1" ngx
   ngx="$(_nginx_container)"
   if [ -z "$ngx" ] || ! docker exec "$ngx" nginx -t >/dev/null 2>&1; then
     err "nginx ноды не запущен или его конфиг не проходит nginx -t — смотри: docker logs remnawave-nginx"
     return 1
   fi
-  log "Жду, пока панель передаст ноде конфиг и Xray займёт 443 (до 2 мин)."
-  for i in $(seq 1 24); do
-    if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then break; fi
-    sleep 5
-  done
-  if [ -z "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
+  if ! _node_wait_443; then
     err "Xray не слушает 443: панель не подключилась к ноде, в профиле нет Reality на 443 или Xray не стартует."
     info "В панели: нода с адресом этого сервера (или его netbird-IP), порт ${NODE_PORT:-2222}, профиль назначен."
     info "Почему не стартует Xray — в docker logs ${NODE_CONTAINER:-remnanode}. Потом повтори шаг."
@@ -2314,6 +2319,137 @@ block_nginx_upgrade() {
   log "Готово. Контейнер remnawave-nginx на образе: ${now:-неизвестно}"
 }
  
+# ----- t) Версия ноды: откат remnanode на нужную версию -----
+# Теги-версии образа $1 с Docker Hub, от новых к старым: «тег дата digest». Hub не ответил — пусто.
+_node_hub_tags() {
+  curl -fsS -m 8 "https://hub.docker.com/v2/repositories/${1}/tags?page_size=100&ordering=last_updated" 2>/dev/null \
+    | python3 -c 'import json, sys
+for t in json.load(sys.stdin)["results"]:
+    print(t["name"], (t.get("last_updated") or "?")[:10], t.get("digest") or "?")' 2>/dev/null \
+    | awk '$1 ~ /^[0-9]+[.][0-9]+[.][0-9]+$/' | sort -rV -k1,1 || true
+}
+
+# Версия запущенного контейнера: в образе номера нет, у latest он находится по digest в списке $1.
+_node_running_version() {
+  local img d
+  img="$(docker inspect -f '{{.Image}}' "$NODE_CONTAINER" 2>/dev/null || true)"
+  if [ -z "$img" ]; then return 0; fi
+  for d in $(docker image inspect -f '{{join .RepoDigests " "}}' "$img" 2>/dev/null || true); do
+    awk -v d="${d#*@}" '$3 == d { print $1; exit }' <<<"$1"
+  done | head -1
+}
+
+# Образ $1 только в сервисе ноды: рядом в стеке nginx. Пишем в тот же файл — права и владелец целы.
+_compose_set_node_image() {
+  local f="${NODE_DIR}/docker-compose.yml" tmp
+  tmp="$(mktemp)"
+  awk -v s="$NODE_SERVICE" -v img="$1" '
+    /^[^[:space:]#]/ { top = $0; in_s = 0 }
+    top ~ /^services:/ && /^  [^[:space:]#]/ { name = $1; sub(/:$/, "", name); in_s = (name == s) }
+    in_s && /^    image:/ { sub(/image:.*/, "image: " img) }
+    { print }' "$f" > "$tmp"
+  cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+
+# Версия $1 старше $2.
+_version_older() {
+  [ "$1" != "$2" ] && [ "$({ echo "$1"; echo "$2"; } | sort -V | head -1)" = "$1" ]
+}
+
+_mptcp_enabled() {
+  [ "$(cat /proc/sys/net/mptcp/enabled 2>/dev/null || true)" = 1 ]
+}
+
+# Тег закрепляется в compose: на latest следующий pull вернул бы ту же версию, от которой уходим.
+# Образ качаем до правок, поэтому несуществующая версия ничего не задевает. Пересоздаётся только
+# контейнер ноды; не поднялась — возвращаем прежний compose (прежний образ остался на диске).
+block_node_version() {
+  local f ref repo tag tags cur v d line target sel was_443 xray prev="" def="" rc=0
+  local items=()
+  require_node || return 1
+  f="${NODE_DIR}/docker-compose.yml"
+  ref="$(_compose_service_key "$f" "$NODE_SERVICE" image)"
+  ref="${ref%%@*}"
+  repo="$ref"; tag=latest
+  case "${ref##*/}" in *:*) repo="${ref%:*}"; tag="${ref##*:}" ;; esac
+
+  tags="$(_node_hub_tags "$repo")"
+  cur="$(_node_running_version "$tags" || true)"
+  cur="${cur:-$tag}"
+  if [ "$cur" = "$tag" ]; then info "Нода сейчас: ${repo}:${tag}"; else info "Нода сейчас: ${repo}:${tag} (это ${cur})"; fi
+  if [ -z "$tags" ]; then warn "Docker Hub не ответил: номер версии придётся ввести самому."; fi
+
+  while read -r v d _; do
+    if [ -z "$v" ]; then continue; fi
+    line="${v} от ${d}"
+    if [ "$v" = "$cur" ]; then line="${line}, сейчас"; prev=1
+    elif [ -n "$prev" ]; then def="$line"; prev=""; fi
+    items+=("$line")
+  done < <(head -n 8 <<<"$tags")
+  items+=("latest, снова получать новые версии" "Другая версия (ввести номер)" "Отмена")
+
+  choose_from_list sel "Какую версию поставить?" "$def" "${items[@]}"
+  case "$sel" in
+    Отмена) warn "Отменено — образ не тронут."; return 0 ;;
+    Другая*) ask_required target "Номер версии, например 3.4.3"; target="${target#v}" ;;
+    latest*) target=latest ;;
+    *) target="${sel%% *}" ;;
+  esac
+  if [[ ! "$target" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+    err "Это не тег образа: ${target}"
+    return 1
+  fi
+
+  if _version_older "$target" 3.4.4 && _mptcp_enabled; then
+    warn "В версиях до 3.4.4 Xray слушает порты через MPTCP, а через него в ядре Linux возможен удалённый root."
+    warn "Если ядро давно не обновлялось, обнови его: пункт e, потом reboot."
+  fi
+  if ! confirm "Поставить ${repo}:${target} вместо ${cur}? Клиенты отключатся примерно на 10 с"; then
+    warn "Отменено — образ не тронут."
+    return 0
+  fi
+
+  log "Скачиваю ${repo}:${target}."
+  if ! docker pull "${repo}:${target}"; then
+    err "Образ не скачался: нет такой версии или нет доступа к реестру. Нода не тронута."
+    return 1
+  fi
+  if [ "$target" = "$tag" ] && [ "$(docker inspect -f '{{.Image}}' "$NODE_CONTAINER" 2>/dev/null || true)" \
+      = "$(docker image inspect -f '{{.Id}}' "${repo}:${target}" 2>/dev/null || true)" ]; then
+    ok "Нода уже на ${repo}:${target}, менять нечего."
+    return 0
+  fi
+
+  was_443="$(ss -Hltn 'sport = :443' 2>/dev/null || true)"
+  cp -a "$f" "${f}.bak"
+  _compose_set_node_image "${repo}:${target}"
+  log "Пересоздаю только ${NODE_CONTAINER} (бэкап compose: ${f}.bak)."
+  ( cd "$NODE_DIR" && docker compose up -d --no-deps "$NODE_SERVICE" ) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    sleep 15
+    if [ "$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$NODE_CONTAINER" 2>/dev/null || true)" != "running 0" ]; then
+      rc=1
+    fi
+  fi
+  if [ "$rc" -ne 0 ]; then
+    docker logs --tail 15 "$NODE_CONTAINER" 2>&1 || true
+    err "Нода на ${repo}:${target} не поднялась, возвращаю ${ref}."
+    cp -a "${f}.bak" "$f"
+    ( cd "$NODE_DIR" && docker compose up -d --no-deps "$NODE_SERVICE" ) || true
+    return 1
+  fi
+
+  if [ -n "$was_443" ] && ! _node_wait_443; then
+    warn "Xray не занял 443 за 2 минуты: проверь ноду в панели и docker logs ${NODE_CONTAINER}."
+  fi
+  xray="$(docker exec "$NODE_CONTAINER" xray version 2>/dev/null | awk 'NR == 1 && $1 == "Xray" { print $2 }' || true)"
+  ok "${NODE_CONTAINER} на образе ${repo}:${target}${xray:+, Xray ${xray}}."
+  if [ "$target" != latest ]; then
+    info "Версия закреплена в compose, сама нода не обновится. Вернуть latest можно здесь же, пункт t."
+  fi
+}
+
 # ----- SNI-проверка mTLS (панель → нода), remnawave/node >= 3.4 -----
 # https://f.docs.rw/t/topic/639 — в 3.3.x нода обязательно сверяла SNI входящего
 # mTLS-соединения; с 3.4.x проверка выключена и включается SNI_VERIFICATION=true.
@@ -5484,6 +5620,7 @@ _audit_node_image() {
   img="$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)"
   [ -n "$ref" ] && [ -n "$img" ] || return 0
   repo="${ref%%:*}"; tag="${ref#*:}"; [ "$tag" = "$ref" ] && tag=latest
+  if [ "$tag" != latest ]; then info "Версия ноды закреплена в compose: ${tag}. Вернуть latest — пункт t"; fi
   created="$(docker image inspect -f '{{.Created}}' "$img" 2>/dev/null | cut -c1-10)"
   local_d="$(docker image inspect -f '{{join .RepoDigests " "}}' "$img" 2>/dev/null | grep -oE 'sha256:[0-9a-f]+' | head -1)"
   remote="$(curl -fsS -m 8 "https://hub.docker.com/v2/repositories/${repo}/tags/${tag}" 2>/dev/null)"
@@ -7407,6 +7544,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} j)${RST} HTTP + HSTS     ${GRY}— 301 на 80, TLS 1.2/1.3, HSTS, открыть 80/tcp${RST}
    ${BOLD}${CYN} 9)${RST} nginx 1.28 → ${WHT}${NGINX_TARGET}${RST}  ${GRY}— проверит версию и спросит${RST}
    ${BOLD}${CYN}10)${RST} Перезапуск контейнеров  ${GRY}— стек ноды или все на хосте${RST}
+   ${BOLD}${GRN} t)${RST} Версия ноды     ${GRY}— откат remnanode на нужную версию или возврат на latest${RST}
  
  ${BOLD}${MAG}Мониторинг (Beszel)${RST}${GRY}:${RST}
    ${BOLD}${CYN}11)${RST} Подключить агент к хабу  ${GRY}— установка beszel-agent${RST}
@@ -7494,6 +7632,7 @@ menu() {
         w|W) run_block "netbird: обновление" netbird_update ;;
         l|L) run_block "Fleet-sync" block_fleet ;;
         v|V) run_block "SNI-проверка ноды" block_sni_verification ;;
+        t|T) run_block "Версия ноды" block_node_version ;;
         i|I) block_install ;;   # шаги сама запускает через run_block
         16) run_block "SSH-харденинг" block_ssh
             run_block "Оптимизация (node-accelerator)" block_optimize ;;
