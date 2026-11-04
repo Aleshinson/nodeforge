@@ -426,45 +426,70 @@ compose_set_env() {
 # ============================ БЛОКИ ============================
  
 # ----- 1) SSH-харденинг: порт + пользователь + sudo + ключи + запрет root -----
-block_ssh() {
-  local port user pass keyinput pubkey
-  ask_port port
-  ask_username user
-  ask_password pass
- 
+# Публичный SSH-ключ в $1: строка ключа или путь к .pub; пусто — вход по паролю останется.
+_ask_pubkey() {
+  local __in __key=""
   echo
   echo "Публичный SSH-ключ (содержимое id_rsa.pub):"
   echo "  • вставьте строку ключа, ИЛИ"
   echo "  • укажите путь к .pub файлу, ИЛИ"
   echo "  • нажмите Enter — тогда парольный вход НЕ отключается."
-  read -rp "Ключ/путь: " keyinput
-  pubkey=""
-  if [ -n "$keyinput" ]; then
-    if [ -f "$keyinput" ]; then pubkey="$(cat "$keyinput")"; else pubkey="$keyinput"; fi
-    if ! valid_pubkey "$pubkey"; then
+  read -rp "Ключ/путь: " __in
+  if [ -n "$__in" ]; then
+    if [ -f "$__in" ]; then __key="$(cat "$__in")"; else __key="$__in"; fi
+    if ! valid_pubkey "$__key"; then
       warn "Это не похоже на публичный SSH-ключ (ожидается ssh-ed25519 / ssh-rsa / ...)."
       if confirm "Всё равно использовать это значение?"; then :; else
-        pubkey=""; warn "Ключ отброшен — парольный вход останется включённым."
+        __key=""; warn "Ключ отброшен — парольный вход останется включённым."
       fi
     fi
   fi
- 
-  # --- сводка перед применением (пароль НЕ печатается) ---
-  echo
-  echo "Будет применено:"
-  echo "  • SSH-порт:          ${port}"
-  echo "  • Пользователь:      ${user}  (sudo NOPASSWD)"
+  printf -v "$1" '%s' "$__key"
+}
+
+# Хеш SHA-512 пароля $1 для chpasswd -e: в ответы пункта «i» пароль открытым не ложится.
+_pass_hash() {
+  printf '%s\n' "$1" | openssl passwd -6 -stdin
+}
+
+# Что сделает SSH-харденинг (пароль НЕ печатается): порт $1, пользователь $2, ключ $3.
+_ssh_plan() {
+  echo "  • SSH-порт:          ${1}"
+  echo "  • Пользователь:      ${2}  (sudo NOPASSWD)"
   echo "  • Вход root по SSH:  запрещён"
-  if [ -n "$pubkey" ]; then
+  if [ -n "$3" ]; then
     echo "  • SSH-ключ:          установлен"
     echo "  • Парольный вход:    будет ОТКЛЮЧЁН"
   else
     echo "  • SSH-ключ:          не задан"
     echo "  • Парольный вход:    останется включённым"
-    warn "БЕЗ КЛЮЧА: парольный вход по SSH остаётся ВКЛ, а у ${user} — беспарольный sudo (NOPASSWD)."
+    warn "БЕЗ КЛЮЧА: парольный вход по SSH остаётся ВКЛ, а у ${2} — беспарольный sudo (NOPASSWD)."
     warn "Слабый пароль = прямой путь к root. Настоятельно рекомендую задать SSH-ключ."
   fi
+}
+
+block_ssh() {
+  local port user pass pubkey hash
+  ask_port port
+  ask_username user
+  ask_password pass
+  _ask_pubkey pubkey
+  echo
+  echo "Будет применено:"
+  _ssh_plan "$port" "$user" "$pubkey"
   confirm "Продолжить?" || { warn "Отменено."; return 1; }
+  hash="$(_pass_hash "$pass")"
+  _ssh_apply "$port" "$user" "$hash" "$pubkey"
+}
+
+# Порт $1, пользователь $2 с хешем пароля $3, ключ $4 (пусто — вход по паролю останется).
+_ssh_apply() {
+  local port="$1" user="$2" hash="$3" pubkey="$4"
+  # shellcheck disable=SC2016  # '$6$' — префикс хеша SHA-512, не переменная
+  case "$hash" in
+    '$6$'*) ;;
+    *) err "Нет хеша пароля пользователя ${user} — SSH не трогаю."; return 1 ;;
+  esac
  
   # порт
   log "Ставлю SSH-порт ${port}."
@@ -479,7 +504,7 @@ block_ssh() {
   apt-get update -y
   apt-get install -y sudo
   id "$user" >/dev/null 2>&1 || adduser --disabled-password --gecos "" "$user"
-  echo "${user}:${pass}" | chpasswd
+  printf '%s:%s\n' "$user" "$hash" | chpasswd -e
   usermod -aG sudo "$user"
   printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user" > "/etc/sudoers.d/90-${user}"
   chmod 440 "/etc/sudoers.d/90-${user}"
@@ -538,30 +563,47 @@ block_optimize() {
 # ----- 3) node-accelerator: protect (nftables na_filter + CrowdSec) -----
 # Единственный владелец фаервола/анти-брутфорса (раньше это был fail2ban — удалён как дубль).
 block_protect() {
-  local node_port tcp_ports udp_ports whitelist ssh_port
+  local ssh_port
   info "Защита: ЕДИНЫЙ фаервол nftables (na_filter) + CrowdSec + блоклисты. Один владелец — без ufw."
   warn "В конце спрошу, работает ли вход в новом окне: без «да» фаервол через 5 мин удалится сам."
   echo
   fw_load
   ssh_port="$(detect_ssh_port 2>/dev/null || echo "${SSH_PORT:-22}")"
   log "SSH-порт: ${ssh_port}"
-  ask node_port "Порт ноды (NODE_PORT)"                 "${NODE_PORT:-2222}"
-  ask tcp_ports "Сервисные TCP-порты (через запятую)"   "${TCP_PORTS:-443}"
-  ask udp_ports "Сервисные UDP-порты (через запятую)"   "${UDP_PORTS:-443}"
-  _ask_panel_ips "$node_port" || { warn "Отменено."; return 1; }
-  warn "ВАЖНО: впиши свой постоянный IP (домашний/VPN), чтобы лимиты тебя не банили. Панель добавится сама."
-  ask whitelist "WHITELIST (IP/CIDR через запятую; пусто — ок)" "${WHITELIST:-}"
-  if confirm "Включить статич-блоклисты (Spamhaus DROP + FireHOL L1) — режут сканеры/ботов?"; then
-    fw_set ENABLE_BLOCKLISTS 1
-  fi
-  if confirm "Дополнительно блокировать выходные узлы Tor?"; then fw_set BLOCK_TOR 1; else fw_set BLOCK_TOR 0; fi
-  fw_set SSH_PORT  "$ssh_port"
-  fw_set NODE_PORT "$node_port"
-  fw_set TCP_PORTS "$tcp_ports"
-  fw_set UDP_PORTS "$udp_ports"
-  fw_set WHITELIST "$whitelist"
+  _protect_ask || { warn "Отменено."; return 1; }
+  _protect_save
+  fw_set SSH_PORT "$ssh_port"
   echo
   apply_firewall
+}
+
+# Вопросы protect → NF_IN_FW_*; в реестр их пишет _protect_save. Пункт «i» задаёт их
+# заранее, вместе с остальными вопросами установки.
+_protect_ask() {
+  fw_load
+  ask NF_IN_FW_NODE_PORT "Порт ноды (NODE_PORT)"               "${NODE_PORT:-2222}"
+  ask NF_IN_FW_TCP       "Сервисные TCP-порты (через запятую)" "${TCP_PORTS:-443}"
+  ask NF_IN_FW_UDP       "Сервисные UDP-порты (через запятую)" "${UDP_PORTS:-443}"
+  _panel_ips_prompt NF_IN_FW_PANEL "$NF_IN_FW_NODE_PORT" || return 1
+  warn "ВАЖНО: впиши свой постоянный IP (домашний/VPN), чтобы лимиты тебя не банили. Панель добавится сама."
+  ask NF_IN_FW_WHITELIST "WHITELIST (IP/CIDR через запятую; пусто — ок)" "${WHITELIST:-}"
+  # «Нет» блоклисты не выключает: в реестре они включены по умолчанию.
+  NF_IN_FW_BLOCKLISTS=""
+  if confirm "Включить статич-блоклисты (Spamhaus DROP + FireHOL L1) — режут сканеры/ботов?"; then
+    NF_IN_FW_BLOCKLISTS=1
+  fi
+  if confirm "Дополнительно блокировать выходные узлы Tor?"; then NF_IN_FW_TOR=1; else NF_IN_FW_TOR=0; fi
+}
+
+# shellcheck disable=SC2153  # NF_IN_FW_* задаёт _protect_ask через ask
+_protect_save() {
+  fw_set NODE_PORT "$NF_IN_FW_NODE_PORT"
+  fw_set TCP_PORTS "$NF_IN_FW_TCP"
+  fw_set UDP_PORTS "$NF_IN_FW_UDP"
+  fw_set PANEL_IPS "$NF_IN_FW_PANEL"
+  fw_set WHITELIST "$NF_IN_FW_WHITELIST"
+  if [ -n "$NF_IN_FW_BLOCKLISTS" ]; then fw_set ENABLE_BLOCKLISTS 1; fi
+  fw_set BLOCK_TOR "$NF_IN_FW_TOR"
 }
  
 # ----- netbird: обновление демона до последней версии -----
@@ -609,15 +651,13 @@ netbird_update() {
 }
 
 # ----- 6) netbird -----
-block_netbird() {
-  local key
+_netbird_connected() {
+  netbird status 2>/dev/null | grep -qiE 'Management:[[:space:]]*Connected|Connected to'
+}
 
-  if command -v netbird >/dev/null 2>&1; then
-    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1))."
-    if confirm "Обновить netbird до последней версии?"; then
-      netbird_update || warn "Обновление netbird завершилось с ошибкой — см. вывод выше."
-    fi
-  else
+# netbird не стоит — поставить официальным установщиком.
+_netbird_ensure() {
+  if ! command -v netbird >/dev/null 2>&1; then
     log "netbird не найден — устанавливаю."
     wait_for_apt
     if ! curl -fsSL https://pkgs.netbird.io/install.sh | sh; then
@@ -626,14 +666,45 @@ block_netbird() {
     fi
     hash -r 2>/dev/null || true   # обновить кэш путей, чтобы команда netbird нашлась сразу
   fi
-
   if ! command -v netbird >/dev/null 2>&1; then
     err "Команда netbird всё ещё недоступна — проверь установку вручную."
     return 1
   fi
+}
+
+# Подключить по setup-key $1.
+_netbird_up() {
+  # Если уже в сети — корректно выходим перед повторным up (иначе netbird ругается).
+  if _netbird_connected; then
+    log "Отключаюсь перед переподключением (netbird down)."
+    netbird down >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  # --disable-dns: иначе netbird подменяет /etc/resolv.conf своим резолвером, и через него
+  # идут все запросы ноды (и Xray). Ноде имена netbird не нужны — панель ходит по IP.
+  if netbird up --setup-key "$1" --disable-dns; then
+    ok "netbird подключён."
+    netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|FQDN' | sed 's/^/   /' || true
+  else
+    err "netbird up не удался. Проверь setup-key и статус: netbird status"
+    return 1
+  fi
+}
+
+block_netbird() {
+  local key
+
+  if command -v netbird >/dev/null 2>&1; then
+    ok "netbird уже установлен ($(netbird version 2>/dev/null | head -1))."
+    if confirm "Обновить netbird до последней версии?"; then
+      netbird_update || warn "Обновление netbird завершилось с ошибкой — см. вывод выше."
+    fi
+  fi
+  _netbird_ensure || return 1
 
   # Уже подключён? Покажем и спросим про переподключение.
-  if netbird status 2>/dev/null | grep -qiE 'Management:[[:space:]]*Connected|Connected to'; then
+  if _netbird_connected; then
     info "netbird сейчас ПОДКЛЮЧЁН:"
     netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|Signal|FQDN' | sed 's/^/   /' || true
     if ! confirm "Переподключить с новым setup-key?"; then
@@ -648,27 +719,22 @@ block_netbird() {
     warn "Ключ не задан. Позже подключишь командой: netbird up --setup-key <KEY>"
     return 0
   fi
-
-  # Если уже в сети — корректно выходим перед повторным up (иначе netbird ругается).
-  if netbird status 2>/dev/null | grep -qiE 'Management:[[:space:]]*Connected|Connected to'; then
-    log "Отключаюсь перед переподключением (netbird down)."
-    netbird down >/dev/null 2>&1 || true
-    sleep 1
-  fi
-
-  # --disable-dns: иначе netbird подменяет /etc/resolv.conf своим резолвером, и через него
-  # идут все запросы ноды (и Xray). Ноде имена netbird не нужны — панель ходит по IP.
-  if netbird up --setup-key "$key" --disable-dns; then
-    ok "netbird подключён."
-    netbird status 2>/dev/null | grep -iE 'NetBird IP|Management|FQDN' | sed 's/^/   /' || true
-  else
-    err "netbird up не удался. Проверь setup-key и статус: netbird status"
-    return 1
-  fi
+  _netbird_up "$key"
 }
  
 # ----- 6) remnanode -----
 block_remnanode() {
+  _remnanode_egames
+  require_node >/dev/null 2>&1 || return 0
+  if confirm "Перезапустить ${NODE_CONTAINER} (docker compose down && up -d в ${NODE_DIR})?"; then
+    ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
+  fi
+  info "После подключения ноды к панели и включения Reality на 443 выполни j: HTTP 301 + HSTS."
+}
+
+# Установщик eGames, затем единый фаервол и том логов. Контейнер не перезапускает:
+# в пункте «i» его тут же пересоздают шаги 6 и 7.
+_remnanode_egames() {
   log "Запускаю установщик remnanode (интерактивный — следуйте подсказкам)."
   wait_for_apt
   bash <(curl -fLs https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
@@ -686,13 +752,9 @@ block_remnanode() {
   mkdir -p /var/log/remnanode
   if ! require_node >/dev/null 2>&1; then
     warn "docker-compose.yml ноды не найден ни в /opt/remnanode, ни в /opt/remnawave — пропускаю правку volumes."
-    return
+    return 0
   fi
   compose_add_volume "/var/log/remnanode:/var/log/remnanode" || true
-  if confirm "Перезапустить ${NODE_CONTAINER} (docker compose down && up -d в ${NODE_DIR})?"; then
-    ( cd "$NODE_DIR" && docker compose down && docker compose up -d )
-  fi
-  info "После подключения ноды к панели и включения Reality на 443 выполни j: HTTP 301 + HSTS."
 }
 
 # ----- Своя установка ноды (вариант полной установки «i») -----
@@ -755,25 +817,41 @@ _node_ask_secret() {
   printf -v "$__var" '%s' "$v"
 }
 
-# Wildcard на родителя домена ноды $2: fi.example.com → example.com и *.example.com.
-# Уже выпущенный и покрывающий домен сертификат берём как есть. Имя сертификата — в $1.
+# Имя сертификата для домена ноды: родитель домена (fi.example.com → example.com),
+# у домена из двух частей — он сам.
+_node_cert_base() {
+  local base="${1#*.}"
+  case "$base" in *.*) echo "$base" ;; *) echo "$1" ;; esac
+}
+
+# Сертификат $1 уже выпущен, проживёт ещё 30+ дней и покрывает домен $2.
+_node_cert_ready() {
+  local live="/etc/letsencrypt/live/${1}/fullchain.pem"
+  [ -f "$live" ] && [ "$(_cert_days "$live")" -ge 30 ] \
+    && openssl x509 -noout -checkhost "$2" -in "$live" 2>/dev/null | grep -q 'does match'
+}
+
+_cf_ini_has_token() {
+  grep -q '^[[:space:]]*dns_cloudflare_api_token' "$NF_CF_INI" 2>/dev/null
+}
+
+# Wildcard на родителя домена ноды $2: example.com и *.example.com. Уже выпущенный и
+# покрывающий домен сертификат берём как есть. Токен Cloudflare $3 (проверен в вопросах
+# пункта «i») ложится в ini; пусто — берём тот, что уже там. Имя сертификата — в $1.
 _node_cert() {
-  local __var="$1" domain="$2" base live
-  base="${domain#*.}"
-  case "$base" in *.*) ;; *) base="$domain" ;; esac
-  live="/etc/letsencrypt/live/${base}/fullchain.pem"
-  if [ -f "$live" ] && [ "$(_cert_days "$live")" -ge 30 ] \
-     && openssl x509 -noout -checkhost "$domain" -in "$live" 2>/dev/null | grep -q 'does match'; then
+  local __var="$1" domain="$2" token="${3:-}" base
+  base="$(_node_cert_base "$domain")"
+  if _node_cert_ready "$base" "$domain"; then
     ok "Сертификат ${base} уже есть и покрывает ${domain} — беру его."
   else
     wait_for_apt
     apt-get update -y
     apt-get install -y certbot python3-certbot-dns-cloudflare
-    if grep -q '^[[:space:]]*dns_cloudflare_api_token' "$NF_CF_INI" 2>/dev/null \
-       && confirm "Взять токен Cloudflare из ${NF_CF_INI}?"; then
-      :
-    else
-      _cf_token_set "$NF_CF_INI" "$base"
+    if [ -n "$token" ]; then
+      _cf_token_write "$NF_CF_INI" "$token"
+    elif ! _cf_ini_has_token; then
+      err "В ${NF_CF_INI} нет токена Cloudflare — сертификат ${base} не выпустить."
+      return 1
     fi
     log "Выпускаю ${base} и *.${base} (DNS-01 через Cloudflare, 1–2 мин)."
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$NF_CF_INI" \
@@ -912,8 +990,9 @@ _node_check() {
     sleep 5
   done
   if [ -z "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
-    err "Xray не слушает 443: панель не подключилась к ноде или в профиле нет Reality на 443."
-    info "В панели: нода с адресом этого сервера (или его netbird-IP), порт ${NODE_PORT:-2222}, профиль назначен. Потом повтори шаг."
+    err "Xray не слушает 443: панель не подключилась к ноде, в профиле нет Reality на 443 или Xray не стартует."
+    info "В панели: нода с адресом этого сервера (или его netbird-IP), порт ${NODE_PORT:-2222}, профиль назначен."
+    info "Почему не стартует Xray — в docker logs ${NODE_CONTAINER:-remnanode}. Потом повтори шаг."
     return 1
   fi
   if curl -fsS -m 10 -o /dev/null --resolve "${domain}:443:127.0.0.1" "https://${domain}/"; then
@@ -924,13 +1003,24 @@ _node_check() {
   fi
 }
 
+# Домен маскировки ноды — server_name из её nginx.conf (после require_node).
+_node_domain() {
+  awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$(_node_nginx_conf)"
+}
+
+# Домен $1, SECRET_KEY $2 и токен Cloudflare $3 — из вопросов пункта «i». Ноду не ждём:
+# конфиг панели ссылается на RU-списки и логи, без них Xray не стартует. Проверка —
+# отдельным шагом после 6 и 7.
 block_node_own() {
-  local domain cert key
+  local domain="$1" key="$2" token="${3:-}" cert
   fw_load
   if require_node >/dev/null 2>&1; then
-    info "Нода уже стоит (${NODE_DIR}, контейнер ${NODE_CONTAINER}) — проверяю её, ничего не переставляю."
-    _node_check "$(awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$(_node_nginx_conf)")"
-    return
+    info "Нода уже стоит (${NODE_DIR}, контейнер ${NODE_CONTAINER}) — ничего не переставляю."
+    return 0
+  fi
+  if [ -z "$domain" ] || [ -z "$key" ]; then
+    err "Нет домена или SECRET_KEY из вопросов — начни пункт «i» заново."
+    return 1
   fi
   if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
     err "Порт 443 уже занят — нода его не получит:"
@@ -938,15 +1028,13 @@ block_node_own() {
     return 1
   fi
   _docker_install
-  _node_ask_domain domain
-  _node_ask_secret key
-  _node_cert cert "$domain"
+  _node_cert cert "$domain" "$token"
   _node_write_stack "$domain" "$cert" "$key"
   log "Поднимаю ноду (${NF_NODE_DIR})."
   ( cd "$NF_NODE_DIR" && docker compose up -d )
   _cert_hook_ensure
-  info "Сайт пока заглушка — настоящий поставит пункт «h»."
-  _node_check "$domain"
+  info "Xray запустится после RU-списков и логов (шаги 6 и 7) — тогда и проверю ноду."
+  info "Сайт пока заглушка — настоящий поставит шаг «h»."
 }
  
 # Скрипт авто-обновления geo-ассетов Xray (cron, Вс 04:00). Кроме RU-списков
@@ -1728,43 +1816,65 @@ _site_auto_fix() (
   _site_install "" "$target" "$sni" "$backup_base" "$variant"
 )
 
+# Варианты API-сайта: «вариант|название|что внутри».
+NF_SITE_VARIANTS=(
+  "reference|HTTP Reference API|HTTP-коды и методы, тёмная документация"
+  "palette|Palette API|палитры и цвета, светлая галерея"
+  "calendar|Calendar API|месяцы и дни недели, календарный справочник"
+  "typography|Typography API|шрифтовые шкалы и системные шрифты"
+  "units|Units API|единицы измерения и десятичные приставки"
+  "geometry|Geometry API|геометрические фигуры, формулы и углы"
+  "paper|Paper API|форматы бумаги и примеры полей для печати"
+)
+
+# Название варианта сайта $1.
+_site_variant_title() {
+  local v name _about
+  for v in "${NF_SITE_VARIANTS[@]}"; do
+    IFS='|' read -r v name _about <<<"$v"
+    if [ "$v" = "$1" ]; then echo "$name"; return 0; fi
+  done
+}
+
+# Список сайтов и выбор номера: вариант — в $1; «0», пустой ввод и конец ввода — пусто.
+_site_variant_ask() {
+  local __i __v __name __about __choice __n="${#NF_SITE_VARIANTS[@]}" __pick=""
+  for __i in "${!NF_SITE_VARIANTS[@]}"; do
+    IFS='|' read -r __v __name __about <<<"${NF_SITE_VARIANTS[__i]}"
+    printf '  %d) %-18s — %s\n' "$((__i + 1))" "$__name" "$__about"
+  done
+  echo "  0) Оставить текущий сайт"
+  while read -rp "Вариант сайта [0]: " __choice; do
+    if [ -z "$__choice" ] || [ "$__choice" = 0 ]; then break; fi
+    if is_uint "$__choice" && [ "$__choice" -ge 1 ] && [ "$__choice" -le "$__n" ]; then
+      __pick="${NF_SITE_VARIANTS[__choice - 1]%%|*}"
+      break
+    fi
+    warn "Выберите номер от 1 до ${__n} или 0."
+  done
+  printf -v "$1" '%s' "$__pick"
+}
+
+# Вариант $5 (из вопросов пункта «i») ставится без меню.
 _site_choose() {
-  local target="$1" sni="$2" backup_base="$3" ngx="$4" markers rc=0 choice variant
+  local target="$1" sni="$2" backup_base="$3" ngx="$4" variant="${5:-}" markers rc=0
   markers="$(_site_tool detect "$target/index.html")" || rc=$?
   case "$rc" in
     0) warn "Обнаружен шаблон eGames: ${markers}" ;;
     1) info "Маркеры eGames не обнаружены. Можно заменить текущий сайт выбранным вариантом API." ;;
     *) err "Не удалось проверить текущий сайт — замена отменена."; return 1 ;;
   esac
-  info "Выбор 1–7 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
-  cat <<'EOF'
-  1) HTTP Reference API — HTTP-коды и методы, тёмная документация
-  2) Palette API        — палитры и цвета, светлая галерея
-  3) Calendar API       — месяцы и дни недели, календарный справочник
-  4) Typography API     — шрифтовые шкалы и системные шрифты
-  5) Units API          — единицы измерения и десятичные приставки
-  6) Geometry API       — геометрические фигуры, формулы и углы
-  7) Paper API          — форматы бумаги и примеры полей для печати
-  0) Назад без изменений
-EOF
-  while true; do
-    read -rp "Вариант сайта [0]: " choice || return 0
-    case "$choice" in
-      1) variant=reference; break ;;
-      2) variant=palette; break ;;
-      3) variant=calendar; break ;;
-      4) variant=typography; break ;;
-      5) variant=units; break ;;
-      6) variant=geometry; break ;;
-      7) variant=paper; break ;;
-      0|"") return 0 ;;
-      *) warn "Выберите номер от 1 до 7 или 0." ;;
-    esac
-  done
+  if [ -z "$variant" ]; then
+    info "Выбор 1–7 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
+    _site_variant_ask variant
+    if [ -z "$variant" ]; then return 0; fi
+  fi
   _site_auto_fix "$target" "$sni" "$backup_base" "$ngx" "$variant" 1
 }
 
+# Вариант сайта $1 — без меню (так его ставит пункт «i»).
 block_camouflage() {
+  local variant="${1:-}"
   require_node || return 1
   command -v python3 >/dev/null 2>&1 || { err "Для проверки сайта нужен python3 (apt install python3)."; return 1; }
   local ngx inspect context sni target rc
@@ -1783,7 +1893,7 @@ block_camouflage() {
   [ "$rc" -eq 0 ] || return 1
   sni="${context%%$'\n'*}"; target="${context#*$'\n'}"
   info "Сайт: https://${sni}; каталог на хосте: ${target}; nginx: ${ngx}"
-  _site_choose "$target" "$sni" /root/nodeforge-bak "$ngx"
+  _site_choose "$target" "$sni" /root/nodeforge-bak "$ngx" "$variant"
 }
 
 # ----- j) HTTP 301 + HSTS для selfsteal-ноды -----
@@ -2300,23 +2410,47 @@ find_beszel_bin() {
  
 # ----- 12) Beszel: подключить агент к хабу -----
 block_beszel_agent() {
-  local key port token url tmp
-  info "Beszel — мониторинг. Нужен публичный ключ из хаба:"
-  info "в веб-интерфейсе хаба нажми Add System и скопируй Public Key."
-  echo
-  ask_required key "Публичный ключ Beszel (Public Key из хаба)"
-  ask port  "Порт агента" "45876"
-  warn "Для NAT-сервера (агент сам идёт к хабу по WebSocket) укажи Token и URL хаба."
-  warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
-  ask token "Token (Enter — пропустить)" ""
-  ask url   "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
+  local key port token url
+  _beszel_ask key port token url
   # Хаб стоит у панели и подключается к агенту сам: порт агента нужен только ему.
   fw_load
   if [ -z "${PANEL_IPS:-}" ]; then
     info "Порт агента ${port} откроем только для панели (хаб Beszel стоит у неё)."
     _ask_panel_ips "${NODE_PORT:-2222}" || { warn "Отменено."; return 1; }
   fi
+  _beszel_install "$key" "$port" "$token" "$url"
+}
 
+# Вопросы агента: ключ → $1, порт → $2, токен → $3, URL хаба → $4. С $5=optional ключ
+# можно не вводить (агент не ставить) — тогда остальное не спрашивается.
+_beszel_ask() {
+  local __k __p="" __t="" __u=""
+  info "Beszel — мониторинг. Нужен публичный ключ из хаба:"
+  info "в веб-интерфейсе хаба нажми Add System и скопируй Public Key."
+  echo
+  if [ "${5:-}" = optional ]; then
+    ask __k "Публичный ключ Beszel (Enter — агент не ставить)" ""
+  else
+    ask_required __k "Публичный ключ Beszel (Public Key из хаба)"
+  fi
+  if [ -n "$__k" ]; then
+    ask __p "Порт агента" "45876"
+    warn "Для NAT-сервера (агент сам идёт к хабу по WebSocket) укажи Token и URL хаба."
+    warn "Если хаб сам подключается к агенту по SSH — Token/URL можно пропустить (Enter)."
+    ask __t "Token (Enter — пропустить)" ""
+    ask __u "URL хаба, напр. https://beszel.example.com (Enter — пропустить)" ""
+  fi
+  printf -v "$1" '%s' "$__k"
+  printf -v "$2" '%s' "$__p"
+  printf -v "$3" '%s' "$__t"
+  printf -v "$4" '%s' "$__u"
+}
+
+# Ключ $1, порт $2, токен $3, URL хаба $4; $5 — автообновление true/false (пусто —
+# спросит установщик Beszel).
+_beszel_install() {
+  local key="$1" port="$2" token="$3" url="$4" auto="${5:-}" tmp
+  fw_load
   tmp="$(mktemp)"
   log "Скачиваю install-agent.sh."
   if ! curl -fsSL https://get.beszel.dev -o "$tmp"; then
@@ -2329,8 +2463,10 @@ block_beszel_agent() {
   set -- -k "$key" -p "$port"
   if [ -n "$token" ]; then set -- "$@" -t "$token"; fi
   if [ -n "$url" ];   then set -- "$@" -url "$url"; fi
- 
-  log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."
+  if [ -n "$auto" ];  then set -- "$@" --auto-update "$auto"; fi
+
+  if [ -n "$auto" ]; then log "Запускаю установку агента Beszel."
+  else log "Запускаю установку агента Beszel (скрипт спросит про авто-обновление)."; fi
   "$tmp" "$@" || warn "install-agent.sh завершился с ненулевым кодом — см. вывод выше."
   rm -f "$tmp"
  
@@ -3152,28 +3288,35 @@ _panel_peers() {
     | grep -E '^[0-9.]+$' | sort -u | paste -sd, || true
 }
 
-# Спросить IP панели (подсказка — кто сейчас подключён к порту ноды) и сохранить в реестр.
+# Спросить IP панели для порта ноды $1 и сохранить в реестр.
 _ask_panel_ips() {
-  local node_port="$1" peers ips p
-  peers="$(_panel_peers "$node_port")"
-  if [ -n "$peers" ]; then info "Сейчас к порту ноды ${node_port} подключены: ${peers} — это панель."; fi
+  local ips
+  _panel_ips_prompt ips "$1" || return 1
+  fw_set PANEL_IPS "$ips"
+}
+
+# Спросить IP панели (подсказка — кто сейчас подключён к порту ноды $2) — в переменную $1.
+_panel_ips_prompt() {
+  local __peers __ips __p
+  __peers="$(_panel_peers "$2")"
+  if [ -n "$__peers" ]; then info "Сейчас к порту ноды ${2} подключены: ${__peers} — это панель."; fi
   while true; do
-    ask ips "IP панели — только ей можно на порт ноды и beszel (через запятую; «-» — не ограничивать)" "${PANEL_IPS:-$peers}"
-    ips="${ips// /}"
-    if [ "$ips" = "-" ]; then ips=""; break; fi
-    if _valid_ipv4_list "$ips"; then break; fi
+    ask __ips "IP панели — только ей можно на порт ноды и beszel (через запятую; «-» — не ограничивать)" "${PANEL_IPS:-$__peers}"
+    __ips="${__ips// /}"
+    if [ "$__ips" = "-" ]; then __ips=""; break; fi
+    if _valid_ipv4_list "$__ips"; then break; fi
     warn "Нужны IPv4-адреса или подсети через запятую, напр. 100.64.0.10 (netbird-IP, если панель ходит по netbird)."
   done
-  if [ -z "$ips" ]; then
+  if [ -z "$__ips" ]; then
     warn "Без IP панели порт ноды${PANEL_PORTS:+ и ${PANEL_PORTS}} остаются доступны всем, кого пропускает na_filter."
   fi
-  for p in ${peers//,/ }; do
-    if [ -n "$ips" ] && [[ ",${ips}," != *",${p},"* ]]; then
-      warn "Панель сейчас подключена с ${p}, а его нет в списке — нода уйдёт в offline."
+  for __p in ${__peers//,/ }; do
+    if [ -n "$__ips" ] && [[ ",${__ips}," != *",${__p},"* ]]; then
+      warn "Панель сейчас подключена с ${__p}, а его нет в списке — нода уйдёт в offline."
       confirm "Всё равно сохранить?" || return 1
     fi
   done
-  fw_set PANEL_IPS "$ips"
+  printf -v "$1" '%s' "$__ips"
 }
 
 # Все PANEL_IPS уже в whitelist na_filter? (если na_filter не загружен — да, мешать некому)
@@ -4048,10 +4191,24 @@ _cf_api() {
 }
 
 # Спросить API-токен (скрытый ввод), проверить в Cloudflare и записать в ini $1 (600).
-# До записи: токен активен и видит зоны имён $2 (по умолчанию — всех сертификатов этого
-# ini). Старый ключ на диск не бэкапим — в нём может быть ключ ко всему аккаунту Cloudflare.
+# Старый ключ на диск не бэкапим — в нём может быть ключ ко всему аккаунту Cloudflare.
 _cf_token_set() {
-  local ini="$1" domains="${2:-}" names zones n d uncovered="" CF_TOKEN
+  local token
+  _cf_token_ask token "$1" "${2:-}" || return 1
+  _cf_token_write "$1" "$token"
+}
+
+_cf_token_write() {
+  install -d -m 700 "$(dirname "$1")"
+  ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$2" > "$1" )
+  chmod 600 "$1"
+  ok "Токен записан в ${1}."
+}
+
+# Спросить API-токен (скрытый ввод) и проверить: активен и видит зоны имён $3 (по
+# умолчанию — всех сертификатов ini $2). Годный — в переменную $1; на диск не пишет.
+_cf_token_ask() {
+  local __var="$1" ini="$2" domains="${3:-}" names zones n d uncovered="" CF_TOKEN
   names="$(_cf_certs_for_ini "$ini")"
   if [ -z "$domains" ]; then
     for n in $names; do
@@ -4074,15 +4231,12 @@ _cf_token_set() {
     fi
   done
   if [ -n "$uncovered" ]; then
-    warn "Токен активен, но не видит зоны для: ${uncovered} — продление этих имён упадёт."
-    confirm "Записать токен всё равно?" || { warn "Не записал."; return 1; }
+    warn "Токен активен, но не видит зоны для: ${uncovered} — выпуск и продление этих имён упадут."
+    confirm "Взять токен всё равно?" || { warn "Токен не взят — ничего не менял."; return 1; }
   else
     ok "Токен активен и видит зоны: $(printf '%s\n' "$zones" | paste -sd' ')"
   fi
-  install -d -m 700 "$(dirname "$ini")"
-  ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$CF_TOKEN" > "$ini" )
-  chmod 600 "$ini"
-  ok "Токен записан в ${ini}."
+  printf -v "$__var" '%s' "$CF_TOKEN"
 }
 
 # ============================================================================
@@ -4507,6 +4661,14 @@ _audit_pick_pending() {
   fi
 }
 
+# Всё несделанное без простоя — в массив sel.
+_audit_pick_safe() {
+  local i
+  for i in "${!AUD_FIX_FN[@]}"; do
+    if [ -z "${AUD_FIX_STATE[$i]}" ] && [ "${AUD_FIX_COST[$i]}" = 0 ]; then sel+=("$i"); fi
+  done
+}
+
 # Есть ли в списке несделанное исправление функцией $1.
 _audit_has_pending() {
   local i
@@ -4518,7 +4680,7 @@ _audit_has_pending() {
 
 # Меню починки: после каждого исправления — обратно к списку, а не в главное меню.
 _audit_fix_menu() {
-  local i n c choice
+  local n c choice
   local -a sel
   while true; do
     _audit_fix_list
@@ -4543,10 +4705,7 @@ _audit_fix_menu() {
       r|R|к|К) _audit_run; continue ;;
       a|A|ф|Ф) _audit_pick_pending || continue ;;
       n|N|т|Т) _audit_pick_pending _fix_dead_location || continue ;;
-      s|S|ы|Ы)
-        for i in "${!AUD_FIX_FN[@]}"; do
-          if [ -z "${AUD_FIX_STATE[$i]}" ] && [ "${AUD_FIX_COST[$i]}" = 0 ]; then sel+=("$i"); fi
-        done ;;
+      s|S|ы|Ы) _audit_pick_safe ;;
       *)
         for c in $choice; do
           if is_uint "$c" && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then sel+=("$(( c - 1 ))")
@@ -4564,7 +4723,7 @@ _audit_fix_menu() {
 AUD_FREEZE_RE='soft lockup|rcu_(preempt|sched) (self-)?detected stall|rcu.*kthread starved|NETDEV WATCHDOG|TX timeout|Long readout interval|blocked for more than'
 
 _audit_system() {
-  local s1 s2 i total steal pct frz span n used ntp failed pkgs mt ma si l1 l5 u
+  local s1 s2 i total steal pct frz span n used ntp failed mt ma si l1 l5 u
   step "Система"
   info "$(. /etc/os-release && echo "$PRETTY_NAME") · ядро $(uname -r) · vCPU $(nproc) · RAM $(free -m | awk '/^Mem:/ {print $2}') МБ · $(uptime -p)"
 
@@ -4641,11 +4800,18 @@ _audit_system() {
     _a_fix "Включить синхронизацию времени (NTP)" 0 _fix_ntp
   fi
 
+  _audit_reboot
+}
+
+# Система ждёт перезагрузки. В полной установке («i») перезагрузка — её последнее
+# действие, поэтому там аудит её не предлагает.
+_audit_reboot() {
+  local pkgs
   pkgs="$(_reboot_pending_pkgs)"
-  if [ -n "$pkgs" ]; then
-    _a_warn "Система ждёт перезагрузки: ${pkgs}"
-    _a_fix "Перезагрузить сервер (обновились: ${pkgs})" 2 _fix_reboot
-  fi
+  if [ -z "$pkgs" ]; then return 0; fi
+  _a_warn "Система ждёт перезагрузки: ${pkgs}"
+  if [ -n "${AUD_REBOOT_LATER:-}" ]; then _a_hint "перезагрузка — в конце установки"
+  else _a_fix "Перезагрузить сервер (обновились: ${pkgs})" 2 _fix_reboot; fi
 }
 
 _audit_network() {
@@ -6710,28 +6876,33 @@ block_sysupdate() {
 }
 
 # ============================================================================
-#  i)  ПОЛНАЯ УСТАНОВКА НОДЫ — пункты подряд, с продолжением после reboot
+#  i)  ПОЛНАЯ УСТАНОВКА НОДЫ — пункты подряд, reboot — последним
 # ----------------------------------------------------------------------------
-#  Сначала доступность из РФ и вопрос «продолжаем?», потом выбор, чем ставить ноду
-#  (установщик eGames, как пункт 5, или своя установка), дальше 1 → IPv6 → 2 → reboot →
-#  3 → 4 → 5 → 6 → 7 → h → j → 11 → a → проверки 14 (1 2 3 4 6). Текущий шаг и вариант
-#  лежат в /etc/nodeforge/install.state: после ребута или остановки «i» продолжит с шага.
+#  Сначала доступность из РФ и вопрос «продолжаем?», потом ВСЕ вопросы установки разом
+#  и сводка — дальше шаги идут сами: 1 → IPv6 → 2 → 3 → 4 → 5 → 6 → 7 → нода на связи →
+#  h → j → 11 → a → reboot, если он нужен (новое ядро из шага 2). Проверки 14 «i» не гоняет.
+#  По ходу — только страховка фаервола (вход в новом окне). Шаг и вариант ноды лежат
+#  в install.state, ответы — в install.answers (только root, пароль — хешем): после
+#  остановки или обрыва сессии «i» продолжит с шага и спросит лишь то, на что ответа нет.
+#  Перед reboot оба файла удаляются — установка к этому времени закончена.
 # ============================================================================
 NF_INSTALL_STATE=/etc/nodeforge/install.state
+NF_INSTALL_ANSWERS=/etc/nodeforge/install.answers
+# «шаг|название|функция шага|функция вопросов (пусто — вопросов нет)».
 NF_INSTALL_STEPS=(
-  "1|SSH-харденинг|block_ssh"
-  "ipv6|Выключить IPv6|_install_ipv6_off"
-  "2|Оптимизация (node-accelerator)|block_optimize"
-  "3|Защита (node-accelerator)|_install_protect"
-  "4|netbird|block_netbird"
-  "5|Нода remnanode|_install_node"
-  "6|RU-блокировка|block_rublock"
-  "7|Логи ноды|block_logs"
-  "h|Свой API-сайт вместо заглушки|block_camouflage"
-  "j|HTTP 301 + HSTS|block_http_hardening"
-  "11|Beszel: агент|block_beszel_agent"
-  "a|Аудит ноды|block_audit"
-  "14|Проверки: IP region, CensorCheck, IP.Check.Place, iPerf3|_install_checks"
+  "1|SSH-харденинг|_install_ssh|_install_ask_ssh"
+  "ipv6|Выключить IPv6|_install_ipv6_off|_install_ask_ipv6"
+  "2|Оптимизация (node-accelerator)|block_optimize|"
+  "3|Защита (node-accelerator)|_install_protect|_install_ask_protect"
+  "4|netbird|_install_netbird|_install_ask_netbird"
+  "5|Нода remnanode|_install_node|_install_ask_node"
+  "6|RU-блокировка|block_rublock|"
+  "7|Логи ноды|block_logs|"
+  "check|Нода на связи: Xray на 443 и маскировка|_install_node_check|"
+  "h|Свой API-сайт вместо заглушки|_install_site|_install_ask_site"
+  "j|HTTP 301 + HSTS|block_http_hardening|"
+  "11|Beszel: агент|_install_beszel|_install_ask_beszel"
+  "a|Аудит ноды|_install_audit|_install_ask_audit"
 )
 
 # Текущая SSH-сессия пришла на IPv6-адрес сервера (выключение IPv6 её оборвёт).
@@ -6740,36 +6911,60 @@ _ssh_over_ipv6() {
     | awk 'substr($3, 1, 1) == "[" && substr($3, 1, 8) != "[::ffff:" { f = 1 } END { exit !f }'
 }
 
-# IPv6 есть — выключить тем же исправлением, что предлагает аудит (sysctl + ifupdown/netplan).
-_install_ipv6_off() {
-  if [ ! -d /proc/sys/net/ipv6 ] || { [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 1 ] \
-       && [ -z "$(_ifupdown_inet6_files)" ] && [ -z "$(_netplan_inet6_ids)" ]; }; then
-    ok "IPv6 на сервере уже выключен."
+# IPv6 где-то ещё включён: в ядре или в настройках сети (ifupdown/netplan).
+_ipv6_on() {
+  [ -d /proc/sys/net/ipv6 ] || return 1
+  [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 1 ] \
+    || [ -n "$(_ifupdown_inet6_files)" ] || [ -n "$(_netplan_inet6_ids)" ]
+}
+
+# ----- вопросы: каждая функция пишет ответы своего шага в NF_IN_* -----
+
+_install_ask_ssh() {
+  local pass
+  echo
+  step "SSH-харденинг (шаг 1)"
+  ask_port NF_IN_SSH_PORT
+  ask_username NF_IN_SSH_USER
+  ask_password pass
+  NF_IN_SSH_HASH="$(_pass_hash "$pass")" || true
+  # shellcheck disable=SC2016  # '$6$' — префикс хеша SHA-512, не переменная
+  case "$NF_IN_SSH_HASH" in
+    '$6$'*) ;;
+    *) err "Не получилось захешировать пароль — нужен openssl."; return 1 ;;
+  esac
+  _ask_pubkey NF_IN_SSH_KEY
+}
+
+# Спрашиваем, только если выключение IPv6 оборвёт эту SSH-сессию.
+_install_ask_ipv6() {
+  NF_IN_IPV6=yes
+  if _ipv6_on && _ssh_over_ipv6; then
+    echo
+    warn "Ты подключён к серверу по IPv6 — выключение IPv6 оборвёт эту сессию."
+    confirm "Выключить IPv6 всё равно?" || NF_IN_IPV6=no
+  fi
+}
+
+_install_ask_protect() {
+  echo
+  step "Фаервол (шаг 3)"
+  _protect_ask
+}
+
+_install_ask_netbird() {
+  NF_IN_NETBIRD_KEY=""
+  echo
+  step "netbird (шаг 4)"
+  if command -v netbird >/dev/null 2>&1 && _netbird_connected; then
+    ok "netbird уже подключён — переподключать не буду."
     return 0
   fi
-  if _ssh_over_ipv6; then
-    warn "Ты подключён к серверу по IPv6 — выключение оборвёт эту сессию."
-    if ! confirm "Выключить IPv6 всё равно?"; then warn "IPv6 оставлен."; return 0; fi
-  fi
-  _fix_disable_ipv6
-}
-
-# 80/tcp — сразу в реестр: его откроет этот же protect, и «j» не будет пересобирать фаервол.
-_install_protect() {
-  fw_load
-  fw_set EXTRA_TCP "$(_merge_ports "${EXTRA_TCP:-}" 80)"
-  info "80/tcp добавлен в реестр заранее — под редирект на HTTPS (пункт j)."
-  block_protect
-}
-
-_install_checks() {
-  local c
-  ensure_check_dependencies
-  for c in 1 2 3 4 6; do _run_check "$c"; done
+  ask NF_IN_NETBIRD_KEY "netbird setup-key (Enter — подключить позже)" ""
 }
 
 # Чем ставить ноду на шаге 5: egames — установщик eGames (пункт 5), own — своя установка.
-_install_ask_node() {
+_install_ask_variant() {
   local egames="установщик eGames, как пункт 5 — его меню и вопросы; включает ufw, после него фаервол пересоберётся"
   local own="своя установка — Docker, nginx + remnanode, Let's Encrypt через Cloudflare; ufw нет, фаервол не пересобирается"
   local pick
@@ -6777,14 +6972,279 @@ _install_ask_node() {
   if [ "$pick" = "$egames" ]; then NF_INSTALL_NODE=egames; else NF_INSTALL_NODE=own; fi
 }
 
+# Вариант ноды, а для своей установки — домен, SECRET_KEY и токен Cloudflare (проверяется
+# сразу, в ini ложится на шаге 5).
+_install_ask_node() {
+  local base
+  echo
+  step "Нода (шаг 5)"
+  if [ -z "$NF_INSTALL_NODE" ]; then _install_ask_variant; fi
+  if [ "$NF_INSTALL_NODE" != own ]; then
+    info "Установщик eGames задаст свои вопросы на шаге 5."
+    return 0
+  fi
+  if require_node >/dev/null 2>&1; then
+    info "Нода уже стоит (${NODE_DIR}) — домен и ключ не нужны."
+    return 0
+  fi
+  if [ -n "$(ss -Hltn 'sport = :443' 2>/dev/null)" ]; then
+    warn "Порт 443 сейчас занят — шаг 5 не пройдёт, пока его не освободишь."
+  fi
+  _node_ask_domain NF_IN_NODE_DOMAIN
+  _node_ask_secret NF_IN_NODE_SECRET
+  NF_IN_CF_TOKEN=""
+  base="$(_node_cert_base "$NF_IN_NODE_DOMAIN")"
+  if _node_cert_ready "$base" "$NF_IN_NODE_DOMAIN"; then
+    ok "Сертификат ${base} уже есть и покрывает ${NF_IN_NODE_DOMAIN} — токен Cloudflare не нужен."
+  elif _cf_ini_has_token && confirm "Взять токен Cloudflare из ${NF_CF_INI}?"; then
+    :
+  else
+    until _cf_token_ask NF_IN_CF_TOKEN "$NF_CF_INI" "$base"; do
+      confirm "Ввести токен ещё раз?" || return 1
+    done
+  fi
+}
+
+_install_ask_site() {
+  echo
+  step "Сайт маскировки (шаг h)"
+  info "Номер 1–7 полностью заменит текущий сайт с бэкапом; .well-known сохранится."
+  _site_variant_ask NF_IN_SITE
+}
+
+_install_ask_beszel() {
+  echo
+  step "Мониторинг Beszel (шаг 11)"
+  _beszel_ask NF_IN_BESZEL_KEY NF_IN_BESZEL_PORT NF_IN_BESZEL_TOKEN NF_IN_BESZEL_URL optional
+  NF_IN_BESZEL_AUTO=""
+  if [ -n "$NF_IN_BESZEL_KEY" ]; then
+    if confirm "Обновлять агент Beszel автоматически раз в сутки?"; then NF_IN_BESZEL_AUTO=true
+    else NF_IN_BESZEL_AUTO=false; fi
+  fi
+}
+
+_install_ask_audit() {
+  local safe="починить сразу всё, что без простоя" report="только отчёт — починю потом пунктом «a»"
+  local menu="спросить меня после аудита (меню, как в пункте «a»)" pick
+  echo
+  step "Аудит (шаг a)"
+  choose_from_list pick "Что делать с найденным?" "$safe" "$safe" "$report" "$menu"
+  case "$pick" in
+    "$safe")   NF_IN_AUDIT=safe ;;
+    "$report") NF_IN_AUDIT=report ;;
+    *)         NF_IN_AUDIT=menu ;;
+  esac
+}
+
+# Сводка ответов для шагов с номера $1.
+_install_summary() {
+  local k id name _fn ask base
+  echo
+  step "Сводка — так и поставлю"
+  for (( k = $1; k < ${#NF_INSTALL_STEPS[@]}; k++ )); do
+    IFS='|' read -r id name _fn ask <<<"${NF_INSTALL_STEPS[k]}"
+    if [ -z "$ask" ]; then continue; fi
+    printf '%s%s) %s%s\n' "$BOLD" "$id" "$name" "$RST"
+    case "$id" in
+      1) _ssh_plan "$NF_IN_SSH_PORT" "$NF_IN_SSH_USER" "$NF_IN_SSH_KEY" ;;
+      ipv6)
+        if [ "${NF_IN_IPV6:-yes}" = no ]; then echo "  • оставить: ты подключён по IPv6"
+        else echo "  • выключить, если включён"; fi ;;
+      3)
+        if [ -n "$NF_IN_FW_PANEL" ]; then echo "  • порт ноды ${NF_IN_FW_NODE_PORT}: только с ${NF_IN_FW_PANEL}"
+        else echo "  • порт ноды ${NF_IN_FW_NODE_PORT}: для всех (IP панели не задан)"; fi
+        echo "  • TCP ${NF_IN_FW_TCP} и 80 (редирект на HTTPS, шаг j), UDP ${NF_IN_FW_UDP}"
+        echo "  • whitelist: ${NF_IN_FW_WHITELIST:-нет}"
+        if [ "${NF_IN_FW_BLOCKLISTS:-${ENABLE_BLOCKLISTS:-1}}" = 1 ]; then echo "  • блоклисты: да"
+        else echo "  • блоклисты: нет"; fi
+        if [ "$NF_IN_FW_TOR" = 1 ]; then echo "  • выходные узлы Tor: блокировать"
+        else echo "  • выходные узлы Tor: не трогать"; fi ;;
+      4)
+        if [ -n "${NF_IN_NETBIRD_KEY:-}" ]; then echo "  • поставить и подключить по setup-key"
+        elif command -v netbird >/dev/null 2>&1 && _netbird_connected; then echo "  • уже подключён — не трогаю"
+        else echo "  • поставить; подключишь позже: netbird up --setup-key <KEY> --disable-dns"; fi ;;
+      5)
+        if [ "$NF_INSTALL_NODE" = egames ]; then
+          echo "  • установщик eGames: его вопросы — на шаге 5; после него фаервол пересоберётся"
+        elif [ -z "${NF_IN_NODE_DOMAIN:-}" ]; then
+          echo "  • своя установка: нода уже стоит — не переставляю"
+        else
+          echo "  • своя установка: домен ${NF_IN_NODE_DOMAIN}, SECRET_KEY задан"
+          base="$(_node_cert_base "$NF_IN_NODE_DOMAIN")"
+          if _node_cert_ready "$base" "$NF_IN_NODE_DOMAIN"; then echo "  • сертификат ${base} уже есть — беру его"
+          elif [ -n "${NF_IN_CF_TOKEN:-}" ]; then echo "  • сертификат: выпущу ${base} и *.${base}, токен Cloudflare — новый (проверен)"
+          else echo "  • сертификат: выпущу ${base} и *.${base}, токен Cloudflare — из ${NF_CF_INI}"; fi
+        fi
+        echo "  • ноду не жду: сразу RU-списки и логи (6 и 7), потом проверю, что она на связи" ;;
+      h)
+        if [ -n "${NF_IN_SITE:-}" ]; then echo "  • $(_site_variant_title "$NF_IN_SITE")"
+        elif [ "$NF_INSTALL_NODE" = own ]; then echo "  • не менять — у своей установки останется заглушка «Welcome»"
+        else echo "  • не менять"; fi ;;
+      11)
+        if [ -z "${NF_IN_BESZEL_KEY:-}" ]; then echo "  • не ставить"
+        elif [ "$NF_IN_BESZEL_AUTO" = true ]; then echo "  • порт ${NF_IN_BESZEL_PORT} (только для панели), автообновление раз в сутки"
+        else echo "  • порт ${NF_IN_BESZEL_PORT} (только для панели), без автообновления"; fi ;;
+      a)
+        case "${NF_IN_AUDIT:-menu}" in
+          safe)   echo "  • починю сразу всё, что без простоя; остальное — пунктом «a»" ;;
+          report) echo "  • только отчёт" ;;
+          *)      echo "  • после аудита спрошу, что чинить" ;;
+        esac ;;
+    esac
+  done
+  echo
+  if [ "$(_install_index 3)" -ge "$1" ]; then
+    info "После фаервола спрошу, работает ли вход в новом окне: без «да» он через 5 мин удалится сам."
+  fi
+  info "Перезагрузка — в самом конце, после всех шагов, если нужна (новое ядро из шага 2): спрошу «Перезагрузить сейчас?»."
+  info "Проверки 14 не запускаю — их пунктом 14, когда удобно."
+  info "Ответы сохраню в ${NF_INSTALL_ANSWERS} (только root, пароль — хешем) и удалю в конце установки."
+}
+
+# Вопросы всех шагов с номера $1, на которые ещё нет ответа, — разом; потом сводка и
+# «начинаем?». Код 1 — установку не начинать.
+_install_questions() {
+  local k id _name _fn ask asked=0
+  for (( k = $1; k < ${#NF_INSTALL_STEPS[@]}; k++ )); do
+    IFS='|' read -r id _name _fn ask <<<"${NF_INSTALL_STEPS[k]}"
+    if [ -z "$ask" ] || [[ " ${NF_IN_ASKED:-} " == *" ${id} "* ]]; then continue; fi
+    if [ "$asked" -eq 0 ]; then
+      echo
+      info "Сначала все вопросы установки — дальше шаги пойдут сами."
+      asked=1
+    fi
+    "$ask" || return 1
+    NF_IN_ASKED="${NF_IN_ASKED:+${NF_IN_ASKED} }${id}"
+  done
+  if [ "$asked" -eq 0 ]; then return 0; fi
+  _install_summary "$1"
+  confirm "Всё верно — начинаем?" || return 1
+  _install_save
+}
+
+_install_save() {
+  local v
+  mkdir -p "$(dirname "$NF_INSTALL_ANSWERS")"
+  ( umask 077; for v in "${!NF_IN_@}"; do printf '%s=%q\n' "$v" "${!v}"; done > "$NF_INSTALL_ANSWERS" )
+  chmod 600 "$NF_INSTALL_ANSWERS"
+}
+
+_install_load() {
+  # shellcheck disable=SC1090  # файл пишет _install_save
+  if [ -s "$NF_INSTALL_ANSWERS" ]; then . "$NF_INSTALL_ANSWERS"; fi
+}
+
+# ----- шаги: берут ответы из NF_IN_* и ничего не спрашивают -----
+
+_install_ssh() {
+  _ssh_apply "$NF_IN_SSH_PORT" "$NF_IN_SSH_USER" "$NF_IN_SSH_HASH" "$NF_IN_SSH_KEY"
+}
+
+# IPv6 есть — выключить тем же исправлением, что предлагает аудит (sysctl + ifupdown/netplan).
+_install_ipv6_off() {
+  if ! _ipv6_on; then
+    ok "IPv6 на сервере уже выключен."
+    return 0
+  fi
+  if [ "${NF_IN_IPV6:-yes}" = no ]; then
+    warn "IPv6 оставлен: ты подключён по IPv6."
+    return 0
+  fi
+  _fix_disable_ipv6
+}
+
+# 80/tcp — сразу в реестр: его откроет этот же protect, и «j» не будет пересобирать фаервол.
+_install_protect() {
+  info "Защита: ЕДИНЫЙ фаервол nftables (na_filter) + CrowdSec + блоклисты. Один владелец — без ufw."
+  warn "В конце спрошу, работает ли вход в новом окне: без «да» фаервол через 5 мин удалится сам."
+  _protect_save
+  fw_load
+  fw_set SSH_PORT "$(detect_ssh_port 2>/dev/null || echo "${SSH_PORT:-22}")"
+  fw_set EXTRA_TCP "$(_merge_ports "${EXTRA_TCP:-}" 80)"
+  info "80/tcp добавлен в реестр заранее — под редирект на HTTPS (пункт j)."
+  apply_firewall
+}
+
+_install_netbird() {
+  _netbird_ensure || return 1
+  if _netbird_connected; then
+    ok "netbird уже подключён — не трогаю."
+    return 0
+  fi
+  if [ -z "${NF_IN_NETBIRD_KEY:-}" ]; then
+    warn "setup-key не задан. Позже подключишь командой: netbird up --setup-key <KEY> --disable-dns"
+    return 0
+  fi
+  _netbird_up "$NF_IN_NETBIRD_KEY"
+}
+
 _install_node() {
-  if [ "${NF_INSTALL_NODE:-}" = egames ]; then block_remnanode; else block_node_own; fi
+  if [ "${NF_INSTALL_NODE:-}" = egames ]; then
+    _remnanode_egames
+    require_node >/dev/null
+  else
+    block_node_own "${NF_IN_NODE_DOMAIN:-}" "${NF_IN_NODE_SECRET:-}" "${NF_IN_CF_TOKEN:-}"
+  fi
+}
+
+# Нода на связи — только после 6 и 7: конфиг панели ссылается на RU-списки и логи,
+# без них Xray не стартует, и ждать его сразу после установки бесполезно.
+_install_node_check() {
+  require_node || return 1
+  _node_check "$(_node_domain)"
+}
+
+_install_site() {
+  if [ -z "${NF_IN_SITE:-}" ]; then
+    ok "Сайт не меняю — так выбрано в вопросах."
+    return 0
+  fi
+  block_camouflage "$NF_IN_SITE"
+}
+
+_install_beszel() {
+  if [ -z "${NF_IN_BESZEL_KEY:-}" ]; then
+    ok "Агент Beszel не ставлю — так выбрано в вопросах."
+    return 0
+  fi
+  _beszel_install "$NF_IN_BESZEL_KEY" "$NF_IN_BESZEL_PORT" "$NF_IN_BESZEL_TOKEN" "$NF_IN_BESZEL_URL" "${NF_IN_BESZEL_AUTO:-}"
+}
+
+# Аудит; что чинить — выбрано в вопросах: safe — всё без простоя сразу, report — только
+# отчёт, menu — меню, как в пункте «a». Перезагрузку не предлагает — она в конце установки.
+_install_audit() {
+  set +e
+  local AUD_WARN AUD_FAIL AUD_REBOOT_LATER=1
+  local -a AUD_FIX_DESC AUD_FIX_COST AUD_FIX_FN AUD_FIX_ARG AUD_FIX_STATE sel=()
+  _audit_run
+  case "${NF_IN_AUDIT:-menu}" in
+    safe)
+      _audit_pick_safe
+      if [ "${#sel[@]}" -gt 0 ]; then _audit_fix_many "${sel[@]}"; fi
+      _audit_fix_list ;;
+    report)
+      _audit_fix_list
+      if [ "${#AUD_FIX_FN[@]}" -gt 0 ]; then info "Починить можно потом пунктом «a»."; fi ;;
+    *) _audit_fix_menu ;;
+  esac
+  return 0
 }
 
 # Ядро поставлено, но не загружено (XanMod из optimize).
 _reboot_pending() {
   [ -f /var/run/reboot-required ] && return 0
   ls /boot/vmlinuz-*xanmod* >/dev/null 2>&1 && ! uname -r | grep -q xanmod
+}
+
+# Перезагрузка — после всех шагов: новое ядро (XanMod из шага 2) заработает после неё.
+# Вход по новому SSH-порту к этому времени проверен на шаге фаервола.
+_install_reboot() {
+  if ! _reboot_pending; then return 0; fi
+  echo
+  warn "Осталась перезагрузка: новое ядро заработает после неё."
+  info "Вход после неё: ssh -p $(detect_ssh_port) <пользователь>@$(_public_ipv4)"
+  if confirm "Перезагрузить сейчас?"; then reboot
+  else info "Перезагрузи сам, когда удобно: reboot"; fi
 }
 
 # Номер шага с id $1 в NF_INSTALL_STEPS (пусто — такого нет).
@@ -6798,6 +7258,7 @@ _install_index() {
 block_install() {
   local i=0 id name fn ans resume="" total="${#NF_INSTALL_STEPS[@]}"
   NF_INSTALL_NODE=""
+  unset "${!NF_IN_@}"
   if [ -s "$NF_INSTALL_STATE" ]; then read -r resume NF_INSTALL_NODE < "$NF_INSTALL_STATE"; fi
   if [ -n "$resume" ]; then
     i="$(_install_index "$resume")"
@@ -6805,7 +7266,7 @@ block_install() {
       warn "Шага «${resume}» из прошлой установки в этой версии скрипта нет."
       i=0; resume=""
     else
-      IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
+      IFS='|' read -r id name _ <<<"${NF_INSTALL_STEPS[i]}"
       info "Незавершённая установка: следующий шаг — ${id}) ${name}."
       if ! confirm "Продолжить с него?"; then
         confirm "Начать установку заново?" || return 0
@@ -6814,14 +7275,20 @@ block_install() {
     fi
   fi
   if [ -z "$resume" ]; then
+    rm -f "$NF_INSTALL_ANSWERS"
     run_block "Доступность из РФ" block_ru_access
     if ! confirm "Продолжаем установку ноды?"; then warn "Установка остановлена."; return 0; fi
     NF_INSTALL_NODE=""
+  else
+    _install_load
   fi
-  if [ -z "$NF_INSTALL_NODE" ]; then _install_ask_node; fi
+  if ! _install_questions "$i"; then
+    warn "Отменено — ответы не сохранены. Пункт «i» спросит заново."
+    return 0
+  fi
   mkdir -p "$(dirname "$NF_INSTALL_STATE")"
   while [ "$i" -lt "$total" ]; do
-    IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
+    IFS='|' read -r id name fn _ <<<"${NF_INSTALL_STEPS[i]}"
     printf '%s %s\n' "$id" "$NF_INSTALL_NODE" > "$NF_INSTALL_STATE"
     echo
     info "Установка: шаг $((i + 1)) из ${total}."
@@ -6834,19 +7301,10 @@ block_install() {
       esac
     fi
     i=$((i + 1))
-    if [ "$fn" = block_optimize ] && _reboot_pending; then
-      IFS='|' read -r id name fn <<<"${NF_INSTALL_STEPS[i]}"
-      printf '%s %s\n' "$id" "$NF_INSTALL_NODE" > "$NF_INSTALL_STATE"
-      echo
-      warn "Новое ядро заработает после перезагрузки."
-      warn "До неё проверь вход в НОВОМ окне: ssh -p $(detect_ssh_port) <пользователь>@$(_public_ipv4)"
-      info "После перезагрузки запусти скрипт и выбери «i» — продолжу с шага «${name}»."
-      if confirm "Перезагрузить сейчас?"; then reboot; fi
-      return 0
-    fi
   done
-  rm -f "$NF_INSTALL_STATE"
+  rm -f "$NF_INSTALL_STATE" "$NF_INSTALL_ANSWERS"
   ok "Установка ноды завершена: все шаги пройдены."
+  _install_reboot
 }
 
 
@@ -6980,14 +7438,14 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} v)${RST} SNI-проверка ноды  ${GRY}— mTLS панель→нода: SNI_VERIFICATION вкл/выкл (node ≥ 3.4)${RST}
  
  ${BOLD}${MAG}Группы${RST} ${GRY}(несколько шагов сразу, в правильном порядке):${RST}
-   ${BOLD}${YLW} i)${RST} ${WHT}Полная установка${RST} ${GRY}— d → «продолжаем?» → 1 IPv6 2 → reboot → 3 4 5 6 7 h j 11 → a → проверки 14${RST}
+   ${BOLD}${YLW} i)${RST} ${WHT}Полная установка${RST} ${GRY}— d → все вопросы сразу → 1 IPv6 2 3 4 5 6 7 → нода на связи → h j 11 → a → reboot${RST}
    ${BOLD}${YLW}16)${RST} ① До ребута       ${GRY}(1 + 2)  → потом reboot${RST}
    ${BOLD}${YLW}17)${RST} ② Поднять ноду    ${GRY}(4 + 5)${RST}
    ${BOLD}${YLW}18)${RST} ③ Настроить ноду  ${GRY}(6 + 7 + 8)${RST}
    ${BOLD}${YLW}19)${RST} ④ Защита + Beszel ${GRY}(3 + 11)${RST}
    ${BOLD}${RED} 0)${RST} ${RED}Выход${RST}
 ${GRY}──────────────────────────────────────────────────────────────${RST}
- ${DIM}Чистая нода целиком: i (после reboot — снова i). По шагам: 16 → reboot → 17 → 18 → 19 → h → j → m → a.${RST}
+ ${DIM}Чистая нода целиком: i (reboot — в конце), потом проверки 14. По шагам: 16 → reboot → 17 → 18 → 19 → h → j → m → a.${RST}
  ${DIM}Можно несколько номеров через пробел.${RST}
 EOF
 }
