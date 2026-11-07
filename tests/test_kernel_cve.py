@@ -7,6 +7,11 @@ from test_install import BashCase, NL
 # The system is stubbed: every command that changes something leaves a line in $LOG.
 STUBS = r'''
 uname() { echo "$RUNNING"; }
+_cve_os() { echo "${DISTRO:-ubuntu}"; }
+_cve_candidate() { echo "${CAND:-}"; }
+_cve_kernel_holds() { echo "${HOLDS:-}"; }
+_cve_add_updates_repo() { echo "add-repo" >> "$LOG"; : > "$CVE_UPDATES_LIST"; CAND="${CAND_AFTER:-$CAND}"; }
+apt-mark() { echo "apt-mark $*" >> "$LOG"; }
 _cve_kernel_state() { if [ "$1" = "${FIXED_REL:-}" ]; then echo fixed; else echo "${STATE:-vulnerable}"; fi; }
 _cve_newest_kernel() { echo "${NEWEST:-$RUNNING}"; }
 _cve_kernel_pkgs() { echo "${PKGS:-}"; }
@@ -17,7 +22,7 @@ _sysupd_fits() { [ -z "${NO_SPACE:-}" ]; }
 _sysupd_apt() { echo "apt $*" >> "$LOG"; }
 _sysctl_persist() { echo "sysctl $1=$2" >> "$LOG"; }
 _cve_mptcp_off() { _sysctl_persist net.mptcp.enabled 0; }
-apt-get() { echo "apt-get $*" >> "$LOG"; }
+apt-get() { echo "apt-get $*" >> "$LOG"; [ -z "${REPO_BREAKS:-}" ] || [ ! -e "$CVE_UPDATES_LIST" ]; }
 systemctl() { echo "systemctl $*" >> "$LOG"; }
 docker() { echo "docker $*" >> "$LOG"; }
 nft() {
@@ -90,7 +95,7 @@ class Base(BashCase):
     def script(self, body, env):
         env = {"RUNNING": "6.8.0-147-generic", **env}
         head = "".join(f'{k}="{v}"; ' for k, v in env.items())
-        return ('LOG="$PWD/$1"; FILTER="$PWD/$2"; CVE_NFT="$PWD/$3/cve.nft"; CVE_UNIT_FILE="$PWD/$3/cve.service"; '
+        return ('LOG="$PWD/$1"; FILTER="$PWD/$2"; CVE_NFT="$PWD/$3/cve.nft"; CVE_UNIT_FILE="$PWD/$3/cve.service"; CVE_UPDATES_LIST="$PWD/$3/updates.list"; '
                 + head + STUBS + body)
 
     def run_item(self, answers=(), **env):
@@ -106,12 +111,15 @@ class Base(BashCase):
 
 class ItemTests(Base):
     PENDING = {"NEWEST": "6.8.0-149-generic", "FIXED_REL": "6.8.0-149-generic"}
+    # The kernel appears only once the install has run: see run_item.
+    PENDING_AFTER_INSTALL = {"FIXED_REL": "6.8.0-149-generic", "INSTALLS": "6.8.0-149-generic"}
 
     def run_item(self, answers=(), **env):
         # A real `nft -f` is absent here: restarting the unit is what brings the table up.
         body = ('systemctl() { echo "systemctl $*" >> "$LOG"; '
                 'if [ "$1" = restart ] && [ -z "${FILTER_FAILS:-}" ]; then : > "$FILTER"; fi; }\n'
                 'command() { if [ "$1" = -v ] && [ "$2" = nft ]; then return 0; fi; builtin command "$@"; }\n'
+                '_sysupd_apt() { echo "apt $*" >> "$LOG"; [ -z "${INSTALLS:-}" ] || NEWEST="$INSTALLS"; }\n'
                 'run_block "Дыра в ядре" block_kernel_cve')
         return self.bash(self.script(body, env), self.calls, self.filter, self.base, stdin=NL.join(answers) + NL)
 
@@ -163,7 +171,7 @@ class ItemTests(Base):
         result = self.run_item(NEWEST="6.8.0-148-generic")
         self.assert_ok(result)
         self.assertFalse(self.has("systemctl reboot"))
-        self.assertIn("пока не нашёл", result.stderr + result.stdout)
+        self.assertIn("Дыра НЕ закрыта", result.stderr + result.stdout)
 
     def test_no_room_stops_before_apt_install_but_keeps_the_shield(self):
         result = self.run_item(PKGS="linux-image-generic", NO_SPACE="1")
@@ -181,6 +189,73 @@ class ItemTests(Base):
         self.assert_ok(result)
         self.assertIn("Не знаю эту сборку", result.stderr + result.stdout)
         self.assertTrue(self.filter.exists())
+
+    def test_hoster_image_without_the_meta_package_still_gets_the_kernel(self):
+        # apt has nothing to upgrade, the fixed kernel is only reachable through the meta package.
+        result = self.run_item(["y", "y"], CAND="6.8.0-149.149", **self.PENDING_AFTER_INSTALL)
+        self.assert_ok(result)
+        self.assertTrue(self.has("install linux-image-generic"))
+        self.assertFalse(self.has("add-repo"))
+
+    def test_repository_without_the_fix_is_opened_on_a_yes(self):
+        result = self.run_item(["y", "y", "n"], CAND="6.8.0-147.147", CAND_AFTER="6.8.0-149.149",
+                               **self.PENDING_AFTER_INSTALL)
+        self.assert_ok(result)
+        log = self.log()
+        self.assertLess(log.index("add-repo"), next(i for i, l in enumerate(log) if "install linux-image-generic" in l))
+
+    def test_repository_that_breaks_apt_is_taken_back(self):
+        result = self.run_item(["y"], CAND="6.8.0-147.147", REPO_BREAKS="1")
+        self.assert_ok(result)
+        self.assertTrue(self.has("add-repo"))
+        self.assertFalse((self.base / "updates.list").exists())
+        self.assertIn("вернул как было", result.stderr + result.stdout)
+
+    def test_repository_stays_closed_without_a_yes(self):
+        result = self.run_item(["n"], CAND="6.8.0-147.147")
+        self.assert_ok(result)
+        self.assertFalse(self.has("add-repo"))
+        self.assertFalse(self.has(" install "))
+        self.assertIn("Дыра НЕ закрыта", result.stderr + result.stdout)
+        self.assertIn("6.8.0-147.147", result.stderr + result.stdout)
+
+    def test_stale_kernel_is_not_installed_instead_of_the_fixed_one(self):
+        # Without the fix anywhere the upgrade may still be offered, but the meta package is not forced.
+        result = self.run_item(["n", "n"], CAND="6.8.0-147.147", PKGS="linux-image-generic")
+        self.assert_ok(result)
+        self.assertFalse(self.has(" install "))
+
+    def test_held_kernel_is_released_only_on_a_yes(self):
+        self.assert_ok(self.run_item(["y"], HOLDS="linux-image-generic"))
+        self.assertTrue(self.has("apt-mark unhold linux-image-generic"))
+
+    def test_held_kernel_stays_held_without_a_yes(self):
+        self.assert_ok(self.run_item(["n"], HOLDS="linux-image-generic"))
+        self.assertFalse(self.has("apt-mark"))
+
+    def test_debian_is_not_sent_to_the_ubuntu_repository(self):
+        result = self.run_item(RUNNING="6.1.0-41-amd64", DISTRO="debian", CAND="6.1.176-1")
+        self.assert_ok(result)
+        self.assertFalse(self.has("add-repo"))
+
+    def test_debian_without_the_meta_package_gets_it(self):
+        result = self.run_item(["n"], RUNNING="6.1.0-41-amd64", DISTRO="debian", CAND="6.1.190-1",
+                               PKGS="", NEWEST="6.1.0-41-amd64")
+        self.assert_ok(result)
+        self.assertIn("linux-image-amd64", result.stderr + result.stdout)
+
+    def test_open_hole_is_never_called_done(self):
+        result = self.bash(self.script('_menu_kernel_cve', {"NEWEST": "6.8.0-147-generic"}),
+                           self.calls, self.filter, self.base)
+        out = result.stdout + result.stderr
+        self.assertIn("Дыра НЕ закрыта", out)
+        self.assertNotIn("готово", out)
+
+    def test_many_ports_of_one_container_make_one_line(self):
+        rows = NL.join(["docker certwarden *:4050", "docker certwarden *:4060", "docker beszel *:8090"]) + NL
+        result = self.run_item(LISTENERS=rows)
+        self.assert_ok(result)
+        self.assertEqual((result.stdout + result.stderr).count("certwarden"), 1)
 
     def test_filter_covers_prerouting_and_outlives_nftables_service(self):
         self.assert_ok(self.run_item())
@@ -228,6 +303,30 @@ class ParsingTests(BashCase):
         self.assert_ok(result)
         self.assertEqual(result.stdout.split(), ["host", "rw-core", "*:443", "4242"])
 
+    def test_docker_dns_on_loopback_is_not_a_listener(self):
+        line = 'LISTEN 0 4096 127.0.0.11:39897 0.0.0.0:* users:(("dockerd",pid=7,fd=9))'
+        result = self.bash(f"ss() {{ echo '{line}'; }}; command() {{ return 1; }}; _cve_mptcp_listeners")
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_meta_package_of_each_build(self):
+        cases = {"6.8.0-146-generic": "linux-image-generic", "6.8.0-1069-aws": "linux-image-aws",
+                 "6.1.0-41-amd64": "linux-image-amd64", "6.12.107+deb13-amd64": "linux-image-amd64",
+                 "6.1.0-41-cloud-amd64": "linux-image-cloud-amd64", "6.12.107+deb13-cloud-amd64": "linux-image-cloud-amd64"}
+        result = self.bash("".join(f'_cve_meta_pkg "{rel}"; ' for rel in cases))
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.split(), list(cases.values()))
+        self.assertEqual(self.bash('_cve_meta_pkg 6.12.60-x64v3-xanmod1').stdout.strip(), "")
+
+    def test_candidate_versions(self):
+        cases = [("6.8.0-149.149", "ubuntu", "generic", "fixed"), ("6.8.0.149.149", "ubuntu", "generic", "fixed"),
+                 ("6.8.0-147.147", "ubuntu", "generic", "vulnerable"), ("(none)", "ubuntu", "generic", "unknown"),
+                 ("6.12.115-2", "debian", "amd64", "fixed"), ("6.1.176-1", "debian", "amd64", "vulnerable"),
+                 ("(none)", "debian", "amd64", "unknown")]
+        result = self.bash("".join(f'_cve_candidate_state "{v}" "{o}" "{f}"; ' for v, o, f, _ in cases))
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.split(), [c[3] for c in cases])
+
 
 class AuditTests(Base):
     def audit(self, **env):
@@ -238,15 +337,11 @@ class AuditTests(Base):
         return result.stdout.strip().splitlines()[-1]
 
     def test_unprotected_kernel_is_a_failure_with_a_fix(self):
-        self.assertEqual(self.audit(), "FAIL=1 WARN=0 FIXES=_cve_shield_on")
-
-    def test_kernel_on_offer_adds_the_upgrade(self):
-        self.assertEqual(self.audit(PKGS="linux-image-generic"),
-                         "FAIL=1 WARN=0 FIXES=_cve_shield_on _cve_kernel_upgrade")
+        self.assertEqual(self.audit(), "FAIL=1 WARN=0 FIXES=_cve_shield_on _cve_kernel_upgrade")
 
     def test_shield_alone_is_a_warning(self):
         self.filter.touch()
-        self.assertEqual(self.audit(), "FAIL=0 WARN=1 FIXES=")
+        self.assertEqual(self.audit(), "FAIL=0 WARN=1 FIXES=_cve_kernel_upgrade")
 
     def test_fixed_kernel_with_the_filter_offers_to_lift_it(self):
         self.filter.touch()

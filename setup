@@ -3591,6 +3591,7 @@ CVE_TABLE="nodeforge_cve98432"
 CVE_NFT="${CVE_NFT:-/etc/nodeforge/cve98432.nft}"
 CVE_UNIT="nodeforge-cve98432.service"
 CVE_UNIT_FILE="${CVE_UNIT_FILE:-/etc/systemd/system/${CVE_UNIT}}"
+CVE_UPDATES_LIST="${CVE_UPDATES_LIST:-/etc/apt/sources.list.d/nodeforge-updates.list}"
 
 # Стабильные ветки с исправлением: 7.3 и новее исправлены все, прочие ветки его не получили.
 CVE_STABLE="5.10.272 5.15.223 6.1.190 6.6.159 6.12.113 6.18.56 7.2.10"
@@ -3644,9 +3645,11 @@ _cve_verdict() {
   echo unknown
 }
 
+_cve_os() { (. /etc/os-release && echo "${ID:-}"); }
+
 _cve_kernel_state() {
   local os pkg
-  os="$(. /etc/os-release && echo "${ID:-}")"
+  os="$(_cve_os)"
   pkg="$(dpkg-query -W -f='${Version}' "linux-image-$1" 2>/dev/null || true)"
   _cve_verdict "$1" "$os" "$pkg"
 }
@@ -3718,10 +3721,11 @@ _cve_shield_on() {
 }
 
 # Кто слушает через MPTCP. Строки: «host процесс порт pid» и «docker контейнер порт».
-# ss видит только сеть хоста, у контейнера в своей сети спрашиваем отдельно.
+# ss видит только сеть хоста, у контейнера в своей сети спрашиваем отдельно. 127.* пропускаем:
+# это loopback и внутренний DNS Docker (127.0.0.11), снаружи туда не попасть.
 _cve_mptcp_listeners() {
   local pid name
-  ss -H -lnMp 2>/dev/null | awk '{
+  ss -H -lnMp 2>/dev/null | awk '$4 !~ /^127\./ {
     who = "?"; pid = "-"
     if (match($0, /\("[^"]+"/)) who = substr($0, RSTART + 2, RLENGTH - 3)
     if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
@@ -3730,7 +3734,7 @@ _cve_mptcp_listeners() {
   while read -r pid name; do
     if [ -z "$pid" ] || [ "$pid" = 0 ]; then continue; fi
     if [ "$(readlink "/proc/${pid}/ns/net")" = "$(readlink /proc/1/ns/net)" ]; then continue; fi
-    nsenter -t "$pid" -n ss -H -lnM 2>/dev/null | awk -v c="${name#/}" '{ print "docker", c, $4 }' || true
+    nsenter -t "$pid" -n ss -H -lnM 2>/dev/null | awk -v c="${name#/}" '$4 !~ /^127\./ { print "docker", c, $4 }' || true
   done < <(docker ps -q | xargs -r docker inspect -f '{{.State.Pid}} {{.Name}}' 2>/dev/null || true)
 }
 
@@ -3741,30 +3745,31 @@ _cve_pid_container() {
   if [ -n "$id" ]; then docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||' || true; fi
 }
 
+# Добавить слово $2 в список $1 без повторов.
+_cve_uniq_add() {
+  case " $1 " in *" $2 "*) echo "$1" ;; *) echo "${1:+$1 }$2" ;; esac
+}
+
 # Открытые порты остаются на MPTCP, пока их не откроют заново. Контейнер с сетью хоста
 # перезапуск лечит; контейнер в своей сети вернётся с MPTCP, его держит правило.
 _cve_close_listeners() {
-  local rows kind who addr pid c
-  local -a restart=()
+  local rows kind who _addr pid c restart="" own="" host=""
   rows="$(_cve_mptcp_listeners)"
   if [ -z "$rows" ]; then ok "Через MPTCP никто не слушает."; return 0; fi
-  while read -r kind who addr pid; do
-    if [ "$kind" = docker ]; then
-      info "${who}: ${addr} слушает через MPTCP в своей сети. Снаружи его прикрывает правило, закроет новое ядро."
-      continue
-    fi
+  while read -r kind who _addr pid; do
+    if [ "$kind" = docker ]; then own="$(_cve_uniq_add "$own" "$who")"; continue; fi
     c="$(_cve_pid_container "$pid")"
-    if [ -n "$c" ]; then
-      case " ${restart[*]:-} " in *" ${c} "*) ;; *) restart+=("$c") ;; esac
-    else
-      warn "${who}: ${addr} ещё слушает через MPTCP. Закроется при перезапуске этой службы."
-    fi
+    if [ -n "$c" ]; then restart="$(_cve_uniq_add "$restart" "$c")"
+    else host="$(_cve_uniq_add "$host" "$who")"; fi
   done <<<"$rows"
-  if [ "${#restart[@]}" -eq 0 ]; then return 0; fi
-  warn "Ещё слушают через MPTCP: ${restart[*]}. Перезапуск оборвёт их соединения на несколько секунд."
+  if [ -n "$own" ]; then info "Контейнеры в своей сети слушают через MPTCP: ${own}. Снаружи их прикрывает правило."; fi
+  if [ -n "$host" ]; then info "Службы хоста ещё слушают через MPTCP: ${host}. Снаружи их прикрывает правило, закроет перезагрузка."; fi
+  if [ -z "$restart" ]; then return 0; fi
+  warn "Ещё слушают через MPTCP: ${restart}. Перезапуск оборвёт их соединения на несколько секунд."
   if confirm "Перезапустить?"; then
-    docker restart "${restart[@]}" >/dev/null
-    ok "Перезапущено: ${restart[*]}."
+    # shellcheck disable=SC2086
+    docker restart $restart >/dev/null
+    ok "Перезапущено: ${restart}."
   else
     info "Оставил как есть: снаружи порты прикрывает правило, а перезагрузка закроет их совсем."
   fi
@@ -3788,11 +3793,94 @@ _cve_fix_pending() {
   [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ] && [ "$(_cve_kernel_state "$newest")" = fixed ]
 }
 
-_cve_kernel_upgrade() {
-  local pkgs dl grow
-  info "Ищу исправленное ядро в репозиториях…"
+# Метапакет запущенной сборки: linux-image-generic, linux-image-amd64, linux-image-cloud-amd64.
+# У XanMod свой репозиторий и свои метапакеты, их видно в _cve_kernel_pkgs.
+_cve_meta_pkg() {
+  case "$1" in
+    *xanmod*) return 0 ;;
+  esac
+  echo "linux-image-$(sed -E 's/^[^-]+-([0-9]+-)?//' <<<"$1")"
+}
+
+_cve_candidate() {
+  LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ { print $2 }' || true
+}
+
+# Есть ли исправление в версии $1 метапакета: 6.8.0-149.149 (Ubuntu), 6.12.113-1 (Debian).
+_cve_candidate_state() {
+  local ver="$1" os="$2" flavour="$3"
+  if [ "$os" = ubuntu ] && [[ "$ver" =~ ^([0-9]+\.[0-9]+\.0)[.-]([0-9]+)\. ]]; then
+    _cve_verdict "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${flavour}" ubuntu ""
+  elif [ "$os" = debian ] && [ -n "$ver" ] && [ "$ver" != "(none)" ]; then
+    _cve_verdict debian debian "$ver"
+  else
+    echo unknown
+  fi
+}
+
+_cve_kernel_holds() {
+  apt-mark showhold 2>/dev/null | grep -E '^linux-(image|headers|modules|generic|virtual)' | paste -sd' ' || true
+}
+
+_cve_apt_update() {
   if ! apt-get -q update >/dev/null 2>&1; then warn "apt update прошёл с ошибками: список пакетов может быть неполным."; fi
+}
+
+# Ядра Ubuntu выходят в <серия>-updates. Его могло не быть в списке, а зеркало хостера могло отстать.
+_cve_add_updates_repo() {
+  local code mirror="http://archive.ubuntu.com/ubuntu"
+  code="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+  case "$(dpkg --print-architecture)" in
+    amd64|i386) ;;
+    *) mirror="http://ports.ubuntu.com/ubuntu-ports" ;;
+  esac
+  printf 'deb %s %s-updates main restricted\n' "$mirror" "$code" > "$CVE_UPDATES_LIST"
+}
+
+# Исправленного ядра нет в подключённых репозиториях: предложить официальный.
+_cve_open_ubuntu_updates() {
+  local cand="$1"
+  warn "В подключённых репозиториях ядро ${cand}, оно без исправления."
+  info "Исправленное лежит в официальном репозитории обновлений Ubuntu. Подключу только его, ничего другого не трогаю."
+  if ! confirm "Подключить?"; then return 0; fi
+  _cve_add_updates_repo
+  # Спор с уже настроенным источником ломает весь apt: такой файл убираем сразу.
+  if ! apt-get -q update >/dev/null 2>&1; then
+    rm -f "$CVE_UPDATES_LIST"
+    _cve_apt_update
+    warn "Репозиторий не подключился, вернул как было."
+    return 0
+  fi
+  ok "Подключён ${CVE_UPDATES_LIST}."
+}
+
+_cve_kernel_upgrade() {
+  local rel os meta flavour cand state held pkgs dl grow
+  rel="$(uname -r)"
+  os="$(_cve_os)"
+  meta="$(_cve_meta_pkg "$rel")"
+  flavour="${meta#linux-image-}"
+  info "Ищу исправленное ядро в репозиториях…"
+  _cve_apt_update
+  held="$(_cve_kernel_holds)"
+  if [ -n "$held" ]; then
+    warn "Пакеты ядра заморожены (apt-mark hold): ${held}. Новое ядро из-за этого не поставится."
+    # shellcheck disable=SC2086
+    if confirm "Разморозить?"; then apt-mark unhold $held >/dev/null; fi
+  fi
+  cand="$(_cve_candidate "$meta")"
+  state="$(_cve_candidate_state "$cand" "$os" "$flavour")"
+  if [ "$os" = ubuntu ] && [ "$state" = vulnerable ]; then
+    _cve_open_ubuntu_updates "$cand"
+    cand="$(_cve_candidate "$meta")"
+    state="$(_cve_candidate_state "$cand" "$os" "$flavour")"
+  fi
   pkgs="$(_cve_kernel_pkgs)"
+  # Метапакета может не быть: образ хостера ставит одно конкретное ядро, и обновлять нечего.
+  # Тогда apt молчит, хотя исправленное ядро есть, поэтому ставим метапакет сами.
+  if [ "$state" = fixed ] && ! _cve_fix_pending && [[ " ${pkgs} " != *" ${meta} "* ]]; then
+    pkgs="${pkgs:+$pkgs }${meta}"
+  fi
   if [ -n "$pkgs" ]; then
     # shellcheck disable=SC2086
     read -r dl grow <<<"$(_apt_need install $pkgs)"
@@ -3817,7 +3905,7 @@ _cve_kernel_upgrade() {
     warn "Перезагрузку отложил. Без неё ядро старое, сервер держит только правило."
     return 0
   fi
-  warn "Исправленного ядра для этой системы пока не нашёл. Запусти пункт ещё раз позже."
+  warn "Исправленное ядро не установлено. В репозиториях: ${meta:-метапакета нет} ${cand:-нет версии}."
 }
 
 block_kernel_cve() {
@@ -3836,7 +3924,16 @@ block_kernel_cve() {
   fi
   _cve_shield_on
   _cve_kernel_upgrade
-  if ! _cve_fix_pending; then _cve_close_listeners; fi
+  if _cve_fix_pending; then return 0; fi
+  _cve_close_listeners
+  err "Дыра НЕ закрыта: ядро ${rel} старое, сервер держит только щит."
+}
+
+# Без run_block: его «готово» читается как «дыра закрыта», а закрывает её только ядро.
+_menu_kernel_cve() {
+  echo
+  step "Дыра в ядре"
+  ( set -eo pipefail; block_kernel_cve ) || err "Дыра в ядре — прервано, см. вывод выше."
 }
 
 _audit_kernel_cve() {
@@ -3855,9 +3952,7 @@ _audit_kernel_cve() {
     _a_fail "Ядро ${rel} без исправления и без защиты: сервер можно захватить удалённо"
     _a_fix "Поставить щит от CVE-2026-98432 (правило + выключить MPTCP)" 0 _cve_shield_on
   fi
-  if _cve_fix_pending || [ -n "$(_cve_kernel_pkgs)" ]; then
-    _a_fix "Обновить ядро и перезагрузить (CVE-2026-98432)" 2 _cve_kernel_upgrade
-  fi
+  _a_fix "Обновить ядро и перезагрузить (CVE-2026-98432)" 2 _cve_kernel_upgrade
 }
 
 
@@ -7900,7 +7995,7 @@ menu() {
         d|D) run_block "Доступность из РФ" block_ru_access ;;
         e|E) run_block "Обновление системы" block_sysupdate ;;
         x|X) run_block "Очистка диска" block_disk_cleanup ;;
-        z|Z) run_block "Дыра в ядре" block_kernel_cve ;;
+        z|Z) _menu_kernel_cve ;;
         p|P) block_ports ;;
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
