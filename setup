@@ -3579,6 +3579,289 @@ _fix_unrefuse_ports() {
 
 
 # ============================================================================
+#  z)  ДЫРА В ЯДРЕ CVE-2026-98432  (удалённый root через TCP-рукопожатие)
+# ----------------------------------------------------------------------------
+#  Ошибка в обычном IPv4 TCP: её вызывает SYN с IP-опциями, MPTCP только облегчает
+#  захват. Лечит одно новое ядро. Пока его нет, стоит щит: правило роняет TCP с
+#  IP-опциями, а MPTCP выключен. Правило висит на prerouting, то есть до DNAT:
+#  настройка хоста на контейнеры в своей сети не действует, а правило их прикрывает.
+#  Нода для пункта не нужна: годится и для сервера с панелью или ботом.
+# ============================================================================
+CVE_TABLE="nodeforge_cve98432"
+CVE_NFT="${CVE_NFT:-/etc/nodeforge/cve98432.nft}"
+CVE_UNIT="nodeforge-cve98432.service"
+CVE_UNIT_FILE="${CVE_UNIT_FILE:-/etc/systemd/system/${CVE_UNIT}}"
+
+# Стабильные ветки с исправлением: 7.3 и новее исправлены все, прочие ветки его не получили.
+CVE_STABLE="5.10.272 5.15.223 6.1.190 6.6.159 6.12.113 6.18.56 7.2.10"
+# У Ubuntu своя нумерация: база ядра, вид сборки, первая сборка с исправлением.
+CVE_UBUNTU="5.15.0 generic 203
+5.15.0 aws 1120
+5.15.0 azure 1126
+5.15.0 gcp 1121
+5.15.0 kvm 1112
+6.8.0 generic 149
+6.8.0 aws 1069
+6.8.0 azure 1073
+6.8.0 gcp 1073
+7.0.0 generic 43
+7.0.0 aws 1017
+7.0.0 azure 1020
+7.0.0 gcp 1017
+7.3.0 generic 10"
+
+# Версия из стабильной ветки ($1 = 6.12.107): fixed | vulnerable.
+_cve_upstream_verdict() {
+  local v="$1" fix
+  for fix in $CVE_STABLE; do
+    if [ "${fix%.*}" = "${v%.*}" ]; then
+      if _version_older "$v" "$fix"; then echo vulnerable; else echo fixed; fi
+      return 0
+    fi
+  done
+  if _version_older "$v" 7.3; then echo vulnerable; else echo fixed; fi
+}
+
+# _cve_verdict <uname -r> <ID из os-release> <версия пакета ядра> → fixed | vulnerable | unknown
+_cve_verdict() {
+  local rel="$1" os="$2" pkg="$3" base abi flavour min
+  case "$rel" in
+    *xanmod*) _cve_upstream_verdict "${rel%%-*}"; return 0 ;;
+  esac
+  if [ "$os" = ubuntu ] && [[ "$rel" =~ ^([0-9]+\.[0-9]+\.0)-([0-9]+)-([a-z]+)$ ]]; then
+    base="${BASH_REMATCH[1]}" abi="${BASH_REMATCH[2]}" flavour="${BASH_REMATCH[3]}"
+    min="$(awk -v b="$base" -v f="$flavour" '$1 == b && $2 == f { print $3 }' <<<"$CVE_UBUNTU")"
+    if [ -z "$min" ]; then echo unknown
+    elif [ "$abi" -lt "$min" ]; then echo vulnerable
+    else echo fixed; fi
+    return 0
+  fi
+  # У Debian версия пакета и есть номер стабильной ветки: 6.1.190-1, 6.12.113-1~deb12u1.
+  if [ "$os" = debian ] && [ -n "$pkg" ]; then
+    _cve_upstream_verdict "${pkg%%[-~+]*}"
+    return 0
+  fi
+  echo unknown
+}
+
+_cve_kernel_state() {
+  local os pkg
+  os="$(. /etc/os-release && echo "${ID:-}")"
+  pkg="$(dpkg-query -W -f='${Version}' "linux-image-$1" 2>/dev/null || true)"
+  _cve_verdict "$1" "$os" "$pkg"
+}
+
+_cve_filter_up() { nft list table ip "$CVE_TABLE" >/dev/null 2>&1; }
+
+_cve_filter_drops() {
+  nft list table ip "$CVE_TABLE" 2>/dev/null | grep -oE 'counter packets [0-9]+' | awk '{s += $3} END {print s + 0}' || true
+}
+
+# Как nftables.service: до поднятия сети. Его правила начинаются с flush ruleset, поэтому наш — после него.
+_cve_filter_on() {
+  if ! command -v nft >/dev/null 2>&1; then _sysupd_apt install nftables; fi
+  mkdir -p "${CVE_NFT%/*}"
+  cat > "$CVE_NFT" <<EOS
+table ip ${CVE_TABLE}
+delete table ip ${CVE_TABLE}
+table ip ${CVE_TABLE} {
+	chain pre {
+		type filter hook prerouting priority -300; policy accept;
+		meta l4proto tcp ip hdrlength > 5 counter drop
+	}
+}
+EOS
+  cat > "$CVE_UNIT_FILE" <<EOS
+[Unit]
+Description=nodeforge: drop TCP with IPv4 options until the kernel has the CVE-2026-98432 fix
+DefaultDependencies=no
+Wants=network-pre.target
+After=nftables.service
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${CVE_NFT}
+ExecStop=-/usr/sbin/nft delete table ip ${CVE_TABLE}
+
+[Install]
+WantedBy=sysinit.target
+EOS
+  systemctl daemon-reload
+  systemctl enable --quiet "$CVE_UNIT"
+  systemctl restart "$CVE_UNIT"
+  if ! _cve_filter_up; then err "Правило не встало: см. systemctl status ${CVE_UNIT}"; return 1; fi
+  ok "Правило стоит и переживёт перезагрузку: TCP с IP-опциями отбрасывается, обычный трафик не задет."
+}
+
+_cve_filter_off() {
+  systemctl disable --now --quiet "$CVE_UNIT" 2>/dev/null || true
+  nft delete table ip "$CVE_TABLE" 2>/dev/null || true
+  rm -f "$CVE_UNIT_FILE" "$CVE_NFT"
+  systemctl daemon-reload
+  ok "Правило снято: ядро уже с исправлением."
+}
+
+_cve_mptcp_off() {
+  if [ -e /proc/sys/net/mptcp/enabled ]; then _sysctl_persist net.mptcp.enabled 0; fi
+  if [ "$(cat /proc/sys/net/ipv4/tcp_migrate_req 2>/dev/null || echo 0)" != 0 ]; then
+    _sysctl_persist net.ipv4.tcp_migrate_req 0
+  fi
+  ok "MPTCP выключен (${NF_SYSCTL}): новые порты слушают обычным TCP."
+}
+
+_cve_shield_on() {
+  _cve_filter_on
+  _cve_mptcp_off
+}
+
+# Кто слушает через MPTCP. Строки: «host процесс порт pid» и «docker контейнер порт».
+# ss видит только сеть хоста, у контейнера в своей сети спрашиваем отдельно.
+_cve_mptcp_listeners() {
+  local pid name
+  ss -H -lnMp 2>/dev/null | awk '{
+    who = "?"; pid = "-"
+    if (match($0, /\("[^"]+"/)) who = substr($0, RSTART + 2, RLENGTH - 3)
+    if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
+    print "host", who, $4, pid }' || true
+  if ! command -v docker >/dev/null 2>&1; then return 0; fi
+  while read -r pid name; do
+    if [ -z "$pid" ] || [ "$pid" = 0 ]; then continue; fi
+    if [ "$(readlink "/proc/${pid}/ns/net")" = "$(readlink /proc/1/ns/net)" ]; then continue; fi
+    nsenter -t "$pid" -n ss -H -lnM 2>/dev/null | awk -v c="${name#/}" '{ print "docker", c, $4 }' || true
+  done < <(docker ps -q | xargs -r docker inspect -f '{{.State.Pid}} {{.Name}}' 2>/dev/null || true)
+}
+
+# Контейнер, которому принадлежит процесс $1 (пусто, если процесс не в контейнере).
+_cve_pid_container() {
+  local id
+  id="$(grep -oE '[0-9a-f]{64}' "/proc/$1/cgroup" 2>/dev/null | head -1 || true)"
+  if [ -n "$id" ]; then docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||' || true; fi
+}
+
+# Открытые порты остаются на MPTCP, пока их не откроют заново. Контейнер с сетью хоста
+# перезапуск лечит; контейнер в своей сети вернётся с MPTCP, его держит правило.
+_cve_close_listeners() {
+  local rows kind who addr pid c
+  local -a restart=()
+  rows="$(_cve_mptcp_listeners)"
+  if [ -z "$rows" ]; then ok "Через MPTCP никто не слушает."; return 0; fi
+  while read -r kind who addr pid; do
+    if [ "$kind" = docker ]; then
+      info "${who}: ${addr} слушает через MPTCP в своей сети. Снаружи его прикрывает правило, закроет новое ядро."
+      continue
+    fi
+    c="$(_cve_pid_container "$pid")"
+    if [ -n "$c" ]; then
+      case " ${restart[*]:-} " in *" ${c} "*) ;; *) restart+=("$c") ;; esac
+    else
+      warn "${who}: ${addr} ещё слушает через MPTCP. Закроется при перезапуске этой службы."
+    fi
+  done <<<"$rows"
+  if [ "${#restart[@]}" -eq 0 ]; then return 0; fi
+  warn "Ещё слушают через MPTCP: ${restart[*]}. Перезапуск оборвёт их соединения на несколько секунд."
+  if confirm "Перезапустить?"; then
+    docker restart "${restart[@]}" >/dev/null
+    ok "Перезапущено: ${restart[*]}."
+  else
+    info "Оставил как есть: снаружи порты прикрывает правило, а перезагрузка закроет их совсем."
+  fi
+}
+
+# Пакеты ядра, у которых есть обновление (фазовый выпуск Ubuntu не откладываем: это дыра).
+_cve_kernel_pkgs() {
+  LC_ALL=C apt-get -s -o APT::Get::Always-Include-Phased-Updates=true upgrade --with-new-pkgs 2>/dev/null \
+    | awk '/^Inst linux-/ && $3 ~ /^\[/ && $2 ~ /^linux-(image|headers|generic|virtual|xanmod|aws|azure|gcp|kvm)/ { print $2 }' \
+    | paste -sd' ' || true
+}
+
+_cve_newest_kernel() {
+  find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -1 || true
+}
+
+# 0 — на диске стоит исправленное ядро, которое включится после перезагрузки.
+_cve_fix_pending() {
+  local newest
+  newest="$(_cve_newest_kernel)"
+  [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ] && [ "$(_cve_kernel_state "$newest")" = fixed ]
+}
+
+_cve_kernel_upgrade() {
+  local pkgs dl grow
+  info "Ищу исправленное ядро в репозиториях…"
+  if ! apt-get -q update >/dev/null 2>&1; then warn "apt update прошёл с ошибками: список пакетов может быть неполным."; fi
+  pkgs="$(_cve_kernel_pkgs)"
+  if [ -n "$pkgs" ]; then
+    # shellcheck disable=SC2086
+    read -r dl grow <<<"$(_apt_need install $pkgs)"
+    if ! _sysupd_fits "${dl:-0}" "${grow:-0}"; then
+      err "Не хватает места под ядро: скачать $(_mb_h "${dl:-0}"), на диске прибавится $(_mb_h "${grow:-0}"). Освободи его пунктом x."
+      return 1
+    fi
+    info "Есть обновление: ${pkgs}. Установка работе сервера не мешает, ядро включится после перезагрузки."
+    if confirm "Поставить?"; then
+      # shellcheck disable=SC2086
+      _sysupd_apt -o APT::Get::Always-Include-Phased-Updates=true install $pkgs
+    fi
+  fi
+  if _cve_fix_pending; then
+    ok "Исправленное ядро $(_cve_newest_kernel) установлено."
+    warn "Перезагрузка отключит всё на этом сервере примерно на минуту."
+    if confirm "Перезагрузить сейчас?"; then
+      log "Перезагружаю. После — запусти этот пункт ещё раз: он проверит ядро и снимет правило."
+      systemctl reboot
+      return 0
+    fi
+    warn "Перезагрузку отложил. Без неё ядро старое, сервер держит только правило."
+    return 0
+  fi
+  warn "Исправленного ядра для этой системы пока не нашёл. Запусти пункт ещё раз позже."
+}
+
+block_kernel_cve() {
+  local rel state
+  rel="$(uname -r)"
+  state="$(_cve_kernel_state "$rel")"
+  if [ "$state" = fixed ]; then
+    ok "Ядро ${rel} уже с исправлением CVE-2026-98432."
+    if _cve_filter_up && confirm "Правило больше не нужно. Снять?"; then _cve_filter_off; fi
+    return 0
+  fi
+  if [ "$state" = vulnerable ]; then
+    warn "Ядро ${rel} без исправления CVE-2026-98432: сервер можно захватить удалённо."
+  else
+    warn "Не знаю эту сборку ядра (${rel}). Спроси о CVE-2026-98432 у её поставщика, а пока ставлю щит."
+  fi
+  _cve_shield_on
+  _cve_kernel_upgrade
+  if ! _cve_fix_pending; then _cve_close_listeners; fi
+}
+
+_audit_kernel_cve() {
+  local rel state
+  step "Дыра в ядре CVE-2026-98432"
+  rel="$(uname -r)"
+  state="$(_cve_kernel_state "$rel")"
+  if [ "$state" = fixed ]; then
+    _a_ok "Ядро ${rel} с исправлением"
+    if _cve_filter_up; then _a_fix "Снять правило CVE-2026-98432: ядро уже исправлено" 0 _cve_filter_off; fi
+    return 0
+  fi
+  if _cve_filter_up; then
+    _a_warn "Ядро ${rel} без исправления, сервер держит правило (отброшено пакетов: $(_cve_filter_drops))"
+  else
+    _a_fail "Ядро ${rel} без исправления и без защиты: сервер можно захватить удалённо"
+    _a_fix "Поставить щит от CVE-2026-98432 (правило + выключить MPTCP)" 0 _cve_shield_on
+  fi
+  if _cve_fix_pending || [ -n "$(_cve_kernel_pkgs)" ]; then
+    _a_fix "Обновить ядро и перезагрузить (CVE-2026-98432)" 2 _cve_kernel_upgrade
+  fi
+}
+
+
+# ============================================================================
 #  m)  MTU  (путь до интернета уже, чем MTU интерфейса)
 # ----------------------------------------------------------------------------
 #  У части хостеров трафик идёт через туннель (GRE и т.п.), и путь пропускает
@@ -6477,6 +6760,7 @@ _audit_run() {
   info "Аудит ноды: 2–3 минуты (замеры MTU, маршрутов, DNS, доступности из РФ). Проверка только читает —"
   info "кроме замера UDP из РФ: на минуту открывает UDP 443 и ${NF_UDP_PROBE_PORT}. Починка — в конце, по выбору."
   _audit_system
+  _audit_kernel_cve
   _audit_network
   _audit_routes
   _audit_geo
@@ -7554,6 +7838,7 @@ ${BOLD}${CYN}══════════════════════�
    ${BOLD}${GRN} a)${RST} ${WHT}Аудит ноды${RST} ${GRN}★${RST}   ${GRY}— проверка MTU, фризов ВМ, GeoIP, фаервола, логов + починка по выбору${RST}
    ${BOLD}${GRN} d)${RST} ${WHT}Доступность из РФ${RST}  ${GRY}— TCP/UDP с зондов в РФ, клиенты по часам и операторам, реестр, причины бана${RST}
    ${BOLD}${CYN}13)${RST} Диагностика     ${GRY}— выбор: аудит / node-diagnostic / node-accelerator${RST}
+   ${BOLD}${GRN} z)${RST} ${WHT}Дыра в ядре${RST}     ${GRY}— CVE-2026-98432: щит сразу, новое ядро, перезагрузка по вопросу. Нода не нужна${RST}
    ${BOLD}${CYN}14)${RST} Проверки и бенчмарки  ${GRY}(IP/регион/DPI/скорость/CPU…)${RST}
    ${BOLD}${CYN}15)${RST} Обновить скрипт  ${GRY}(свежая версия с GitHub + перезапуск)${RST}
    ${BOLD}${GRN} e)${RST} Обновить систему ${GRY}— apt с расчётом места: не хватает — предложит, что удалить, или обновит порциями${RST}
@@ -7615,6 +7900,7 @@ menu() {
         d|D) run_block "Доступность из РФ" block_ru_access ;;
         e|E) run_block "Обновление системы" block_sysupdate ;;
         x|X) run_block "Очистка диска" block_disk_cleanup ;;
+        z|Z) run_block "Дыра в ядре" block_kernel_cve ;;
         p|P) block_ports ;;
         f|F) run_block "Починить фаервол" apply_firewall ;;
         k|K) run_block "Порты для панели" block_panel_only ;;
