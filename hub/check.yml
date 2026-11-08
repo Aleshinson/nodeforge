@@ -1,0 +1,53 @@
+# Проверка серверов из хаба: только чтение.
+# nodeforge той же версии, что этот сценарий, едет во временную папку и после проверки удаляется.
+- name: Проверка
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Сводка сервера
+      block:
+        - name: Временная папка
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: .nodehub
+          register: tmp
+
+        - name: nodeforge и сводка
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "{{ tmp.path }}/"
+            mode: "0700"
+          loop:
+            - ../setup
+            - check.sh
+
+        - name: Снять сводку
+          ansible.builtin.command: bash {{ tmp.path }}/check.sh {{ tmp.path }}/setup
+          register: summary
+          changed_when: false
+      always:
+        - name: Убрать за собой
+          ansible.builtin.file:
+            path: "{{ tmp.path }}"
+            state: absent
+          when: tmp.path is defined
+
+    - name: Разобрать сводку
+      ansible.builtin.set_fact:
+        s: "{{ dict(summary.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Строка для итога
+      ansible.builtin.set_fact:
+        line: >-
+          ядро {{ s.kernel }} {{ {'fixed': 'дыра закрыта', 'vulnerable': 'ДЫРА ОТКРЫТА', 'unknown': 'дыра: сборка неизвестна'}[s.cve98432] }}
+          {%- if s.cve98432_pending is defined %}, новое ядро {{ s.cve98432_pending }} ждёт перезагрузки{% endif %}
+          {%- if s.cve98432_shield is defined %}, щит стоит{% endif %},
+          диск {{ s.disk }}, свободно памяти {{ s.mem_free_mb }} МБ, работает {{ s.uptime }}
+          {%- if s.reboot is defined %}, ПРОСИТ ПЕРЕЗАГРУЗКУ{% endif %}
+          {%- if s.remnanode is defined %}, remnanode {{ [s.remnanode, s.remnanode_version | default('')] | select | join(' ') }}{% endif %}
+
+    - name: Итог по всем серверам
+      run_once: true
+      ansible.builtin.debug:
+        msg: "{{ ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'line') | map('default', 'нет связи')) | map('join', ': ') | list }}"
